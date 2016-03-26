@@ -427,7 +427,7 @@ zio_inject_fault(char *name, int flags, int *id, zinject_record_t *record)
 		handler->zi_spa = spa;
 		handler->zi_record = *record;
 		list_insert_tail(&inject_handlers, handler);
-		atomic_add_32(&zio_injection_enabled, 1);
+		atomic_inc_32(&zio_injection_enabled);
 
 		rw_exit(&inject_lock);
 	}
@@ -439,7 +439,11 @@ zio_inject_fault(char *name, int flags, int *id, zinject_record_t *record)
 	 * fault injection isn't a performance critical path.
 	 */
 	if (flags & ZINJECT_FLUSH_ARC)
-		arc_flush(NULL);
+		/*
+		 * We must use FALSE to ensure arc_flush returns, since
+		 * we're not preventing concurrent ARC insertions.
+		 */
+		arc_flush(NULL, FALSE);
 
 	return (0);
 }
@@ -504,7 +508,7 @@ zio_clear_fault(int id)
 
 	spa_inject_delref(handler->zi_spa);
 	kmem_free(handler, sizeof (inject_handler_t));
-	atomic_add_32(&zio_injection_enabled, -1);
+	atomic_dec_32(&zio_injection_enabled);
 
 	return (0);
 }

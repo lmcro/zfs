@@ -62,6 +62,8 @@ AC_DEFUN([ZFS_AC_DEBUG_DMU_TX], [
 
 AC_DEFUN([ZFS_AC_CONFIG_ALWAYS], [
 	ZFS_AC_CONFIG_ALWAYS_NO_UNUSED_BUT_SET_VARIABLE
+	ZFS_AC_CONFIG_ALWAYS_NO_BOOL_COMPARE
+	ZFS_AC_CONFIG_ALWAYS_TOOLCHAIN_SIMD
 ])
 
 AC_DEFUN([ZFS_AC_CONFIG], [
@@ -88,8 +90,8 @@ AC_DEFUN([ZFS_AC_CONFIG], [
 	case "$ZFS_CONFIG" in
 		kernel) ZFS_AC_CONFIG_KERNEL ;;
 		user)	ZFS_AC_CONFIG_USER   ;;
-		all)    ZFS_AC_CONFIG_KERNEL
-			ZFS_AC_CONFIG_USER   ;;
+		all)    ZFS_AC_CONFIG_USER
+			ZFS_AC_CONFIG_KERNEL ;;
 		srpm)                        ;;
 		*)
 		AC_MSG_RESULT([Error!])
@@ -139,7 +141,7 @@ AC_DEFUN([ZFS_AC_RPM], [
 	])
 
 	RPM_DEFINE_COMMON='--define "$(DEBUG_ZFS) 1" --define "$(DEBUG_DMU_TX) 1"'
-	RPM_DEFINE_UTIL='--define "_dracutdir $(dracutdir)" --define "_udevdir $(udevdir)" --define "_udevruledir $(udevruledir)"'
+	RPM_DEFINE_UTIL='--define "_dracutdir $(dracutdir)" --define "_udevdir $(udevdir)" --define "_udevruledir $(udevruledir)" --define "_initconfdir $(DEFAULT_INITCONF_DIR)" $(DEFINE_INITRAMFS)'
 	RPM_DEFINE_KMOD='--define "kernels $(LINUX_VERSION)" --define "require_spldir $(SPL)" --define "require_splobj $(SPL_OBJ)" --define "ksrc $(LINUX)" --define "kobj $(LINUX_OBJ)"'
 	RPM_DEFINE_DKMS=
 
@@ -265,6 +267,8 @@ AC_DEFUN([ZFS_AC_DEFAULT_PACKAGE], [
 		VENDOR=ubuntu ;
 	elif test -f /etc/debian_version ; then
 		VENDOR=debian ;
+	elif test -f /etc/alpine-release ; then
+		VENDOR=alpine ;
 	else
 		VENDOR= ;
 	fi
@@ -277,6 +281,7 @@ AC_DEFUN([ZFS_AC_DEFAULT_PACKAGE], [
 		redhat)     DEFAULT_PACKAGE=rpm  ;;
 		fedora)     DEFAULT_PACKAGE=rpm  ;;
 		gentoo)     DEFAULT_PACKAGE=tgz  ;;
+		alpine)     DEFAULT_PACKAGE=tgz  ;;
 		arch)       DEFAULT_PACKAGE=tgz  ;;
 		sles)       DEFAULT_PACKAGE=rpm  ;;
 		slackware)  DEFAULT_PACKAGE=tgz  ;;
@@ -285,7 +290,6 @@ AC_DEFUN([ZFS_AC_DEFAULT_PACKAGE], [
 		debian)     DEFAULT_PACKAGE=deb  ;;
 		*)          DEFAULT_PACKAGE=rpm  ;;
 	esac
-
 	AC_MSG_RESULT([$DEFAULT_PACKAGE])
 	AC_SUBST(DEFAULT_PACKAGE)
 
@@ -299,7 +303,8 @@ AC_DEFUN([ZFS_AC_DEFAULT_PACKAGE], [
 		toss)       DEFAULT_INIT_SCRIPT=redhat ;;
 		redhat)     DEFAULT_INIT_SCRIPT=redhat ;;
 		fedora)     DEFAULT_INIT_SCRIPT=fedora ;;
-		gentoo)     DEFAULT_INIT_SCRIPT=gentoo ;;
+		gentoo)     DEFAULT_INIT_SCRIPT=openrc ;;
+		alpine)     DEFAULT_INIT_SCRIPT=openrc ;;
 		arch)       DEFAULT_INIT_SCRIPT=lsb    ;;
 		sles)       DEFAULT_INIT_SCRIPT=lsb    ;;
 		slackware)  DEFAULT_INIT_SCRIPT=lsb    ;;
@@ -308,9 +313,33 @@ AC_DEFUN([ZFS_AC_DEFAULT_PACKAGE], [
 		debian)     DEFAULT_INIT_SCRIPT=lsb    ;;
 		*)          DEFAULT_INIT_SCRIPT=lsb    ;;
 	esac
-
 	AC_MSG_RESULT([$DEFAULT_INIT_SCRIPT])
 	AC_SUBST(DEFAULT_INIT_SCRIPT)
+
+	AC_MSG_CHECKING([default init config direectory])
+	case "$VENDOR" in
+		alpine)     DEFAULT_INITCONF_DIR=/etc/conf.d    ;;
+		gentoo)     DEFAULT_INITCONF_DIR=/etc/conf.d    ;;
+		toss)       DEFAULT_INITCONF_DIR=/etc/sysconfig ;;
+		redhat)     DEFAULT_INITCONF_DIR=/etc/sysconfig ;;
+		fedora)     DEFAULT_INITCONF_DIR=/etc/sysconfig ;;
+		sles)       DEFAULT_INITCONF_DIR=/etc/sysconfig ;;
+		ubuntu)     DEFAULT_INITCONF_DIR=/etc/default   ;;
+		debian)     DEFAULT_INITCONF_DIR=/etc/default   ;;
+		*)          DEFAULT_INITCONF_DIR=/etc/default   ;;
+	esac
+	AC_MSG_RESULT([$DEFAULT_INITCONF_DIR])
+	AC_SUBST(DEFAULT_INITCONF_DIR)
+
+	AC_MSG_CHECKING([whether initramfs-tools is available])
+	if test -d /usr/share/initramfs-tools ; then
+		DEFINE_INITRAMFS='--define "_initramfs 1"'
+		AC_MSG_RESULT([yes])
+	else
+		DEFINE_INITRAMFS=''
+		AC_MSG_RESULT([no])
+	fi
+	AC_SUBST(DEFINE_INITRAMFS)
 ])
 
 dnl #

@@ -94,7 +94,7 @@ def get_Kstat():
 
 def div1():
     sys.stdout.write("\n")
-    for i in xrange(18):
+    for i in range(18):
         sys.stdout.write("%s" % "----")
     sys.stdout.write("\n")
 
@@ -191,12 +191,10 @@ def get_arc_summary(Kstat):
     ### ARC Misc. ###
     deleted = Kstat["kstat.zfs.misc.arcstats.deleted"]
     mutex_miss = Kstat["kstat.zfs.misc.arcstats.mutex_miss"]
-    recycle_miss = Kstat["kstat.zfs.misc.arcstats.recycle_miss"]
 
     ### ARC Misc. ###
     output["arc_misc"] = {}
     output["arc_misc"]["deleted"] = fHits(deleted)
-    output["arc_misc"]['recycle_miss'] = fHits(recycle_miss)
     output["arc_misc"]['mutex_miss'] = fHits(mutex_miss)
     output["arc_misc"]['evict_skips'] = fHits(mutex_miss)
 
@@ -302,8 +300,6 @@ def _arc_summary(Kstat):
     ### ARC Misc. ###
     sys.stdout.write("ARC Misc:\n")
     sys.stdout.write("\tDeleted:\t\t\t\t%s\n" % arc['arc_misc']['deleted'])
-    sys.stdout.write("\tRecycle Misses:\t\t\t\t%s\n" %
-            arc['arc_misc']['recycle_miss'])
     sys.stdout.write("\tMutex Misses:\t\t\t\t%s\n" %
             arc['arc_misc']['mutex_miss'])
     sys.stdout.write("\tEvict Skips:\t\t\t\t%s\n" %
@@ -1064,7 +1060,7 @@ def _tunable_summary(Kstat):
         if alternate_tunable_layout:
             format = "\t%s=%s\n"
 
-        if show_tunable_descriptions and descriptions.has_key(name):
+        if show_tunable_descriptions and name in descriptions:
             sys.stdout.write("\t# %s\n" % descriptions[name])
 
         sys.stdout.write(format % (name, values[name]))
@@ -1136,7 +1132,7 @@ def main():
     if 'p' in args:
         try:
             pages.append(unSub[int(args['p']) - 1])
-        except IndexError , e:
+        except IndexError as e:
             sys.stderr.write('the argument to -p must be between 1 and ' +
                     str(len(unSub)) + '\n')
             sys.exit()

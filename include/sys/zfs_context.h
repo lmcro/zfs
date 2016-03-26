@@ -160,8 +160,18 @@ extern int aok;
 
 /*
  * DTrace SDT probes have different signatures in userland than they do in
- * kernel.  If they're being used in kernel code, re-define them out of
+ * the kernel.  If they're being used in kernel code, re-define them out of
  * existence for their counterparts in libzpool.
+ *
+ * Here's an example of how to use the set-error probes in userland:
+ * zfs$target:::set-error /arg0 == EBUSY/ {stack();}
+ *
+ * Here's an example of how to use DTRACE_PROBE probes in userland:
+ * If there is a probe declared as follows:
+ * DTRACE_PROBE2(zfs__probe_name, uint64_t, blkid, dnode_t *, dn);
+ * Then you can use it as follows:
+ * zfs$target:::probe2 /copyinstr(arg0) == "zfs__probe_name"/
+ *     {printf("%u %p\n", arg1, arg2);}
  */
 
 #ifdef DTRACE_PROBE
@@ -212,7 +222,7 @@ extern int aok;
  */
 #define	TS_MAGIC		0x72f158ab4261e538ull
 #define	TS_RUN			0x00000002
-#define	TS_STACK_MIN		PTHREAD_STACK_MIN
+#define	TS_STACK_MIN		MAX(PTHREAD_STACK_MIN, 32768)
 #define	TS_STACK_MAX		(256 * 1024)
 
 /* in libzpool, p0 exists only to have its address taken */
@@ -233,6 +243,7 @@ typedef struct kthread {
 	kt_did_t	t_tid;
 	thread_func_t	t_func;
 	void *		t_arg;
+	pri_t		t_pri;
 } kthread_t;
 
 #define	curthread			zk_thread_current()
@@ -273,6 +284,7 @@ typedef struct kmutex {
 } kmutex_t;
 
 #define	MUTEX_DEFAULT	0
+#define	MUTEX_NOLOCKDEP	MUTEX_DEFAULT
 #define	MUTEX_HELD(m)	((m)->m_owner == curthread)
 #define	MUTEX_NOT_HELD(m) (!MUTEX_HELD(m))
 
@@ -304,6 +316,7 @@ typedef int krw_t;
 #define	RW_READER	0
 #define	RW_WRITER	1
 #define	RW_DEFAULT	RW_READER
+#define	RW_NOLOCKDEP	RW_READER
 
 #define	RW_READ_HELD(x)		((x)->rw_readers > 0)
 #define	RW_WRITE_HELD(x)	((x)->rw_wr_owner == curthread)
@@ -349,8 +362,8 @@ extern clock_t cv_timedwait_hires(kcondvar_t *cvp, kmutex_t *mp, hrtime_t tim,
     hrtime_t res, int flag);
 extern void cv_signal(kcondvar_t *cv);
 extern void cv_broadcast(kcondvar_t *cv);
-#define	cv_timedwait_interruptible(cv, mp, at)	cv_timedwait(cv, mp, at)
-#define	cv_wait_interruptible(cv, mp)		cv_wait(cv, mp)
+#define	cv_timedwait_sig(cv, mp, at)		cv_timedwait(cv, mp, at)
+#define	cv_wait_sig(cv, mp)			cv_wait(cv, mp)
 #define	cv_wait_io(cv, mp)			cv_wait(cv, mp)
 
 /*
@@ -408,10 +421,13 @@ extern void kstat_set_raw_ops(kstat_t *ksp,
 #define	kmem_cache_alloc(_c, _f) umem_cache_alloc(_c, _f)
 #define	kmem_cache_free(_c, _b)	umem_cache_free(_c, _b)
 #define	kmem_debugging()	0
-#define	kmem_cache_reap_now(_c)		/* nothing */
+#define	kmem_cache_reap_now(_c)	umem_cache_reap_now(_c);
 #define	kmem_cache_set_move(_c, _cb)	/* nothing */
+#define	vmem_qcache_reap(_v)		/* nothing */
 #define	POINTER_INVALIDATE(_pp)		/* nothing */
 #define	POINTER_IS_VALID(_p)	0
+
+extern vmem_t *zio_arena;
 
 typedef umem_cache_t kmem_cache_t;
 
@@ -468,6 +484,7 @@ extern void	taskq_init_ent(taskq_ent_t *);
 extern void	taskq_destroy(taskq_t *);
 extern void	taskq_wait(taskq_t *);
 extern void	taskq_wait_id(taskq_t *, taskqid_t);
+extern void	taskq_wait_outstanding(taskq_t *, taskqid_t);
 extern int	taskq_member(taskq_t *, kthread_t *);
 extern int	taskq_cancel_id(taskq_t *, taskqid_t);
 extern void	system_taskq_init(void);
@@ -483,8 +500,10 @@ typedef struct vnode {
 	uint64_t	v_size;
 	int		v_fd;
 	char		*v_path;
+	int		v_dump_fd;
 } vnode_t;
 
+extern char *vn_dumpdir;
 #define	AV_SCANSTAMP_SZ	32		/* length of anti-virus scanstamp */
 
 typedef struct xoptattr {
@@ -609,9 +628,14 @@ extern void delay(clock_t ticks);
 	} while (0);
 
 #define	max_ncpus	64
+#define	boot_ncpus	(sysconf(_SC_NPROCESSORS_ONLN))
 
-#define	minclsyspri	60
-#define	maxclsyspri	99
+/*
+ * Process priorities as defined by setpriority(2) and getpriority(2).
+ */
+#define	minclsyspri	19
+#define	maxclsyspri	-20
+#define	defclsyspri	0
 
 #define	CPU_SEQID	(pthread_self() & (max_ncpus - 1))
 
@@ -628,6 +652,8 @@ extern int random_get_pseudo_bytes(uint8_t *ptr, size_t len);
 
 extern void kernel_init(int);
 extern void kernel_fini(void);
+extern void thread_init(void);
+extern void thread_fini(void);
 
 struct spa;
 extern void nicenum(uint64_t num, char *buf);

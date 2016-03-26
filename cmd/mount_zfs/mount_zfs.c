@@ -28,9 +28,14 @@
 #include <unistd.h>
 #include <sys/file.h>
 #include <sys/mount.h>
+#include <sys/mntent.h>
 #include <sys/stat.h>
 #include <libzfs.h>
 #include <locale.h>
+#include <getopt.h>
+
+#define	ZS_COMMENT	0x00000000	/* comment */
+#define	ZS_ZFSUTIL	0x00000001	/* caller is zfs(8) */
 
 libzfs_handle_t *g_zfs;
 
@@ -335,14 +340,18 @@ mtab_update(char *dataset, char *mntpoint, char *type, char *mntopts)
 }
 
 static void
-__zfs_selinux_setcontext(const char *name, const char *context, char *mntopts,
-    char *mtabopt)
+append_mntopt(const char *name, const char *val, char *mntopts,
+    char *mtabopt, boolean_t quote)
 {
 	char tmp[MNT_LINE_MAX];
 
-	snprintf(tmp, MNT_LINE_MAX, ",%s=\"%s\"", name, context);
-	strlcat(mntopts, tmp, MNT_LINE_MAX);
-	strlcat(mtabopt, tmp, MNT_LINE_MAX);
+	snprintf(tmp, MNT_LINE_MAX, quote ? ",%s=\"%s\"" : ",%s=%s", name, val);
+
+	if (mntopts)
+		strlcat(mntopts, tmp, MNT_LINE_MAX);
+
+	if (mtabopt)
+		strlcat(mtabopt, tmp, MNT_LINE_MAX);
 }
 
 static void
@@ -354,7 +363,7 @@ zfs_selinux_setcontext(zfs_handle_t *zhp, zfs_prop_t zpt, const char *name,
 	if (zfs_prop_get(zhp, zpt, context, sizeof (context),
 	    NULL, NULL, 0, B_FALSE) == 0) {
 		if (strcmp(context, "none") != 0)
-		    __zfs_selinux_setcontext(name, context, mntopts, mtabopt);
+		    append_mntopt(name, context, mntopts, mtabopt, B_TRUE);
 	}
 }
 
@@ -379,7 +388,7 @@ main(int argc, char **argv)
 	opterr = 0;
 
 	/* check options */
-	while ((c = getopt(argc, argv, "sfnvo:h?")) != -1) {
+	while ((c = getopt_long(argc, argv, "sfnvo:h?", 0, 0)) != -1) {
 		switch (c) {
 		case 's':
 			sloppy = 1;
@@ -473,8 +482,10 @@ main(int argc, char **argv)
 	if (zfsflags & ZS_ZFSUTIL)
 		zfsutil = 1;
 
-	if ((g_zfs = libzfs_init()) == NULL)
+	if ((g_zfs = libzfs_init()) == NULL) {
+		(void) fprintf(stderr, "%s", libzfs_error_init(errno));
 		return (MOUNT_SYSERR);
+	}
 
 	/* try to open the dataset to access the mount point */
 	if ((zhp = zfs_open(g_zfs, dataset,
@@ -504,10 +515,13 @@ main(int argc, char **argv)
 			    ZFS_PROP_SELINUX_ROOTCONTEXT, MNTOPT_ROOTCONTEXT,
 			    mntopts, mtabopt);
 		} else {
-			__zfs_selinux_setcontext(MNTOPT_CONTEXT,
-			    prop, mntopts, mtabopt);
+			append_mntopt(MNTOPT_CONTEXT, prop,
+			    mntopts, mtabopt, B_TRUE);
 		}
 	}
+
+	/* A hint used to determine an auto-mounted snapshot mount point */
+	append_mntopt(MNTOPT_MNTPOINT, mntpoint, mntopts, NULL, B_FALSE);
 
 	/* treat all snapshots as legacy mount points */
 	if (zfs_get_type(zhp) == ZFS_TYPE_SNAPSHOT)

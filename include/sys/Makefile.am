@@ -9,6 +9,7 @@ COMMON_H = \
 	$(top_srcdir)/include/sys/bplist.h \
 	$(top_srcdir)/include/sys/bpobj.h \
 	$(top_srcdir)/include/sys/bptree.h \
+	$(top_srcdir)/include/sys/bqueue.h \
 	$(top_srcdir)/include/sys/dbuf.h \
 	$(top_srcdir)/include/sys/ddt.h \
 	$(top_srcdir)/include/sys/dmu.h \
@@ -33,6 +34,8 @@ COMMON_H = \
 	$(top_srcdir)/include/sys/efi_partition.h \
 	$(top_srcdir)/include/sys/metaslab.h \
 	$(top_srcdir)/include/sys/metaslab_impl.h \
+	$(top_srcdir)/include/sys/mntent.h \
+	$(top_srcdir)/include/sys/multilist.h \
 	$(top_srcdir)/include/sys/nvpair.h \
 	$(top_srcdir)/include/sys/nvpair_impl.h \
 	$(top_srcdir)/include/sys/range_tree.h \
@@ -53,6 +56,7 @@ COMMON_H = \
 	$(top_srcdir)/include/sys/trace_dbuf.h \
 	$(top_srcdir)/include/sys/trace_dmu.h \
 	$(top_srcdir)/include/sys/trace_dnode.h \
+	$(top_srcdir)/include/sys/trace_multilist.h \
 	$(top_srcdir)/include/sys/trace_txg.h \
 	$(top_srcdir)/include/sys/trace_zil.h \
 	$(top_srcdir)/include/sys/trace_zrlock.h \
@@ -93,6 +97,7 @@ COMMON_H = \
 	$(top_srcdir)/include/sys/zio_compress.h \
 	$(top_srcdir)/include/sys/zio.h \
 	$(top_srcdir)/include/sys/zio_impl.h \
+	$(top_srcdir)/include/sys/zio_priority.h \
 	$(top_srcdir)/include/sys/zrlock.h
 
 KERNEL_H = \

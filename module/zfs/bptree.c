@@ -65,7 +65,7 @@ bptree_alloc(objset_t *os, dmu_tx_t *tx)
 	bptree_phys_t *bt;
 
 	obj = dmu_object_alloc(os, DMU_OTN_UINT64_METADATA,
-	    SPA_MAXBLOCKSIZE, DMU_OTN_UINT64_METADATA,
+	    SPA_OLD_MAXBLOCKSIZE, DMU_OTN_UINT64_METADATA,
 	    sizeof (bptree_phys_t), tx);
 
 	/*
@@ -156,7 +156,7 @@ bptree_visit_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	int err;
 	struct bptree_args *ba = arg;
 
-	if (BP_IS_HOLE(bp))
+	if (bp == NULL || BP_IS_HOLE(bp))
 		return (0);
 
 	err = ba->ba_func(ba->ba_arg, bp, ba->ba_tx);
