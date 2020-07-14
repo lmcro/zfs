@@ -34,8 +34,11 @@ extern "C" {
 #endif
 
 typedef struct vdev_file {
-	vnode_t		*vf_vnode;
+	zfs_file_t	*vf_file;
 } vdev_file_t;
+
+extern void vdev_file_init(void);
+extern void vdev_file_fini(void);
 
 #ifdef	__cplusplus
 }

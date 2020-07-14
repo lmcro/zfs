@@ -26,32 +26,12 @@
 #
 
 #
-# Copyright (c) 2012 by Delphix. All rights reserved.
+# Copyright (c) 2012, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/include/libtest.shlib
 . $STF_SUITE/tests/functional/cli_root/zpool_create/zpool_create.shlib
 
 verify_runnable "global"
-
-if ! $(is_physical_device $DISKS) ; then
-	log_unsupported "This directory cannot be run on raw files."
-fi
-
-if [[ -n $DISK ]]; then
-	#
-        # Use 'zpool create' to clean up the infomation in
-        # in the given disk to avoid slice overlapping.
-        #
-	cleanup_devices $DISK
-
-        partition_disk $SIZE $DISK 7
-else
-	for disk in `$ECHO $DISKSARRAY`; do
-		cleanup_devices $disk
-
-		partition_disk $SIZE $disk 7
-	done
-fi
 
 log_pass

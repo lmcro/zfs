@@ -272,7 +272,7 @@ typedef struct efi_gpe_Attrs {
 #define	EFI_FREEDESKTOP_BOOT	{ 0xbc13c2ff, 0x59e6, 0x4262, 0xa3, 0x52, \
 				    { 0xb2, 0x75, 0xfd, 0x6f, 0x71, 0x72 } }
 
-/* minimum # of bytes for partition table entires, per EFI spec */
+/* minimum # of bytes for partition table entries, per EFI spec */
 #define	EFI_MIN_ARRAY_SIZE	(16 * 1024)
 
 #define	EFI_PART_NAME_LEN	36
@@ -297,11 +297,11 @@ typedef struct efi_gpe {
  * checksums, and perform any necessary byte-swapping to the on-disk
  * format.
  */
-/* Solaris library abstraction for EFI partitons */
+/* Solaris library abstraction for EFI partitions */
 typedef struct dk_part	{
 	diskaddr_t	p_start;	/* starting LBA */
 	diskaddr_t	p_size;		/* size in blocks */
-	struct uuid	p_guid;		/* partion type GUID */
+	struct uuid	p_guid;		/* partition type GUID */
 	ushort_t	p_tag;		/* converted to part'n type GUID */
 	ushort_t	p_flag;		/* attributes */
 	char		p_name[EFI_PART_NAME_LEN]; /* partition name */

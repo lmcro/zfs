@@ -20,7 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
  * Copyright (c) 2013 by Saso Kiselkov. All rights reserved.
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
  */
@@ -36,6 +36,7 @@
 #include <sys/zfs_context.h>
 #include <sys/refcount.h>
 #include <sys/zrlock.h>
+#include <sys/multilist.h>
 
 #ifdef	__cplusplus
 extern "C" {
@@ -53,6 +54,7 @@ extern "C" {
 #define	DB_RF_NOPREFETCH	(1 << 3)
 #define	DB_RF_NEVERWAIT		(1 << 4)
 #define	DB_RF_CACHED		(1 << 5)
+#define	DB_RF_NO_DECRYPT	(1 << 6)
 
 /*
  * The simplified state transition diagram for dbufs looks like:
@@ -82,6 +84,13 @@ typedef enum dbuf_states {
 	DB_EVICTING
 } dbuf_states_t;
 
+typedef enum dbuf_cached_state {
+	DB_NO_CACHE = -1,
+	DB_DBUF_CACHE,
+	DB_DBUF_METADATA_CACHE,
+	DB_CACHE_MAX
+} dbuf_cached_state_t;
+
 struct dnode;
 struct dmu_tx;
 
@@ -99,6 +108,12 @@ typedef enum override_states {
 	DR_OVERRIDDEN
 } override_states_t;
 
+typedef enum db_lock_type {
+	DLT_NONE,
+	DLT_PARENT,
+	DLT_OBJSET
+} db_lock_type_t;
+
 typedef struct dbuf_dirty_record {
 	/* link on our parents dirty list */
 	list_node_t dr_dirty_node;
@@ -112,14 +127,17 @@ typedef struct dbuf_dirty_record {
 	/* pointer back to our dbuf */
 	struct dmu_buf_impl *dr_dbuf;
 
-	/* pointer to next dirty record */
-	struct dbuf_dirty_record *dr_next;
+	/* list link for dbuf dirty records */
+	list_node_t dr_dbuf_node;
 
 	/* pointer to parent dirty record */
 	struct dbuf_dirty_record *dr_parent;
 
 	/* How much space was changed to dsl_pool_dirty_space() for this? */
 	unsigned int dr_accounted;
+
+	/* A copy of the bp that points to us */
+	blkptr_t dr_bp_copy;
 
 	union dirty_types {
 		struct dirty_indirect {
@@ -142,6 +160,16 @@ typedef struct dbuf_dirty_record {
 			override_states_t dr_override_state;
 			uint8_t dr_copies;
 			boolean_t dr_nopwrite;
+			boolean_t dr_has_raw_params;
+
+			/*
+			 * If dr_has_raw_params is set, the following crypt
+			 * params will be set on the BP that's written.
+			 */
+			boolean_t dr_byteorder;
+			uint8_t	dr_salt[ZIO_DATA_SALT_LEN];
+			uint8_t	dr_iv[ZIO_DATA_IV_LEN];
+			uint8_t	dr_mac[ZIO_DATA_MAC_LEN];
 		} dl;
 	} dt;
 } dbuf_dirty_record_t;
@@ -178,6 +206,13 @@ typedef struct dmu_buf_impl {
 	 */
 	struct dmu_buf_impl *db_hash_next;
 
+	/*
+	 * Our link on the owner dnodes's dn_dbufs list.
+	 * Protected by its dn_dbufs_mtx.  Should be on the same cache line
+	 * as db_level and db_blkid for the best avl_add() performance.
+	 */
+	avl_node_t db_link;
+
 	/* our block number */
 	uint64_t db_blkid;
 
@@ -195,6 +230,22 @@ typedef struct dmu_buf_impl {
 	 */
 	uint8_t db_level;
 
+	/*
+	 * Protects db_buf's contents if they contain an indirect block or data
+	 * block of the meta-dnode. We use this lock to protect the structure of
+	 * the block tree. This means that when modifying this dbuf's data, we
+	 * grab its rwlock. When modifying its parent's data (including the
+	 * blkptr to this dbuf), we grab the parent's rwlock. The lock ordering
+	 * for this lock is:
+	 * 1) dn_struct_rwlock
+	 * 2) db_rwlock
+	 * We don't currently grab multiple dbufs' db_rwlocks at once.
+	 */
+	krwlock_t db_rwlock;
+
+	/* buffer holding our data */
+	arc_buf_t *db_buf;
+
 	/* db_mtx protects the members below */
 	kmutex_t db_mtx;
 
@@ -208,22 +259,19 @@ typedef struct dmu_buf_impl {
 	 * If nonzero, the buffer can't be destroyed.
 	 * Protected by db_mtx.
 	 */
-	refcount_t db_holds;
-
-	/* buffer holding our data */
-	arc_buf_t *db_buf;
+	zfs_refcount_t db_holds;
 
 	kcondvar_t db_changed;
 	dbuf_dirty_record_t *db_data_pending;
 
-	/* pointer to most recent dirty record for this buffer */
-	dbuf_dirty_record_t *db_last_dirty;
+	/* List of dirty records for the buffer sorted newest to oldest. */
+	list_t db_dirty_records;
 
-	/*
-	 * Our link on the owner dnodes's dn_dbufs list.
-	 * Protected by its dn_dbufs_mtx.
-	 */
-	avl_node_t db_link;
+	/* Link in dbuf_cache or dbuf_metadata_cache */
+	multilist_node_t db_cache_link;
+
+	/* Tells us which dbuf cache this dbuf is in, if any */
+	dbuf_cached_state_t db_caching_status;
 
 	/* Data which is unique to data (leaf) blocks: */
 
@@ -261,7 +309,8 @@ typedef struct dbuf_hash_table {
 	kmutex_t hash_mutexes[DBUF_MUTEXES];
 } dbuf_hash_table_t;
 
-uint64_t dbuf_whichblock(struct dnode *di, int64_t level, uint64_t offset);
+uint64_t dbuf_whichblock(const struct dnode *di, const int64_t level,
+    const uint64_t offset);
 
 void dbuf_create_bonus(struct dnode *dn);
 int dbuf_spill_set_blksz(dmu_buf_t *db, uint64_t blksz, dmu_tx_t *tx);
@@ -284,7 +333,7 @@ boolean_t dbuf_try_add_ref(dmu_buf_t *db, objset_t *os, uint64_t obj,
 uint64_t dbuf_refcount(dmu_buf_impl_t *db);
 
 void dbuf_rele(dmu_buf_impl_t *db, void *tag);
-void dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag);
+void dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag, boolean_t evicting);
 
 dmu_buf_impl_t *dbuf_find(struct objset *os, uint64_t object, uint8_t level,
     uint64_t blkid);
@@ -300,12 +349,14 @@ void dmu_buf_write_embedded(dmu_buf_t *dbuf, void *data,
     bp_embedded_type_t etype, enum zio_compress comp,
     int uncompressed_size, int compressed_size, int byteorder, dmu_tx_t *tx);
 
-void dbuf_clear(dmu_buf_impl_t *db);
-void dbuf_evict(dmu_buf_impl_t *db);
+void dmu_buf_redact(dmu_buf_t *dbuf, dmu_tx_t *tx);
+void dbuf_destroy(dmu_buf_impl_t *db);
 
 void dbuf_unoverride(dbuf_dirty_record_t *dr);
 void dbuf_sync_list(list_t *list, int level, dmu_tx_t *tx);
 void dbuf_release_bp(dmu_buf_impl_t *db);
+db_lock_type_t dmu_buf_lock_parent(dmu_buf_impl_t *db, krw_t rw, void *tag);
+void dmu_buf_unlock_parent(dmu_buf_impl_t *db, db_lock_type_t type, void *tag);
 
 void dbuf_free_range(struct dnode *dn, uint64_t start, uint64_t end,
     struct dmu_tx *);
@@ -314,6 +365,9 @@ void dbuf_new_size(dmu_buf_impl_t *db, int size, dmu_tx_t *tx);
 
 void dbuf_stats_init(dbuf_hash_table_t *hash);
 void dbuf_stats_destroy(void);
+
+int dbuf_dnode_findbp(dnode_t *dn, uint64_t level, uint64_t blkid,
+    blkptr_t *bp, uint16_t *datablkszsec, uint8_t *indblkshift);
 
 #define	DB_DNODE(_db)		((_db)->db_dnode_handle->dnh_dnode)
 #define	DB_DNODE_LOCK(_db)	((_db)->db_dnode_handle->dnh_zrlock)
@@ -325,6 +379,29 @@ void dbuf_init(void);
 void dbuf_fini(void);
 
 boolean_t dbuf_is_metadata(dmu_buf_impl_t *db);
+
+static inline dbuf_dirty_record_t *
+dbuf_find_dirty_lte(dmu_buf_impl_t *db, uint64_t txg)
+{
+	dbuf_dirty_record_t *dr;
+
+	for (dr = list_head(&db->db_dirty_records);
+	    dr != NULL && dr->dr_txg > txg;
+	    dr = list_next(&db->db_dirty_records, dr))
+		continue;
+	return (dr);
+}
+
+static inline dbuf_dirty_record_t *
+dbuf_find_dirty_eq(dmu_buf_impl_t *db, uint64_t txg)
+{
+	dbuf_dirty_record_t *dr;
+
+	dr = dbuf_find_dirty_lte(db, txg);
+	if (dr && dr->dr_txg == txg)
+		return (dr);
+	return (NULL);
+}
 
 #define	DBUF_GET_BUFC_TYPE(_db)	\
 	(dbuf_is_metadata(_db) ? ARC_BUFC_METADATA : ARC_BUFC_DATA)
@@ -339,9 +416,11 @@ boolean_t dbuf_is_metadata(dmu_buf_impl_t *db);
 	(dbuf_is_metadata(_db) &&					\
 	((_db)->db_objset->os_secondary_cache == ZFS_CACHE_METADATA)))
 
-#define	DBUF_IS_L2COMPRESSIBLE(_db)					\
-	((_db)->db_objset->os_compress != ZIO_COMPRESS_OFF ||		\
-	(dbuf_is_metadata(_db) && zfs_mdcomp_disable == B_FALSE))
+#define	DNODE_LEVEL_IS_L2CACHEABLE(_dn, _level)				\
+	((_dn)->dn_objset->os_secondary_cache == ZFS_CACHE_ALL ||	\
+	(((_level) > 0 ||						\
+	DMU_OT_IS_METADATA((_dn)->dn_handle->dnh_dnode->dn_type)) &&	\
+	((_dn)->dn_objset->os_secondary_cache == ZFS_CACHE_METADATA)))
 
 #ifdef ZFS_DEBUG
 

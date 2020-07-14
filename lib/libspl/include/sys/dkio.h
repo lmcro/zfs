@@ -59,7 +59,6 @@ struct dk_cinfo {
 	uint_t	dki_vec;		/* interrupt vector */
 	char	dki_dname[DK_DEVLEN];	/* drive name (no unit #) */
 	uint_t	dki_unit;		/* unit number */
-	uint_t	dki_slave;		/* slave number */
 	ushort_t dki_partition;		/* partition number */
 	ushort_t dki_maxtransfer;	/* max. transfer size in DEV_BSIZE */
 };
@@ -158,7 +157,7 @@ struct dk_geom {
 
 /*
  * The following ioctls are generic in nature and need to be
- * suported as appropriate by all disk drivers
+ * supported as appropriate by all disk drivers
  */
 #define	DKIOCGGEOM	(DKIOC|1)		/* Get geometry */
 #define	DKIOCINFO	(DKIOC|3)		/* Get info */

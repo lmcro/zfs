@@ -26,7 +26,7 @@
 #
 
 #
-# Copyright (c) 2013 by Delphix. All rights reserved.
+# Copyright (c) 2013, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -38,7 +38,7 @@
 # STRATEGY:
 # 1. largest_file will write to a file and increase its size
 # to the maximum allowable.
-# 2. The last byte of the file should be accessbile without error.
+# 2. The last byte of the file should be accessible without error.
 # 3. Writing beyond the maximum file size generates an 'errno' of
 # EFBIG.
 #
@@ -48,6 +48,6 @@ verify_runnable "both"
 log_assert "Write a file to the allowable ZFS fs size."
 
 log_note "Invoke 'largest_file' with $TESTDIR/bigfile"
-log_must $LARGEST_FILE $TESTDIR/bigfile
+log_must largest_file $TESTDIR/bigfile
 
 log_pass "Successfully created a file to the maximum allowable size."

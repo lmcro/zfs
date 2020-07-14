@@ -26,7 +26,7 @@
 #
 
 #
-# Copyright (c) 2013 by Delphix. All rights reserved.
+# Copyright (c) 2013, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -45,9 +45,13 @@
 
 verify_runnable "global"
 
+if ! is_physical_device $FS_DISK0; then
+	log_unsupported "This directory cannot be run on raw files."
+fi
+
 function cleanup
 {
-	poolexists $TESTPOOL1 || $ZPOOL import $TESTPOOL1 >/dev/null 2>&1
+	poolexists $TESTPOOL1 || zpool import $TESTPOOL1 >/dev/null 2>&1
 
 	poolexists $TESTPOOL1 && destroy_pool $TESTPOOL1
 
@@ -57,12 +61,12 @@ function cleanup
 	cleanup_devices $vdisks $sdisks
 }
 
-function verify_assertion #disks
+function verify_assertion # disks
 {
 	typeset targets=$1
 
 	for t in $targets; do
-		log_must set_partition 0 "" 0mb $t
+		log_must zero_partitions $t
 	done
 
 	return 0
@@ -75,45 +79,13 @@ log_onexit cleanup
 set -A vdevs "" "mirror" "raidz" "raidz1" "raidz2"
 
 typeset -i i=0
-
 while (( i < ${#vdevs[*]} )); do
+	typeset spare="spare $sdisks"
 
-	for num in 0 1 2 3 ; do
-		eval typeset slice=\${FS_SIDE$num}
-		disk=${slice%${SLICE_PREFIX}*}
-		slice=${slice##*${SLICE_PREFIX}}
-		if [[ $WRAPPER == *"smi"* && \
-			$disk == ${saved_disk} ]]; then
-			cyl=$(get_endslice $disk ${saved_slice})
-			log_must set_partition $slice "$cyl" $FS_SIZE $disk
-		else
-			log_must set_partition $slice "" $FS_SIZE $disk
-		fi
-		saved_disk=$disk
-		saved_slice=$slice
-	done
-
-	if [[ -n $SINGLE_DISK && -n ${vdevs[i]} ]]; then
-		(( i = i + 1 ))
-		continue
-	fi
-
-	create_pool $TESTPOOL1 ${vdevs[i]} $vslices spare $sslices
-	log_must $ZPOOL export $TESTPOOL1
-	verify_assertion "$vdisks $sdisks"
-
-	if [[ ( $FS_DISK0 == $FS_DISK2 ) && -n ${vdevs[i]} ]]; then
-		(( i = i + 1 ))
-		continue
-	fi
-
-	if [[ ( $FS_DISK0 == $FS_DISK3 ) && ( ${vdevs[i]} == "raidz2" ) ]]; then
-		(( i = i + 1 ))
-		continue
-	fi
-
-	create_pool $TESTPOOL1 ${vdevs[i]} $vdisks spare $sdisks
-	log_must $ZPOOL export $TESTPOOL1
+	# If this is for raidz2, use 3 disks for the pool.
+	[[ ${vdevs[i]} = "raidz2" ]] && spare="$sdisks"
+	create_pool $TESTPOOL1 ${vdevs[i]} $vdisks $spare
+	log_must zpool export $TESTPOOL1
 	verify_assertion "$vdisks $sdisks"
 
 	(( i = i + 1 ))

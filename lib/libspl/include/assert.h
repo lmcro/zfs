@@ -31,84 +31,120 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
-#ifndef __assert_c99
-static inline void
-__assert_c99(const char *expr, const char *file, int line, const char *func)
-{
-	fprintf(stderr, "%s:%i: %s: Assertion `%s` failed.\n",
-		file, line, func, expr);
-	abort();
-}
-#endif  /* __assert_c99 */
+/* Set to non-zero to avoid abort()ing on an assertion failure */
+extern int aok;
 
-#ifndef verify
-#if defined(__STDC__)
-#if __STDC_VERSION__ - 0 >= 199901L
-#define	verify(EX) (void)((EX) || \
-	(__assert_c99(#EX, __FILE__, __LINE__, __func__), 0))
-#else
-#define	verify(EX) (void)((EX) || (__assert(#EX, __FILE__, __LINE__), 0))
-#endif  /* __STDC_VERSION__ - 0 >= 199901L */
-#else
-#define	verify(EX) (void)((EX) || (_assert("EX", __FILE__, __LINE__), 0))
-#endif	/* __STDC__ */
-#endif  /* verify */
-
-#undef VERIFY
-#undef ASSERT
-
-#define	VERIFY	verify
-#define	ASSERT	assert
-
-extern void __assert(const char *, const char *, int);
+/* printf version of libspl_assert */
+extern void libspl_assertf(const char *file, const char *func, int line,
+    const char *format, ...);
 
 static inline int
-assfail(const char *buf, const char *file, int line)
+libspl_assert(const char *buf, const char *file, const char *func, int line)
 {
-	__assert(buf, file, line);
+	libspl_assertf(file, func, line, "%s", buf);
 	return (0);
 }
 
-/* BEGIN CSTYLED */
-#define	VERIFY3_IMPL(LEFT, OP, RIGHT, TYPE) do { \
-	const TYPE __left = (TYPE)(LEFT); \
-	const TYPE __right = (TYPE)(RIGHT); \
-	if (!(__left OP __right)) { \
-		char *__buf = alloca(256); \
-		(void) snprintf(__buf, 256, "%s %s %s (0x%llx %s 0x%llx)", \
-			#LEFT, #OP, #RIGHT, \
-			(u_longlong_t)__left, #OP, (u_longlong_t)__right); \
-		assfail(__buf, __FILE__, __LINE__); \
-	} \
-} while (0)
-/* END CSTYLED */
+#ifdef verify
+#undef verify
+#endif
 
-#define	VERIFY3S(x, y, z)	VERIFY3_IMPL(x, y, z, int64_t)
-#define	VERIFY3U(x, y, z)	VERIFY3_IMPL(x, y, z, uint64_t)
-#define	VERIFY3P(x, y, z)	VERIFY3_IMPL(x, y, z, uintptr_t)
-#define	VERIFY0(x)		VERIFY3_IMPL(x, ==, 0, uint64_t)
+#define	VERIFY(cond)							\
+	(void) ((!(cond)) &&						\
+	    libspl_assert(#cond, __FILE__, __FUNCTION__, __LINE__))
+#define	verify(cond)							\
+	(void) ((!(cond)) &&						\
+	    libspl_assert(#cond, __FILE__, __FUNCTION__, __LINE__))
+
+#define	VERIFY3B(LEFT, OP, RIGHT)					\
+do {									\
+	const boolean_t __left = (boolean_t)(LEFT);			\
+	const boolean_t __right = (boolean_t)(RIGHT);			\
+	if (!(__left OP __right))					\
+		libspl_assertf(__FILE__, __FUNCTION__, __LINE__,	\
+		    "%s %s %s (0x%llx %s 0x%llx)", #LEFT, #OP, #RIGHT,	\
+		    (u_longlong_t)__left, #OP, (u_longlong_t)__right);	\
+} while (0)
+
+#define	VERIFY3S(LEFT, OP, RIGHT)					\
+do {									\
+	const int64_t __left = (int64_t)(LEFT);				\
+	const int64_t __right = (int64_t)(RIGHT);			\
+	if (!(__left OP __right))					\
+		libspl_assertf(__FILE__, __FUNCTION__, __LINE__,	\
+		    "%s %s %s (0x%llx %s 0x%llx)", #LEFT, #OP, #RIGHT,	\
+		    (u_longlong_t)__left, #OP, (u_longlong_t)__right);	\
+} while (0)
+
+#define	VERIFY3U(LEFT, OP, RIGHT)					\
+do {									\
+	const uint64_t __left = (uint64_t)(LEFT);			\
+	const uint64_t __right = (uint64_t)(RIGHT);			\
+	if (!(__left OP __right))					\
+		libspl_assertf(__FILE__, __FUNCTION__, __LINE__,	\
+		    "%s %s %s (0x%llx %s 0x%llx)", #LEFT, #OP, #RIGHT,	\
+		    (u_longlong_t)__left, #OP, (u_longlong_t)__right);	\
+} while (0)
+
+#define	VERIFY3P(LEFT, OP, RIGHT)					\
+do {									\
+	const uintptr_t __left = (uintptr_t)(LEFT);			\
+	const uintptr_t __right = (uintptr_t)(RIGHT);			\
+	if (!(__left OP __right))					\
+		libspl_assertf(__FILE__, __FUNCTION__, __LINE__,	\
+		    "%s %s %s (0x%llx %s 0x%llx)", #LEFT, #OP, #RIGHT,	\
+		    (u_longlong_t)__left, #OP, (u_longlong_t)__right);	\
+} while (0)
+
+#define	VERIFY0(LEFT)							\
+do {									\
+	const uint64_t __left = (uint64_t)(LEFT);			\
+	if (!(__left == 0))						\
+		libspl_assertf(__FILE__, __FUNCTION__, __LINE__,	\
+		    "%s == 0 (0x%llx == 0)", #LEFT,			\
+		    (u_longlong_t)__left);				\
+} while (0)
+
+#ifdef assert
+#undef assert
+#endif
+
+/* Compile time assert */
+#define	CTASSERT_GLOBAL(x)		_CTASSERT(x, __LINE__)
+#define	CTASSERT(x)			{ _CTASSERT(x, __LINE__); }
+#define	_CTASSERT(x, y)			__CTASSERT(x, y)
+#define	__CTASSERT(x, y)						\
+	typedef char __attribute__((unused))				\
+	__compile_time_assertion__ ## y[(x) ? 1 : -1]
 
 #ifdef NDEBUG
+#define	ASSERT3B(x, y, z)	((void)0)
 #define	ASSERT3S(x, y, z)	((void)0)
 #define	ASSERT3U(x, y, z)	((void)0)
 #define	ASSERT3P(x, y, z)	((void)0)
 #define	ASSERT0(x)		((void)0)
-#define	ASSERTV(x)
+#define	ASSERT(x)		((void)0)
+#define	assert(x)		((void)0)
 #define	IMPLY(A, B)		((void)0)
 #define	EQUIV(A, B)		((void)0)
 #else
-#define	ASSERT3S(x, y, z)	VERIFY3S(x, y, z)
-#define	ASSERT3U(x, y, z)	VERIFY3U(x, y, z)
-#define	ASSERT3P(x, y, z)	VERIFY3P(x, y, z)
-#define	ASSERT0(x)		VERIFY0(x)
-#define	ASSERTV(x)		x
+#define	ASSERT3B	VERIFY3B
+#define	ASSERT3S	VERIFY3S
+#define	ASSERT3U	VERIFY3U
+#define	ASSERT3P	VERIFY3P
+#define	ASSERT0		VERIFY0
+#define	ASSERT		VERIFY
+#define	assert		VERIFY
 #define	IMPLY(A, B) \
 	((void)(((!(A)) || (B)) || \
-	    assfail("(" #A ") implies (" #B ")", __FILE__, __LINE__)))
+	    libspl_assert("(" #A ") implies (" #B ")", \
+	    __FILE__, __FUNCTION__, __LINE__)))
 #define	EQUIV(A, B) \
 	((void)((!!(A) == !!(B)) || \
-	    assfail("(" #A ") is equivalent to (" #B ")", __FILE__, __LINE__)))
+	    libspl_assert("(" #A ") is equivalent to (" #B ")", \
+	    __FILE__, __FUNCTION__, __LINE__)))
 
 #endif  /* NDEBUG */
 

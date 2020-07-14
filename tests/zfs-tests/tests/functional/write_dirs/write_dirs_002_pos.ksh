@@ -26,7 +26,7 @@
 #
 
 #
-# Copyright (c) 2013 by Delphix. All rights reserved.
+# Copyright (c) 2013, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -37,7 +37,7 @@
 # is full. The zfs file system should be work well and stable.
 #
 # STRATEGY:
-# 1. Create a pool & dateset
+# 1. Create a pool & dataset
 # 2. Make directories in the zfs file system
 # 3. Create 5000 files in each directories
 # 4. Test case exit when the disk is full
@@ -47,11 +47,10 @@ verify_runnable "both"
 
 function cleanup
 {
-	for file in `$FIND $TESTDIR -type f`; do
-		$CAT /dev/null > $file
-	done
-	log_must $SYNC
-	log_must $RM -rf $TESTDIR/*
+	destroy_dataset $TESTPOOL/$TESTFS
+	wait_freeing $TESTPOOL
+	sync_pool $TESTPOOL
+	zfs create -o mountpoint=$TESTDIR $TESTPOOL/$TESTFS
 }
 
 typeset -i retval=0

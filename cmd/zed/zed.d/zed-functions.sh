@@ -1,3 +1,5 @@
+#!/bin/sh
+# shellcheck disable=SC2039
 # zed-functions.sh
 #
 # ZED helper functions for use in ZEDLETs
@@ -126,6 +128,7 @@ zed_lock()
     #
     eval "exec ${fd}> '${lockfile}'"
     err="$(flock --exclusive "${fd}" 2>&1)"
+    # shellcheck disable=SC2181
     if [ $? -ne 0 ]; then
         zed_log_err "failed to lock \"${lockfile}\": ${err}"
     fi
@@ -162,8 +165,8 @@ zed_unlock()
     fi
 
     # Release the lock and close the file descriptor.
-    #
     err="$(flock --unlock "${fd}" 2>&1)"
+    # shellcheck disable=SC2181
     if [ $? -ne 0 ]; then
         zed_log_err "failed to unlock \"${lockfile}\": ${err}"
     fi
@@ -196,6 +199,10 @@ zed_notify()
     [ "${rv}" -eq 1 ] && num_failure=$((num_failure + 1))
 
     zed_notify_pushbullet "${subject}" "${pathname}"; rv=$?
+    [ "${rv}" -eq 0 ] && num_success=$((num_success + 1))
+    [ "${rv}" -eq 1 ] && num_failure=$((num_failure + 1))
+
+    zed_notify_slack_webhook "${subject}" "${pathname}"; rv=$?
     [ "${rv}" -eq 0 ] && num_success=$((num_success + 1))
     [ "${rv}" -eq 1 ] && num_failure=$((num_failure + 1))
 
@@ -356,6 +363,80 @@ zed_notify_pushbullet()
 }
 
 
+# zed_notify_slack_webhook (subject, pathname)
+#
+# Notification via Slack Webhook <https://api.slack.com/incoming-webhooks>.
+# The Webhook URL (ZED_SLACK_WEBHOOK_URL) identifies this client to the
+# Slack channel. 
+#
+# Requires awk, curl, and sed executables to be installed in the standard PATH.
+#
+# References
+#   https://api.slack.com/incoming-webhooks
+#
+# Arguments
+#   subject: notification subject
+#   pathname: pathname containing the notification message (OPTIONAL)
+#
+# Globals
+#   ZED_SLACK_WEBHOOK_URL
+#
+# Return
+#   0: notification sent
+#   1: notification failed
+#   2: not configured
+#
+zed_notify_slack_webhook()
+{
+    [ -n "${ZED_SLACK_WEBHOOK_URL}" ] || return 2
+
+    local subject="$1"
+    local pathname="${2:-"/dev/null"}"
+    local msg_body
+    local msg_tag
+    local msg_json
+    local msg_out
+    local msg_err
+    local url="${ZED_SLACK_WEBHOOK_URL}"
+
+    [ -n "${subject}" ] || return 1
+    if [ ! -r "${pathname}" ]; then
+        zed_log_err "slack webhook cannot read \"${pathname}\""
+        return 1
+    fi
+
+    zed_check_cmd "awk" "curl" "sed" || return 1
+
+    # Escape the following characters in the message body for JSON:
+    # newline, backslash, double quote, horizontal tab, vertical tab,
+    # and carriage return.
+    #
+    msg_body="$(awk '{ ORS="\\n" } { gsub(/\\/, "\\\\"); gsub(/"/, "\\\"");
+        gsub(/\t/, "\\t"); gsub(/\f/, "\\f"); gsub(/\r/, "\\r"); print }' \
+        "${pathname}")"
+
+    # Construct the JSON message for posting.
+    #
+    msg_json="$(printf '{"text": "*%s*\n%s"}' "${subject}" "${msg_body}" )"
+
+    # Send the POST request and check for errors.
+    #
+    msg_out="$(curl -X POST "${url}" \
+        --header "Content-Type: application/json" --data-binary "${msg_json}" \
+        2>/dev/null)"; rv=$?
+    if [ "${rv}" -ne 0 ]; then
+        zed_log_err "curl exit=${rv}"
+        return 1
+    fi
+    msg_err="$(echo "${msg_out}" \
+        | sed -n -e 's/.*"error" *:.*"message" *: *"\([^"]*\)".*/\1/p')"
+    if [ -n "${msg_err}" ]; then
+        zed_log_err "slack webhook \"${msg_err}"\"
+        return 1
+    fi
+    return 0
+}
+
 # zed_rate_limit (tag, [interval])
 #
 # Check whether an event of a given type [tag] has already occurred within the
@@ -394,7 +475,7 @@ zed_rate_limit()
 
     zed_lock "${lockfile}" "${lockfile_fd}"
     time_now="$(date +%s)"
-    time_prev="$(egrep "^[0-9]+;${tag}\$" "${statefile}" 2>/dev/null \
+    time_prev="$(grep -E "^[0-9]+;${tag}\$" "${statefile}" 2>/dev/null \
         | tail -1 | cut -d\; -f1)"
 
     if [ -n "${time_prev}" ] \
@@ -403,7 +484,7 @@ zed_rate_limit()
     else
         umask_bak="$(umask)"
         umask 077
-        egrep -v "^[0-9]+;${tag}\$" "${statefile}" 2>/dev/null \
+        grep -E -v "^[0-9]+;${tag}\$" "${statefile}" 2>/dev/null \
             > "${statefile}.$$"
         echo "${time_now};${tag}" >> "${statefile}.$$"
         mv -f "${statefile}.$$" "${statefile}"
@@ -412,4 +493,46 @@ zed_rate_limit()
 
     zed_unlock "${lockfile}" "${lockfile_fd}"
     return "${rv}"
+}
+
+
+# zed_guid_to_pool (guid)
+#
+# Convert a pool GUID into its pool name (like "tank")
+# Arguments
+#   guid: pool GUID (decimal or hex)
+#
+# Return
+#   Pool name
+#
+zed_guid_to_pool()
+{
+	if [ -z "$1" ] ; then
+		return
+	fi
+
+	guid=$(printf "%llu" "$1")
+	if [ -n "$guid" ] ; then
+		$ZPOOL get -H -ovalue,name guid | awk '$1=='"$guid"' {print $2}'
+	fi
+}
+
+# zed_exit_if_ignoring_this_event
+#
+# Exit the script if we should ignore this event, as determined by
+# $ZED_SYSLOG_SUBCLASS_INCLUDE and $ZED_SYSLOG_SUBCLASS_EXCLUDE in zed.rc.
+# This function assumes you've imported the normal zed variables.
+zed_exit_if_ignoring_this_event()
+{
+	if [ -n "${ZED_SYSLOG_SUBCLASS_INCLUDE}" ]; then
+	    eval "case ${ZEVENT_SUBCLASS} in
+	    ${ZED_SYSLOG_SUBCLASS_INCLUDE});;
+	    *) exit 0;;
+	    esac"
+	elif [ -n "${ZED_SYSLOG_SUBCLASS_EXCLUDE}" ]; then
+	    eval "case ${ZEVENT_SUBCLASS} in
+	    ${ZED_SYSLOG_SUBCLASS_EXCLUDE}) exit 0;;
+	    *);;
+	    esac"
+	fi
 }

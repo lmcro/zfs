@@ -24,6 +24,11 @@
 # Copyright 2008 Sun Microsystems, Inc.  All rights reserved.
 # Use is subject to license terms.
 #
+
+#
+# Copyright (c) 2016 by Delphix. All rights reserved.
+#
+
 . $STF_SUITE/include/libtest.shlib
 
 #
@@ -52,7 +57,7 @@ set -A args  "" "create" "create -s" "create -V" "create -s -V" \
     "set compressratio=" "set mounted=" "set origin=" "set quota=" \
     "set reservation=" "set volsize=" " set volblocksize=" "set recordsize=" \
     "set mountpoint=" "set devices=" "set exec=" "set setuid=" "set readonly=" \
-    "set zoned=" "set snapdir=" "set aclmode=" "set aclinherit=" \
+    "set snapdir=" "set aclmode=" "set aclinherit=" \
     "set quota=blah" "set reservation=blah" "set atime=blah" "set checksum=blah" \
     "set compression=blah" \
     "upgrade blah" "mount blah" "mount -o" \
@@ -60,12 +65,17 @@ set -A args  "" "create" "create -s" "create -V" "create -s -V" \
     "share" "unshare" "send" "send -i" "receive" "receive -d" "receive -vnF" \
     "recv" "recv -d" "recv -vnF" "allow" "unallow" \
     "blah blah" "-%" "--" "--?" "-*" "-="
+if is_freebsd; then
+	args+=("set jailed=")
+else
+	args+=("set zoned=")
+fi
 
 log_assert "Badly-formed zfs sub-command should return an error."
 
 typeset -i i=0
 while (( $i < ${#args[*]} )); do
-	log_mustnot $ZFS ${args[i]}
+	log_mustnot zfs ${args[i]}
 	((i = i + 1))
 done
 

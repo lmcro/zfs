@@ -21,14 +21,12 @@
 #
 
 #
-# Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
+# Copyright (c) 2009, Sun Microsystems Inc. All rights reserved.
+# Copyright (c) 2013, 2016, Delphix. All rights reserved.
 # Use is subject to license terms.
 #
 
-#
-# Copyright (c) 2013 by Delphix. All rights reserved.
-#
-
+. $STF_SUITE/include/properties.shlib
 . $STF_SUITE/tests/functional/rsend/rsend.kshlib
 
 #
@@ -39,20 +37,10 @@
 #	1. Setting properties for all the filesystem and volumes randomly
 #	2. Backup all the data from POOL by send -R
 #	3. Restore all the data in POOL2
-#	4. Verify all the perperties in two pools are same
+#	4. Verify all the properties in the two pools are the same
 #
 
 verify_runnable "global"
-
-function rand_set_prop
-{
-	typeset dtst=$1
-	typeset prop=$2
-	shift 2
-	typeset value=$(random_get $@)
-
-	log_must eval "$ZFS set $prop='$value' $dtst"
-}
 
 function edited_prop
 {
@@ -62,15 +50,15 @@ function edited_prop
 
 	case $behaviour in
 		"get")
-			typeset props=$($ZFS inherit 2>&1 | \
-				$AWK '$2=="YES" {print $1}' | \
-				$EGREP -v "^vol|\.\.\.$")
+			typeset props=$(zfs inherit 2>&1 | \
+				awk '$2=="YES" {print $1}' | \
+				egrep -v "^vol|\.\.\.$")
 			for item in $props ; do
 				if [[ $item == "mlslabel" ]] && \
 					! is_te_enabled ; then
 					continue
 				fi
-				$ZFS get -H -o property,value $item $ds >> \
+				zfs get -H -o property,value $item $ds >> \
 					$backfile
 				if (($? != 0)); then
 					log_fail "zfs get -H -o property,value"\
@@ -85,9 +73,9 @@ function edited_prop
 
 			typeset prop value
 			while read prop value ; do
-				eval $ZFS set $prop='$value' $ds
+				eval zfs set $prop='$value' $ds
 				if (($? != 0)); then
-					log_fail "$ZFS set $prop=$value $ds"
+					log_fail "zfs set $prop=$value $ds"
 				fi
 			done < $backfile
 			;;
@@ -106,17 +94,14 @@ function cleanup
 
 	typeset prop
 	for prop in $(fs_inherit_prop) ; do
-		log_must $ZFS inherit $prop $POOL
-		log_must $ZFS inherit $prop $POOL2
+		log_must zfs inherit $prop $POOL
+		log_must zfs inherit $prop $POOL2
 	done
 
-	#if is_shared $POOL; then
-	#	log_must $ZFS set sharenfs=off $POOL
-	#fi
 	log_must setup_test_model $POOL
 
 	if [[ -d $TESTDIR ]]; then
-		log_must $RM -rf $TESTDIR/*
+		log_must rm -rf $TESTDIR/*
 	fi
 }
 
@@ -131,28 +116,27 @@ for fs in "$POOL" "$POOL/pclone" "$POOL/$FS" "$POOL/$FS/fs1" \
 	"$POOL/$FS/fs1/fs2" "$POOL/$FS/fs1/fclone" ; do
 	rand_set_prop $fs aclinherit "discard" "noallow" "secure" "passthrough"
 	rand_set_prop $fs checksum "on" "off" "fletcher2" "fletcher4" "sha256"
-	rand_set_prop $fs aclmode "discard" "groupmask" "passthrough"
+	rand_set_prop $fs acltype "off" "noacl" "posixacl"
 	rand_set_prop $fs atime "on" "off"
 	rand_set_prop $fs checksum "on" "off" "fletcher2" "fletcher4" "sha256"
-	rand_set_prop $fs compression "on" "off" "lzjb" "gzip" \
-		"gzip-1" "gzip-2" "gzip-3" "gzip-4" "gzip-5" "gzip-6"   \
-		"gzip-7" "gzip-8" "gzip-9"
+	rand_set_prop $fs compression "${compress_prop_vals[@]}"
 	rand_set_prop $fs copies "1" "2" "3"
 	rand_set_prop $fs devices "on" "off"
 	rand_set_prop $fs exec "on" "off"
 	rand_set_prop $fs quota "512M" "1024M"
 	rand_set_prop $fs recordsize "512" "2K" "8K" "32K" "128K"
+	rand_set_prop $fs dnodesize "legacy" "auto" "1k" "2k" "4k" "8k" "16k"
 	rand_set_prop $fs setuid "on" "off"
 	rand_set_prop $fs snapdir "hidden" "visible"
-	rand_set_prop $fs xattr "on" "off"
+	if ! is_freebsd; then
+		rand_set_prop $fs xattr "on" "off"
+	fi
 	rand_set_prop $fs user:prop "aaa" "bbb" "23421" "()-+?"
 done
 
 for vol in "$POOL/vol" "$POOL/$FS/vol" ; do
 	rand_set_prop $vol checksum "on" "off" "fletcher2" "fletcher4" "sha256"
-	rand_set_prop $vol compression "on" "off" "lzjb" "gzip" \
-		"gzip-1" "gzip-2" "gzip-3" "gzip-4" "gzip-5" "gzip-6"   \
-		"gzip-7" "gzip-8" "gzip-9"
+	rand_set_prop $vol compression "${compress_prop_vals[@]}"
 	rand_set_prop $vol readonly "on" "off"
 	rand_set_prop $vol copies "1" "2" "3"
 	rand_set_prop $vol user:prop "aaa" "bbb" "23421" "()-+?"
@@ -160,13 +144,14 @@ done
 
 
 # Verify inherited property can be received
-rand_set_prop $POOL sharenfs "on" "off" "rw"
+rand_set_prop $POOL redundant_metadata "all" "most"
+rand_set_prop $POOL sync "standard" "always" "disabled"
 
 #
 # Duplicate POOL2 for testing
 #
-log_must eval "$ZFS send -R $POOL@final > $BACKDIR/pool-final-R"
-log_must eval "$ZFS receive -d -F $POOL2 < $BACKDIR/pool-final-R"
+log_must eval "zfs send -R $POOL@final > $BACKDIR/pool-final-R"
+log_must eval "zfs receive -d -F $POOL2 < $BACKDIR/pool-final-R"
 
 #
 # Define all the POOL/POOL2 datasets pair
@@ -188,7 +173,7 @@ while ((i < ${#pair[@]})); do
 done
 
 
-$ZPOOL upgrade -v | $GREP "Snapshot properties" > /dev/null 2>&1
+zpool upgrade -v | grep "Snapshot properties" > /dev/null 2>&1
 if (( $? == 0 )) ; then
 	i=0
 	while ((i < ${#pair[@]})); do

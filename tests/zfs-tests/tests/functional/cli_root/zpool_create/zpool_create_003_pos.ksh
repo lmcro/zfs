@@ -26,7 +26,7 @@
 #
 
 #
-# Copyright (c) 2012 by Delphix. All rights reserved.
+# Copyright (c) 2012, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -38,7 +38,8 @@
 # actually creating the pool.
 #
 # STRATEGY:
-# 1. Create storage pool with -n option
+# 1. Create storage pool with -n option; this should only work when valid
+#    properties are specified on the command line
 # 2. Verify the pool has not been actually created
 #
 
@@ -46,36 +47,49 @@ verify_runnable "global"
 
 function cleanup
 {
-	[[ -e $tmpfile ]] && log_must $RM -f $tmpfile
+	poolexists $TESTPOOL && destroy_pool $TESTPOOL
+	rm -f $tmpfile
 }
 
-tmpfile="/var/tmp/zpool_create_003.tmp$$"
+tmpfile="$TEST_BASE_DIR/zpool_create_003.tmp$$"
 
-log_assert "'zpool create -n <pool> <vspec> ...' can display the configureation" \
+log_assert "'zpool create -n <pool> <vspec> ...' can display the configuration" \
         "without actually creating the pool."
 
 log_onexit cleanup
 
-if [[ -n $DISK ]]; then
-        disk=$DISK
-else
-        disk=$DISK0
-fi
+typeset goodprops=('' '-o comment=text' '-O checksum=on' '-O ns:prop=value')
+typeset badprops=('-o ashift=9999' '-O doesnotexist=on' '-O volsize=10M')
 
-#
-# Make sure disk is clean before we use it
-#
-create_pool $TESTPOOL ${disk}${SLICE_PREFIX}${SLICE0} > $tmpfile
-destroy_pool $TESTPOOL
+# Verify zpool create -n with valid pool-level and fs-level options
+for prop in "${goodprops[@]}"
+do
+	#
+	# Make sure disk is clean before we use it
+	#
+	create_pool $TESTPOOL $DISK0 > $tmpfile
+	destroy_pool $TESTPOOL
 
-$ZPOOL create -n  $TESTPOOL ${disk}${SLICE_PREFIX}${SLICE0} > $tmpfile
+	log_must eval "zpool create -n $prop $TESTPOOL $DISK0 > $tmpfile"
 
-poolexists $TESTPOOL && \
-        log_fail "'zpool create -n <pool> <vspec> ...' fail."
+	poolexists $TESTPOOL && \
+		log_fail "'zpool create -n <pool> <vspec> ...' fail."
 
-str="would create '$TESTPOOL' with the following layout:"
-$CAT $tmpfile | $GREP "$str" >/dev/null 2>&1
-(( $? != 0 )) && \
-        log_fail "'zpool create -n <pool> <vspec>...' is executed as unexpected."
+	str="would create '$TESTPOOL' with the following layout:"
+	grep "$str" $tmpfile >/dev/null 2>&1 || \
+		log_fail "'zpool create -n <pool> <vspec>...' is executed as unexpected."
+done
+
+# Verify zpool create -n with invalid options
+for prop in "${badprops[@]}"
+do
+	#
+	# Make sure disk is clean before we use it
+	#
+	create_pool $TESTPOOL $DISK0 > $tmpfile
+	destroy_pool $TESTPOOL
+
+	log_mustnot zpool create -n $prop $TESTPOOL $DISK0
+done
 
 log_pass "'zpool create -n <pool> <vspec>...' success."

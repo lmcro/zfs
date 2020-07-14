@@ -4,16 +4,15 @@ VPATH = \
 	$(top_srcdir)/module/nvpair \
 	$(top_srcdir)/lib/libnvpair
 
-AM_CFLAGS += $(DEBUG_STACKFLAGS) $(FRAME_LARGER_THAN)
-
-DEFAULT_INCLUDES += \
-	-I$(top_srcdir)/include \
-	-I$(top_srcdir)/lib/libspl/include
+# Includes kernel code, generate warnings for large stack frames
+# and required CFLAGS for libtirpc
+AM_CFLAGS += $(FRAME_LARGER_THAN) $(LIBTIRPC_CFLAGS)
 
 lib_LTLIBRARIES = libnvpair.la
 
 USER_C = \
 	libnvpair.c \
+	libnvpair_json.c \
 	nvpair_alloc_system.c
 
 KERNEL_C = \
@@ -21,13 +20,21 @@ KERNEL_C = \
 	nvpair.c \
 	fnvpair.c
 
+dist_libnvpair_la_SOURCES = \
+	$(USER_C)
+
 nodist_libnvpair_la_SOURCES = \
-	$(USER_C) \
 	$(KERNEL_C)
 
 libnvpair_la_LIBADD = \
-        $(top_builddir)/lib/libuutil/libuutil.la
+	$(abs_top_builddir)/lib/libspl/libspl_assert.la
 
-libnvpair_la_LDFLAGS = -version-info 1:1:0
+libnvpair_la_LIBADD += $(LIBTIRPC_LIBS) $(LTLIBINTL)
 
-EXTRA_DIST = $(USER_C)
+libnvpair_la_LDFLAGS = -Wl,-z,defs
+
+if BUILD_FREEBSD
+libnvpair_la_LDFLAGS += -version-info 3:0:0
+else
+libnvpair_la_LDFLAGS += -version-info 1:1:0
+endif

@@ -21,19 +21,22 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2013, Joyent, Inc. All rights reserved.
- * Copyright (c) 2011, 2015 by Delphix. All rights reserved.
+ * Copyright 2019 Joyent, Inc.
+ * Copyright (c) 2011, 2020 by Delphix. All rights reserved.
  * Copyright (c) 2012 DEY Storage Systems, Inc.  All rights reserved.
  * Copyright (c) 2012 Pawel Jakub Dawidek <pawel@dawidek.net>.
  * Copyright (c) 2013 Martin Matuska. All rights reserved.
  * Copyright (c) 2013 Steven Hartland. All rights reserved.
- * Copyright 2013 Nexenta Systems, Inc. All rights reserved.
+ * Copyright 2017 Nexenta Systems, Inc.
+ * Copyright 2016 Igor Kozhukhov <ikozhukhov@gmail.com>
+ * Copyright 2017-2018 RackTop Systems.
+ * Copyright (c) 2019 Datto Inc.
+ * Copyright (c) 2019, loli10K <ezomori.nozomu@gmail.com>
  */
 
 #include <ctype.h>
 #include <errno.h>
 #include <libintl.h>
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <strings.h>
@@ -43,7 +46,6 @@
 #include <fcntl.h>
 #include <sys/mntent.h>
 #include <sys/mount.h>
-#include <priv.h>
 #include <pwd.h>
 #include <grp.h>
 #include <stddef.h>
@@ -57,11 +59,14 @@
 #include <sys/dnode.h>
 #include <sys/spa.h>
 #include <sys/zap.h>
+#include <sys/dsl_crypt.h>
 #include <libzfs.h>
+#include <libzutil.h>
 
 #include "zfs_namecheck.h"
 #include "zfs_prop.h"
 #include "libzfs_impl.h"
+#include "libzfs.h"
 #include "zfs_deleg.h"
 
 static int userquota_propname_decode(const char *propname, boolean_t zoned,
@@ -81,8 +86,12 @@ zfs_type_to_name(zfs_type_t type)
 		return (dgettext(TEXT_DOMAIN, "snapshot"));
 	case ZFS_TYPE_VOLUME:
 		return (dgettext(TEXT_DOMAIN, "volume"));
+	case ZFS_TYPE_POOL:
+		return (dgettext(TEXT_DOMAIN, "pool"));
+	case ZFS_TYPE_BOOKMARK:
+		return (dgettext(TEXT_DOMAIN, "bookmark"));
 	default:
-		break;
+		assert(!"unhandled zfs_type_t");
 	}
 
 	return (NULL);
@@ -100,8 +109,42 @@ zfs_validate_name(libzfs_handle_t *hdl, const char *path, int type,
 	namecheck_err_t why;
 	char what;
 
-	(void) zfs_prop_get_table();
-	if (dataset_namecheck(path, &why, &what) != 0) {
+	if (!(type & ZFS_TYPE_SNAPSHOT) && strchr(path, '@') != NULL) {
+		if (hdl != NULL)
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			    "snapshot delimiter '@' is not expected here"));
+		return (0);
+	}
+
+	if (type == ZFS_TYPE_SNAPSHOT && strchr(path, '@') == NULL) {
+		if (hdl != NULL)
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			    "missing '@' delimiter in snapshot name"));
+		return (0);
+	}
+
+	if (!(type & ZFS_TYPE_BOOKMARK) && strchr(path, '#') != NULL) {
+		if (hdl != NULL)
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			    "bookmark delimiter '#' is not expected here"));
+		return (0);
+	}
+
+	if (type == ZFS_TYPE_BOOKMARK && strchr(path, '#') == NULL) {
+		if (hdl != NULL)
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			    "missing '#' delimiter in bookmark name"));
+		return (0);
+	}
+
+	if (modifying && strchr(path, '%') != NULL) {
+		if (hdl != NULL)
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			    "invalid character %c in name"), '%');
+		return (0);
+	}
+
+	if (entity_namecheck(path, &why, &what) != 0) {
 		if (hdl != NULL) {
 			switch (why) {
 			case NAME_ERR_TOOLONG:
@@ -116,7 +159,8 @@ zfs_validate_name(libzfs_handle_t *hdl, const char *path, int type,
 
 			case NAME_ERR_EMPTY_COMPONENT:
 				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-				    "empty component in name"));
+				    "empty component or misplaced '@'"
+				    " or '#' delimiter in name"));
 				break;
 
 			case NAME_ERR_TRAILING_SLASH:
@@ -130,9 +174,10 @@ zfs_validate_name(libzfs_handle_t *hdl, const char *path, int type,
 				    "'%c' in name"), what);
 				break;
 
-			case NAME_ERR_MULTIPLE_AT:
+			case NAME_ERR_MULTIPLE_DELIMITERS:
 				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-				    "multiple '@' delimiters in name"));
+				    "multiple '@' and/or '#' delimiters in "
+				    "name"));
 				break;
 
 			case NAME_ERR_NOLETTER:
@@ -149,32 +194,24 @@ zfs_validate_name(libzfs_handle_t *hdl, const char *path, int type,
 				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 				    "reserved disk name"));
 				break;
+
+			case NAME_ERR_SELF_REF:
+				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+				    "self reference, '.' is found in name"));
+				break;
+
+			case NAME_ERR_PARENT_REF:
+				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+				    "parent reference, '..' is found in name"));
+				break;
+
 			default:
+				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+				    "(%d) not defined"), why);
 				break;
 			}
 		}
 
-		return (0);
-	}
-
-	if (!(type & ZFS_TYPE_SNAPSHOT) && strchr(path, '@') != NULL) {
-		if (hdl != NULL)
-			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-			    "snapshot delimiter '@' in filesystem name"));
-		return (0);
-	}
-
-	if (type == ZFS_TYPE_SNAPSHOT && strchr(path, '@') == NULL) {
-		if (hdl != NULL)
-			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-			    "missing '@' delimiter in snapshot name"));
-		return (0);
-	}
-
-	if (modifying && strchr(path, '%') != NULL) {
-		if (hdl != NULL)
-			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-			    "invalid character %c in name"), '%');
 		return (0);
 	}
 
@@ -295,7 +332,7 @@ get_stats_ioctl(zfs_handle_t *zhp, zfs_cmd_t *zc)
 
 	(void) strlcpy(zc->zc_name, zhp->zfs_name, sizeof (zc->zc_name));
 
-	while (ioctl(hdl->libzfs_fd, ZFS_IOC_OBJSET_STATS, zc) != 0) {
+	while (zfs_ioctl(hdl, ZFS_IOC_OBJSET_STATS, zc) != 0) {
 		if (errno == ENOMEM) {
 			if (zcmd_expand_dst_nvlist(hdl, zc) != 0) {
 				return (-1);
@@ -323,7 +360,7 @@ get_recvd_props_ioctl(zfs_handle_t *zhp)
 
 	(void) strlcpy(zc.zc_name, zhp->zfs_name, sizeof (zc.zc_name));
 
-	while (ioctl(hdl->libzfs_fd, ZFS_IOC_OBJSET_RECVD_PROPS, &zc) != 0) {
+	while (zfs_ioctl(hdl, ZFS_IOC_OBJSET_RECVD_PROPS, &zc) != 0) {
 		if (errno == ENOMEM) {
 			if (zcmd_expand_dst_nvlist(hdl, &zc) != 0) {
 				return (-1);
@@ -442,7 +479,7 @@ make_dataset_handle(libzfs_handle_t *hdl, const char *path)
 {
 	zfs_cmd_t zc = {"\0"};
 
-	zfs_handle_t *zhp = calloc(sizeof (zfs_handle_t), 1);
+	zfs_handle_t *zhp = calloc(1, sizeof (zfs_handle_t));
 
 	if (zhp == NULL)
 		return (NULL);
@@ -469,7 +506,7 @@ make_dataset_handle(libzfs_handle_t *hdl, const char *path)
 zfs_handle_t *
 make_dataset_handle_zc(libzfs_handle_t *hdl, zfs_cmd_t *zc)
 {
-	zfs_handle_t *zhp = calloc(sizeof (zfs_handle_t), 1);
+	zfs_handle_t *zhp = calloc(1, sizeof (zfs_handle_t));
 
 	if (zhp == NULL)
 		return (NULL);
@@ -486,7 +523,7 @@ make_dataset_handle_zc(libzfs_handle_t *hdl, zfs_cmd_t *zc)
 zfs_handle_t *
 make_dataset_simple_handle_zc(zfs_handle_t *pzhp, zfs_cmd_t *zc)
 {
-	zfs_handle_t *zhp = calloc(sizeof (zfs_handle_t), 1);
+	zfs_handle_t *zhp = calloc(1, sizeof (zfs_handle_t));
 
 	if (zhp == NULL)
 		return (NULL);
@@ -503,7 +540,7 @@ make_dataset_simple_handle_zc(zfs_handle_t *pzhp, zfs_cmd_t *zc)
 zfs_handle_t *
 zfs_handle_dup(zfs_handle_t *zhp_orig)
 {
-	zfs_handle_t *zhp = calloc(sizeof (zfs_handle_t), 1);
+	zfs_handle_t *zhp = calloc(1, sizeof (zfs_handle_t));
 
 	if (zhp == NULL)
 		return (NULL);
@@ -552,12 +589,11 @@ zfs_bookmark_exists(const char *path)
 {
 	nvlist_t *bmarks;
 	nvlist_t *props;
-	char fsname[ZFS_MAXNAMELEN];
+	char fsname[ZFS_MAX_DATASET_NAME_LEN];
 	char *bmark_name;
 	char *pound;
 	int err;
 	boolean_t rv;
-
 
 	(void) strlcpy(fsname, path, sizeof (fsname));
 	pound = strchr(fsname, '#');
@@ -583,7 +619,7 @@ zfs_handle_t *
 make_bookmark_handle(zfs_handle_t *parent, const char *path,
     nvlist_t *bmark_props)
 {
-	zfs_handle_t *zhp = calloc(sizeof (zfs_handle_t), 1);
+	zfs_handle_t *zhp = calloc(1, sizeof (zfs_handle_t));
 
 	if (zhp == NULL)
 		return (NULL);
@@ -611,8 +647,36 @@ make_bookmark_handle(zfs_handle_t *parent, const char *path,
 	return (zhp);
 }
 
+struct zfs_open_bookmarks_cb_data {
+	const char *path;
+	zfs_handle_t *zhp;
+};
+
+static int
+zfs_open_bookmarks_cb(zfs_handle_t *zhp, void *data)
+{
+	struct zfs_open_bookmarks_cb_data *dp = data;
+
+	/*
+	 * Is it the one we are looking for?
+	 */
+	if (strcmp(dp->path, zfs_get_name(zhp)) == 0) {
+		/*
+		 * We found it.  Save it and let the caller know we are done.
+		 */
+		dp->zhp = zhp;
+		return (EEXIST);
+	}
+
+	/*
+	 * Not found.  Close the handle and ask for another one.
+	 */
+	zfs_close(zhp);
+	return (0);
+}
+
 /*
- * Opens the given snapshot, filesystem, or volume.   The 'types'
+ * Opens the given snapshot, bookmark, filesystem, or volume.   The 'types'
  * argument is a mask of acceptable types.  The function will print an
  * appropriate error message and return NULL if it can't be opened.
  */
@@ -621,6 +685,7 @@ zfs_open(libzfs_handle_t *hdl, const char *path, int types)
 {
 	zfs_handle_t *zhp;
 	char errbuf[1024];
+	char *bookp;
 
 	(void) snprintf(errbuf, sizeof (errbuf),
 	    dgettext(TEXT_DOMAIN, "cannot open '%s'"), path);
@@ -628,20 +693,68 @@ zfs_open(libzfs_handle_t *hdl, const char *path, int types)
 	/*
 	 * Validate the name before we even try to open it.
 	 */
-	if (!zfs_validate_name(hdl, path, ZFS_TYPE_DATASET, B_FALSE)) {
-		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-		    "invalid dataset name"));
+	if (!zfs_validate_name(hdl, path, types, B_FALSE)) {
 		(void) zfs_error(hdl, EZFS_INVALIDNAME, errbuf);
 		return (NULL);
 	}
 
 	/*
-	 * Try to get stats for the dataset, which will tell us if it exists.
+	 * Bookmarks needs to be handled separately.
 	 */
-	errno = 0;
-	if ((zhp = make_dataset_handle(hdl, path)) == NULL) {
-		(void) zfs_standard_error(hdl, errno, errbuf);
-		return (NULL);
+	bookp = strchr(path, '#');
+	if (bookp == NULL) {
+		/*
+		 * Try to get stats for the dataset, which will tell us if it
+		 * exists.
+		 */
+		errno = 0;
+		if ((zhp = make_dataset_handle(hdl, path)) == NULL) {
+			(void) zfs_standard_error(hdl, errno, errbuf);
+			return (NULL);
+		}
+	} else {
+		char dsname[ZFS_MAX_DATASET_NAME_LEN];
+		zfs_handle_t *pzhp;
+		struct zfs_open_bookmarks_cb_data cb_data = {path, NULL};
+
+		/*
+		 * We need to cut out '#' and everything after '#'
+		 * to get the parent dataset name only.
+		 */
+		assert(bookp - path < sizeof (dsname));
+		(void) strncpy(dsname, path, bookp - path);
+		dsname[bookp - path] = '\0';
+
+		/*
+		 * Create handle for the parent dataset.
+		 */
+		errno = 0;
+		if ((pzhp = make_dataset_handle(hdl, dsname)) == NULL) {
+			(void) zfs_standard_error(hdl, errno, errbuf);
+			return (NULL);
+		}
+
+		/*
+		 * Iterate bookmarks to find the right one.
+		 */
+		errno = 0;
+		if ((zfs_iter_bookmarks(pzhp, zfs_open_bookmarks_cb,
+		    &cb_data) == 0) && (cb_data.zhp == NULL)) {
+			(void) zfs_error(hdl, EZFS_NOENT, errbuf);
+			zfs_close(pzhp);
+			return (NULL);
+		}
+		if (cb_data.zhp == NULL) {
+			(void) zfs_standard_error(hdl, errno, errbuf);
+			zfs_close(pzhp);
+			return (NULL);
+		}
+		zhp = cb_data.zhp;
+
+		/*
+		 * Cleanup.
+		 */
+		zfs_close(pzhp);
 	}
 
 	if (!(types & zhp->zfs_type)) {
@@ -675,26 +788,25 @@ typedef struct mnttab_node {
 static int
 libzfs_mnttab_cache_compare(const void *arg1, const void *arg2)
 {
-	const mnttab_node_t *mtn1 = arg1;
-	const mnttab_node_t *mtn2 = arg2;
+	const mnttab_node_t *mtn1 = (const mnttab_node_t *)arg1;
+	const mnttab_node_t *mtn2 = (const mnttab_node_t *)arg2;
 	int rv;
 
 	rv = strcmp(mtn1->mtn_mt.mnt_special, mtn2->mtn_mt.mnt_special);
 
-	if (rv == 0)
-		return (0);
-	return (rv > 0 ? 1 : -1);
+	return (TREE_ISIGN(rv));
 }
 
 void
 libzfs_mnttab_init(libzfs_handle_t *hdl)
 {
+	pthread_mutex_init(&hdl->libzfs_mnttab_cache_lock, NULL);
 	assert(avl_numnodes(&hdl->libzfs_mnttab_cache) == 0);
 	avl_create(&hdl->libzfs_mnttab_cache, libzfs_mnttab_cache_compare,
 	    sizeof (mnttab_node_t), offsetof(mnttab_node_t, mtn_node));
 }
 
-int
+static int
 libzfs_mnttab_update(libzfs_handle_t *hdl)
 {
 	struct mnttab entry;
@@ -738,7 +850,8 @@ libzfs_mnttab_fini(libzfs_handle_t *hdl)
 	void *cookie = NULL;
 	mnttab_node_t *mtn;
 
-	while ((mtn = avl_destroy_nodes(&hdl->libzfs_mnttab_cache, &cookie))) {
+	while ((mtn = avl_destroy_nodes(&hdl->libzfs_mnttab_cache, &cookie))
+	    != NULL) {
 		free(mtn->mtn_mt.mnt_special);
 		free(mtn->mtn_mt.mnt_mountp);
 		free(mtn->mtn_mt.mnt_fstype);
@@ -746,6 +859,7 @@ libzfs_mnttab_fini(libzfs_handle_t *hdl)
 		free(mtn);
 	}
 	avl_destroy(&hdl->libzfs_mnttab_cache);
+	(void) pthread_mutex_destroy(&hdl->libzfs_mnttab_cache_lock);
 }
 
 void
@@ -760,7 +874,7 @@ libzfs_mnttab_find(libzfs_handle_t *hdl, const char *fsname,
 {
 	mnttab_node_t find;
 	mnttab_node_t *mtn;
-	int error;
+	int ret = ENOENT;
 
 	if (!hdl->libzfs_mnttab_enable) {
 		struct mnttab srch = { 0 };
@@ -780,17 +894,24 @@ libzfs_mnttab_find(libzfs_handle_t *hdl, const char *fsname,
 			return (ENOENT);
 	}
 
-	if (avl_numnodes(&hdl->libzfs_mnttab_cache) == 0)
-		if ((error = libzfs_mnttab_update(hdl)) != 0)
+	pthread_mutex_lock(&hdl->libzfs_mnttab_cache_lock);
+	if (avl_numnodes(&hdl->libzfs_mnttab_cache) == 0) {
+		int error;
+
+		if ((error = libzfs_mnttab_update(hdl)) != 0) {
+			pthread_mutex_unlock(&hdl->libzfs_mnttab_cache_lock);
 			return (error);
+		}
+	}
 
 	find.mtn_mt.mnt_special = (char *)fsname;
 	mtn = avl_find(&hdl->libzfs_mnttab_cache, &find, NULL);
 	if (mtn) {
 		*entry = mtn->mtn_mt;
-		return (0);
+		ret = 0;
 	}
-	return (ENOENT);
+	pthread_mutex_unlock(&hdl->libzfs_mnttab_cache_lock);
+	return (ret);
 }
 
 void
@@ -799,14 +920,28 @@ libzfs_mnttab_add(libzfs_handle_t *hdl, const char *special,
 {
 	mnttab_node_t *mtn;
 
-	if (avl_numnodes(&hdl->libzfs_mnttab_cache) == 0)
-		return;
-	mtn = zfs_alloc(hdl, sizeof (mnttab_node_t));
-	mtn->mtn_mt.mnt_special = zfs_strdup(hdl, special);
-	mtn->mtn_mt.mnt_mountp = zfs_strdup(hdl, mountp);
-	mtn->mtn_mt.mnt_fstype = zfs_strdup(hdl, MNTTYPE_ZFS);
-	mtn->mtn_mt.mnt_mntopts = zfs_strdup(hdl, mntopts);
-	avl_add(&hdl->libzfs_mnttab_cache, mtn);
+	pthread_mutex_lock(&hdl->libzfs_mnttab_cache_lock);
+	if (avl_numnodes(&hdl->libzfs_mnttab_cache) != 0) {
+		mtn = zfs_alloc(hdl, sizeof (mnttab_node_t));
+		mtn->mtn_mt.mnt_special = zfs_strdup(hdl, special);
+		mtn->mtn_mt.mnt_mountp = zfs_strdup(hdl, mountp);
+		mtn->mtn_mt.mnt_fstype = zfs_strdup(hdl, MNTTYPE_ZFS);
+		mtn->mtn_mt.mnt_mntopts = zfs_strdup(hdl, mntopts);
+		/*
+		 * Another thread may have already added this entry
+		 * via libzfs_mnttab_update. If so we should skip it.
+		 */
+		if (avl_find(&hdl->libzfs_mnttab_cache, mtn, NULL) != NULL) {
+			free(mtn->mtn_mt.mnt_special);
+			free(mtn->mtn_mt.mnt_mountp);
+			free(mtn->mtn_mt.mnt_fstype);
+			free(mtn->mtn_mt.mnt_mntopts);
+			free(mtn);
+		} else {
+			avl_add(&hdl->libzfs_mnttab_cache, mtn);
+		}
+	}
+	pthread_mutex_unlock(&hdl->libzfs_mnttab_cache_lock);
 }
 
 void
@@ -815,8 +950,10 @@ libzfs_mnttab_remove(libzfs_handle_t *hdl, const char *fsname)
 	mnttab_node_t find;
 	mnttab_node_t *ret;
 
+	pthread_mutex_lock(&hdl->libzfs_mnttab_cache_lock);
 	find.mtn_mt.mnt_special = (char *)fsname;
-	if ((ret = avl_find(&hdl->libzfs_mnttab_cache, (void *)&find, NULL))) {
+	if ((ret = avl_find(&hdl->libzfs_mnttab_cache, (void *)&find, NULL))
+	    != NULL) {
 		avl_remove(&hdl->libzfs_mnttab_cache, ret);
 		free(ret->mtn_mt.mnt_special);
 		free(ret->mtn_mt.mnt_mountp);
@@ -824,6 +961,7 @@ libzfs_mnttab_remove(libzfs_handle_t *hdl, const char *fsname)
 		free(ret->mtn_mt.mnt_mntopts);
 		free(ret);
 	}
+	pthread_mutex_unlock(&hdl->libzfs_mnttab_cache_lock);
 }
 
 int
@@ -866,7 +1004,7 @@ zfs_which_resv_prop(zfs_handle_t *zhp, zfs_prop_t *resv_prop)
 nvlist_t *
 zfs_valid_proplist(libzfs_handle_t *hdl, zfs_type_t type, nvlist_t *nvl,
     uint64_t zoned, zfs_handle_t *zhp, zpool_handle_t *zpool_hdl,
-    const char *errbuf)
+    boolean_t key_params_ok, const char *errbuf)
 {
 	nvpair_t *elem;
 	uint64_t intval;
@@ -931,10 +1069,11 @@ zfs_valid_proplist(libzfs_handle_t *hdl, zfs_type_t type, nvlist_t *nvl,
 
 		if (prop == ZPROP_INVAL && zfs_prop_userquota(propname)) {
 			zfs_userquota_prop_t uqtype;
-			char newpropname[128];
+			char *newpropname = NULL;
 			char domain[128];
 			uint64_t rid;
 			uint64_t valary[3];
+			int rc;
 
 			if (userquota_propname_decode(propname, zoned,
 			    &uqtype, domain, sizeof (domain), &rid) != 0) {
@@ -947,7 +1086,11 @@ zfs_valid_proplist(libzfs_handle_t *hdl, zfs_type_t type, nvlist_t *nvl,
 			}
 
 			if (uqtype != ZFS_PROP_USERQUOTA &&
-			    uqtype != ZFS_PROP_GROUPQUOTA) {
+			    uqtype != ZFS_PROP_GROUPQUOTA &&
+			    uqtype != ZFS_PROP_USEROBJQUOTA &&
+			    uqtype != ZFS_PROP_GROUPOBJQUOTA &&
+			    uqtype != ZFS_PROP_PROJECTQUOTA &&
+			    uqtype != ZFS_PROP_PROJECTOBJQUOTA) {
 				zfs_error_aux(hdl,
 				    dgettext(TEXT_DOMAIN, "'%s' is readonly"),
 				    propname);
@@ -972,7 +1115,7 @@ zfs_valid_proplist(libzfs_handle_t *hdl, zfs_type_t type, nvlist_t *nvl,
 				if (intval == 0) {
 					zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 					    "use 'none' to disable "
-					    "userquota/groupquota"));
+					    "{user|group|project}quota"));
 					goto error;
 				}
 			} else {
@@ -987,17 +1130,24 @@ zfs_valid_proplist(libzfs_handle_t *hdl, zfs_type_t type, nvlist_t *nvl,
 			 * userquota@<hex-rid>-domain, to make it easy
 			 * for the kernel to decode.
 			 */
-			(void) snprintf(newpropname, sizeof (newpropname),
-			    "%s%llx-%s", zfs_userquota_prop_prefixes[uqtype],
+			rc = asprintf(&newpropname, "%s%llx-%s",
+			    zfs_userquota_prop_prefixes[uqtype],
 			    (longlong_t)rid, domain);
+			if (rc == -1 || newpropname == NULL) {
+				(void) no_memory(hdl);
+				goto error;
+			}
+
 			valary[0] = uqtype;
 			valary[1] = rid;
 			valary[2] = intval;
 			if (nvlist_add_uint64_array(ret, newpropname,
 			    valary, 3) != 0) {
+				free(newpropname);
 				(void) no_memory(hdl);
 				goto error;
 			}
+			free(newpropname);
 			continue;
 		} else if (prop == ZPROP_INVAL && zfs_prop_written(propname)) {
 			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
@@ -1023,7 +1173,8 @@ zfs_valid_proplist(libzfs_handle_t *hdl, zfs_type_t type, nvlist_t *nvl,
 		}
 
 		if (zfs_prop_readonly(prop) &&
-		    (!zfs_prop_setonce(prop) || zhp != NULL)) {
+		    !(zfs_prop_setonce(prop) && zhp == NULL) &&
+		    !(zfs_prop_encryption_key_param(prop) && key_params_ok)) {
 			zfs_error_aux(hdl,
 			    dgettext(TEXT_DOMAIN, "'%s' is readonly"),
 			    propname);
@@ -1072,7 +1223,7 @@ zfs_valid_proplist(libzfs_handle_t *hdl, zfs_type_t type, nvlist_t *nvl,
 			 */
 			if (intval < SPA_MINBLOCKSIZE ||
 			    intval > maxbs || !ISP2(intval)) {
-				zfs_nicenum(maxbs, buf, sizeof (buf));
+				zfs_nicebytes(maxbs, buf, sizeof (buf));
 				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 				    "'%s' must be power of 2 from 512B "
 				    "to %s"), propname, buf);
@@ -1081,6 +1232,45 @@ zfs_valid_proplist(libzfs_handle_t *hdl, zfs_type_t type, nvlist_t *nvl,
 			}
 			break;
 		}
+
+		case ZFS_PROP_SPECIAL_SMALL_BLOCKS:
+		{
+			int maxbs = SPA_OLD_MAXBLOCKSIZE;
+			char buf[64];
+
+			if (zpool_hdl != NULL) {
+				char state[64] = "";
+
+				maxbs = zpool_get_prop_int(zpool_hdl,
+				    ZPOOL_PROP_MAXBLOCKSIZE, NULL);
+
+				/*
+				 * Issue a warning but do not fail so that
+				 * tests for settable properties succeed.
+				 */
+				if (zpool_prop_get_feature(zpool_hdl,
+				    "feature@allocation_classes", state,
+				    sizeof (state)) != 0 ||
+				    strcmp(state, ZFS_FEATURE_ACTIVE) != 0) {
+					(void) fprintf(stderr, gettext(
+					    "%s: property requires a special "
+					    "device in the pool\n"), propname);
+				}
+			}
+			if (intval != 0 &&
+			    (intval < SPA_MINBLOCKSIZE ||
+			    intval > maxbs || !ISP2(intval))) {
+				zfs_nicebytes(maxbs, buf, sizeof (buf));
+				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+				    "invalid '%s=%d' property: must be zero or "
+				    "a power of 2 from 512B to %s"), propname,
+				    intval, buf);
+				(void) zfs_error(hdl, EZFS_BADPROP, errbuf);
+				goto error;
+			}
+			break;
+		}
+
 		case ZFS_PROP_MLSLABEL:
 		{
 #ifdef HAVE_MLSLABEL
@@ -1163,7 +1353,12 @@ badlabel:
 					    "component of '%s' is too long"),
 					    propname);
 					break;
+
 				default:
+					zfs_error_aux(hdl,
+					    dgettext(TEXT_DOMAIN,
+					    "(%d) not defined"),
+					    why);
 					break;
 				}
 				(void) zfs_error(hdl, EZFS_BADPROP, errbuf);
@@ -1237,58 +1432,68 @@ badlabel:
 				else
 					proto = PROTO_NFS;
 
-				/*
-				 * Must be an valid sharing protocol
-				 * option string so init the libshare
-				 * in order to enable the parser and
-				 * then parse the options. We use the
-				 * control API since we don't care about
-				 * the current configuration and don't
-				 * want the overhead of loading it
-				 * until we actually do something.
-				 */
-
-				if (zfs_init_libshare(hdl,
-				    SA_INIT_CONTROL_API) != SA_OK) {
-					/*
-					 * An error occurred so we can't do
-					 * anything
-					 */
-					zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-					    "'%s' cannot be set: problem "
-					    "in share initialization"),
-					    propname);
-					(void) zfs_error(hdl, EZFS_BADPROP,
-					    errbuf);
-					goto error;
-				}
-
 				if (zfs_parse_options(strval, proto) != SA_OK) {
-					/*
-					 * There was an error in parsing so
-					 * deal with it by issuing an error
-					 * message and leaving after
-					 * uninitializing the the libshare
-					 * interface.
-					 */
 					zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 					    "'%s' cannot be set to invalid "
 					    "options"), propname);
 					(void) zfs_error(hdl, EZFS_BADPROP,
 					    errbuf);
-					zfs_uninit_libshare(hdl);
 					goto error;
 				}
-				zfs_uninit_libshare(hdl);
 			}
 
 			break;
+
+		case ZFS_PROP_KEYLOCATION:
+			if (!zfs_prop_valid_keylocation(strval, B_FALSE)) {
+				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+				    "invalid keylocation"));
+				(void) zfs_error(hdl, EZFS_BADPROP, errbuf);
+				goto error;
+			}
+
+			if (zhp != NULL) {
+				uint64_t crypt =
+				    zfs_prop_get_int(zhp, ZFS_PROP_ENCRYPTION);
+
+				if (crypt == ZIO_CRYPT_OFF &&
+				    strcmp(strval, "none") != 0) {
+					zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+					    "keylocation must be 'none' "
+					    "for unencrypted datasets"));
+					(void) zfs_error(hdl, EZFS_BADPROP,
+					    errbuf);
+					goto error;
+				} else if (crypt != ZIO_CRYPT_OFF &&
+				    strcmp(strval, "none") == 0) {
+					zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+					    "keylocation must not be 'none' "
+					    "for encrypted datasets"));
+					(void) zfs_error(hdl, EZFS_BADPROP,
+					    errbuf);
+					goto error;
+				}
+			}
+			break;
+
+		case ZFS_PROP_PBKDF2_ITERS:
+			if (intval < MIN_PBKDF2_ITERATIONS) {
+				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+				    "minimum pbkdf2 iterations is %u"),
+				    MIN_PBKDF2_ITERATIONS);
+				(void) zfs_error(hdl, EZFS_BADPROP, errbuf);
+				goto error;
+			}
+			break;
+
 		case ZFS_PROP_UTF8ONLY:
 			chosen_utf = (int)intval;
 			break;
+
 		case ZFS_PROP_NORMALIZE:
 			chosen_normal = (int)intval;
 			break;
+
 		default:
 			break;
 		}
@@ -1298,28 +1503,14 @@ badlabel:
 		 * checks to enforce.
 		 */
 		if (type == ZFS_TYPE_VOLUME && zhp != NULL) {
-			uint64_t volsize = zfs_prop_get_int(zhp,
-			    ZFS_PROP_VOLSIZE);
 			uint64_t blocksize = zfs_prop_get_int(zhp,
 			    ZFS_PROP_VOLBLOCKSIZE);
 			char buf[64];
 
 			switch (prop) {
-			case ZFS_PROP_RESERVATION:
-			case ZFS_PROP_REFRESERVATION:
-				if (intval > volsize) {
-					zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-					    "'%s' is greater than current "
-					    "volume size"), propname);
-					(void) zfs_error(hdl, EZFS_BADPROP,
-					    errbuf);
-					goto error;
-				}
-				break;
-
 			case ZFS_PROP_VOLSIZE:
 				if (intval % blocksize != 0) {
-					zfs_nicenum(blocksize, buf,
+					zfs_nicebytes(blocksize, buf,
 					    sizeof (buf));
 					zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 					    "'%s' must be a multiple of "
@@ -1334,6 +1525,28 @@ badlabel:
 					zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 					    "'%s' cannot be zero"),
 					    propname);
+					(void) zfs_error(hdl, EZFS_BADPROP,
+					    errbuf);
+					goto error;
+				}
+				break;
+
+			default:
+				break;
+			}
+		}
+
+		/* check encryption properties */
+		if (zhp != NULL) {
+			int64_t crypt = zfs_prop_get_int(zhp,
+			    ZFS_PROP_ENCRYPTION);
+
+			switch (prop) {
+			case ZFS_PROP_COPIES:
+				if (crypt != ZIO_CRYPT_OFF && intval > 2) {
+					zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+					    "encrypted datasets cannot have "
+					    "3 copies"));
 					(void) zfs_error(hdl, EZFS_BADPROP,
 					    errbuf);
 					goto error;
@@ -1372,7 +1585,7 @@ error:
 	return (NULL);
 }
 
-int
+static int
 zfs_add_synthetic_resv(zfs_handle_t *zhp, nvlist_t *nvl)
 {
 	uint64_t old_volsize;
@@ -1381,6 +1594,7 @@ zfs_add_synthetic_resv(zfs_handle_t *zhp, nvlist_t *nvl)
 	uint64_t new_reservation;
 	zfs_prop_t resv_prop;
 	nvlist_t *props;
+	zpool_handle_t *zph = zpool_handle(zhp);
 
 	/*
 	 * If this is an existing volume, and someone is setting the volsize,
@@ -1395,7 +1609,7 @@ zfs_add_synthetic_resv(zfs_handle_t *zhp, nvlist_t *nvl)
 	fnvlist_add_uint64(props, zfs_prop_to_name(ZFS_PROP_VOLBLOCKSIZE),
 	    zfs_prop_get_int(zhp, ZFS_PROP_VOLBLOCKSIZE));
 
-	if ((zvol_volsize_to_reservation(old_volsize, props) !=
+	if ((zvol_volsize_to_reservation(zph, old_volsize, props) !=
 	    old_reservation) || nvlist_exists(nvl,
 	    zfs_prop_to_name(resv_prop))) {
 		fnvlist_free(props);
@@ -1406,7 +1620,7 @@ zfs_add_synthetic_resv(zfs_handle_t *zhp, nvlist_t *nvl)
 		fnvlist_free(props);
 		return (-1);
 	}
-	new_reservation = zvol_volsize_to_reservation(new_volsize, props);
+	new_reservation = zvol_volsize_to_reservation(zph, new_volsize, props);
 	fnvlist_free(props);
 
 	if (nvlist_add_uint64(nvl, zfs_prop_to_name(resv_prop),
@@ -1417,95 +1631,60 @@ zfs_add_synthetic_resv(zfs_handle_t *zhp, nvlist_t *nvl)
 	return (1);
 }
 
-void
-zfs_setprop_error(libzfs_handle_t *hdl, zfs_prop_t prop, int err,
-    char *errbuf)
+/*
+ * Helper for 'zfs {set|clone} refreservation=auto'.  Must be called after
+ * zfs_valid_proplist(), as it is what sets the UINT64_MAX sentinel value.
+ * Return codes must match zfs_add_synthetic_resv().
+ */
+static int
+zfs_fix_auto_resv(zfs_handle_t *zhp, nvlist_t *nvl)
 {
-	switch (err) {
+	uint64_t volsize;
+	uint64_t resvsize;
+	zfs_prop_t prop;
+	nvlist_t *props;
 
-	case ENOSPC:
-		/*
-		 * For quotas and reservations, ENOSPC indicates
-		 * something different; setting a quota or reservation
-		 * doesn't use any disk space.
-		 */
-		switch (prop) {
-		case ZFS_PROP_QUOTA:
-		case ZFS_PROP_REFQUOTA:
-			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-			    "size is less than current used or "
-			    "reserved space"));
-			(void) zfs_error(hdl, EZFS_PROPSPACE, errbuf);
-			break;
-
-		case ZFS_PROP_RESERVATION:
-		case ZFS_PROP_REFRESERVATION:
-			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-			    "size is greater than available space"));
-			(void) zfs_error(hdl, EZFS_PROPSPACE, errbuf);
-			break;
-
-		default:
-			(void) zfs_standard_error(hdl, err, errbuf);
-			break;
-		}
-		break;
-
-	case EBUSY:
-		(void) zfs_standard_error(hdl, EBUSY, errbuf);
-		break;
-
-	case EROFS:
-		(void) zfs_error(hdl, EZFS_DSREADONLY, errbuf);
-		break;
-
-	case E2BIG:
-		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-		    "property value too long"));
-		(void) zfs_error(hdl, EZFS_BADPROP, errbuf);
-		break;
-
-	case ENOTSUP:
-		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-		    "pool and or dataset must be upgraded to set this "
-		    "property or value"));
-		(void) zfs_error(hdl, EZFS_BADVERSION, errbuf);
-		break;
-
-	case ERANGE:
-		if (prop == ZFS_PROP_COMPRESSION ||
-		    prop == ZFS_PROP_RECORDSIZE) {
-			(void) zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-			    "property setting is not allowed on "
-			    "bootable datasets"));
-			(void) zfs_error(hdl, EZFS_NOTSUP, errbuf);
-		} else {
-			(void) zfs_standard_error(hdl, err, errbuf);
-		}
-		break;
-
-	case EINVAL:
-		if (prop == ZPROP_INVAL) {
-			(void) zfs_error(hdl, EZFS_BADPROP, errbuf);
-		} else {
-			(void) zfs_standard_error(hdl, err, errbuf);
-		}
-		break;
-
-	case EOVERFLOW:
-		/*
-		 * This platform can't address a volume this big.
-		 */
-#ifdef _ILP32
-		if (prop == ZFS_PROP_VOLSIZE) {
-			(void) zfs_error(hdl, EZFS_VOLTOOBIG, errbuf);
-			break;
-		}
-#endif
-		/* FALLTHROUGH */
-	default:
-		(void) zfs_standard_error(hdl, err, errbuf);
+	if (!ZFS_IS_VOLUME(zhp)) {
+		return (0);
 	}
+
+	if (zfs_which_resv_prop(zhp, &prop) != 0) {
+		return (-1);
+	}
+
+	if (prop != ZFS_PROP_REFRESERVATION) {
+		return (0);
+	}
+
+	if (nvlist_lookup_uint64(nvl, zfs_prop_to_name(prop), &resvsize) != 0) {
+		/* No value being set, so it can't be "auto" */
+		return (0);
+	}
+	if (resvsize != UINT64_MAX) {
+		/* Being set to a value other than "auto" */
+		return (0);
+	}
+
+	props = fnvlist_alloc();
+
+	fnvlist_add_uint64(props, zfs_prop_to_name(ZFS_PROP_VOLBLOCKSIZE),
+	    zfs_prop_get_int(zhp, ZFS_PROP_VOLBLOCKSIZE));
+
+	if (nvlist_lookup_uint64(nvl, zfs_prop_to_name(ZFS_PROP_VOLSIZE),
+	    &volsize) != 0) {
+		volsize = zfs_prop_get_int(zhp, ZFS_PROP_VOLSIZE);
+	}
+
+	resvsize = zvol_volsize_to_reservation(zpool_handle(zhp), volsize,
+	    props);
+	fnvlist_free(props);
+
+	(void) nvlist_remove_all(nvl, zfs_prop_to_name(prop));
+	if (nvlist_add_uint64(nvl, zfs_prop_to_name(prop), resvsize) != 0) {
+		(void) no_memory(zhp->zfs_hdl);
+		return (-1);
+	}
+	return (1);
 }
 
 static boolean_t
@@ -1572,7 +1751,7 @@ zfs_prop_set_list(zfs_handle_t *zhp, nvlist_t *props)
 	char errbuf[1024];
 	libzfs_handle_t *hdl = zhp->zfs_hdl;
 	nvlist_t *nvl;
-	int nvl_len;
+	int nvl_len = 0;
 	int added_resv = 0;
 	zfs_prop_t prop = 0;
 	nvpair_t *elem;
@@ -1583,7 +1762,7 @@ zfs_prop_set_list(zfs_handle_t *zhp, nvlist_t *props)
 
 	if ((nvl = zfs_valid_proplist(hdl, zhp->zfs_type, props,
 	    zfs_prop_get_int(zhp, ZFS_PROP_ZONED), zhp, zhp->zpool_hdl,
-	    errbuf)) == NULL)
+	    B_FALSE, errbuf)) == NULL)
 		goto error;
 
 	/*
@@ -1598,11 +1777,16 @@ zfs_prop_set_list(zfs_handle_t *zhp, nvlist_t *props)
 			goto error;
 		}
 	}
+
+	if (added_resv != 1 &&
+	    (added_resv = zfs_fix_auto_resv(zhp, nvl)) == -1) {
+		goto error;
+	}
+
 	/*
 	 * Check how many properties we're setting and allocate an array to
 	 * store changelist pointers for postfix().
 	 */
-	nvl_len = 0;
 	for (elem = nvlist_next_nvpair(nvl, NULL);
 	    elem != NULL;
 	    elem = nvlist_next_nvpair(nvl, elem))
@@ -1623,8 +1807,9 @@ zfs_prop_set_list(zfs_handle_t *zhp, nvlist_t *props)
 		 * its canmount property to 'on' or 'noauto'.  We only use
 		 * the changelist logic to unmount when setting canmount=off.
 		 */
-		if (!(prop == ZFS_PROP_CANMOUNT &&
-		    fnvpair_value_uint64(elem) != ZFS_CANMOUNT_OFF)) {
+		if (prop != ZFS_PROP_CANMOUNT ||
+		    (fnvpair_value_uint64(elem) == ZFS_CANMOUNT_OFF &&
+		    zfs_is_mounted(zhp, NULL))) {
 			cls[cl_idx] = changelist_gather(zhp, prop, 0, 0);
 			if (cls[cl_idx] == NULL)
 				goto error;
@@ -1659,13 +1844,18 @@ zfs_prop_set_list(zfs_handle_t *zhp, nvlist_t *props)
 	ret = zfs_ioctl(hdl, ZFS_IOC_SET_PROP, &zc);
 
 	if (ret != 0) {
+		if (zc.zc_nvlist_dst_filled == B_FALSE) {
+			(void) zfs_standard_error(hdl, errno, errbuf);
+			goto error;
+		}
+
 		/* Get the list of unset properties back and report them. */
 		nvlist_t *errorprops = NULL;
 		if (zcmd_read_dst_nvlist(hdl, &zc, &errorprops) != 0)
 			goto error;
-		for (elem = nvlist_next_nvpair(nvl, NULL);
+		for (nvpair_t *elem = nvlist_next_nvpair(errorprops, NULL);
 		    elem != NULL;
-		    elem = nvlist_next_nvpair(nvl, elem)) {
+		    elem = nvlist_next_nvpair(errorprops, elem)) {
 			prop = zfs_name_to_prop(nvpair_name(elem));
 			zfs_setprop_error(hdl, prop, errno, errbuf);
 		}
@@ -1865,22 +2055,21 @@ getprop_uint64(zfs_handle_t *zhp, zfs_prop_t prop, char **source)
 	return (value);
 }
 
-static char *
+static const char *
 getprop_string(zfs_handle_t *zhp, zfs_prop_t prop, char **source)
 {
 	nvlist_t *nv;
-	char *value;
+	const char *value;
 
 	*source = NULL;
 	if (nvlist_lookup_nvlist(zhp->zfs_props,
 	    zfs_prop_to_name(prop), &nv) == 0) {
-		verify(nvlist_lookup_string(nv, ZPROP_VALUE, &value) == 0);
+		value = fnvlist_lookup_string(nv, ZPROP_VALUE);
 		(void) nvlist_lookup_string(nv, ZPROP_SOURCE, source);
 	} else {
 		verify(!zhp->zfs_props_table ||
 		    zhp->zfs_props_table[prop] == B_TRUE);
-		if ((value = (char *)zfs_prop_default_string(prop)) == NULL)
-			value = "";
+		value = zfs_prop_default_string(prop);
 		*source = "";
 	}
 
@@ -1912,9 +2101,9 @@ zfs_unset_recvd_props_mode(zfs_handle_t *zhp, uint64_t *cookie)
  * zfs_prop_get_int() are built using this interface.
  *
  * Certain properties can be overridden using 'mount -o'.  In this case, scan
- * the contents of the /etc/mtab entry, searching for the appropriate options.
- * If they differ from the on-disk values, report the current values and mark
- * the source "temporary".
+ * the contents of the /proc/self/mounts entry, searching for the
+ * appropriate options. If they differ from the on-disk values, report the
+ * current values and mark the source "temporary".
  */
 static int
 get_numeric_property(zfs_handle_t *zhp, zfs_prop_t prop, zprop_source_t *src,
@@ -1934,9 +2123,9 @@ get_numeric_property(zfs_handle_t *zhp, zfs_prop_t prop, zprop_source_t *src,
 	 * the property is valid for the snapshot's head dataset type.
 	 */
 	if (zhp->zfs_type == ZFS_TYPE_SNAPSHOT &&
-		!zfs_prop_valid_for_type(prop, zhp->zfs_head_type, B_TRUE)) {
-			*val = zfs_prop_default_numeric(prop);
-			return (-1);
+	    !zfs_prop_valid_for_type(prop, zhp->zfs_head_type, B_TRUE)) {
+		*val = zfs_prop_default_numeric(prop);
+		return (-1);
 	}
 
 	switch (prop) {
@@ -1979,14 +2168,16 @@ get_numeric_property(zfs_handle_t *zhp, zfs_prop_t prop, zprop_source_t *src,
 		mntopt_on = MNTOPT_NBMAND;
 		mntopt_off = MNTOPT_NONBMAND;
 		break;
+
 	default:
 		break;
 	}
 
 	/*
 	 * Because looking up the mount options is potentially expensive
-	 * (iterating over all of /etc/mtab), we defer its calculation until
-	 * we're looking up a property which requires its presence.
+	 * (iterating over all of /proc/self/mounts), we defer its
+	 * calculation until we're looking up a property which requires
+	 * its presence.
 	 */
 	if (!zhp->zfs_mntcheck &&
 	    (mntopt_on != NULL || prop == ZFS_PROP_MOUNTED)) {
@@ -2015,7 +2206,9 @@ get_numeric_property(zfs_handle_t *zhp, zfs_prop_t prop, zprop_source_t *src,
 	case ZFS_PROP_EXEC:
 	case ZFS_PROP_READONLY:
 	case ZFS_PROP_SETUID:
+#ifndef __FreeBSD__
 	case ZFS_PROP_XATTR:
+#endif
 	case ZFS_PROP_NBMAND:
 		*val = getprop_uint64(zhp, prop, source);
 
@@ -2079,13 +2272,16 @@ get_numeric_property(zfs_handle_t *zhp, zfs_prop_t prop, zprop_source_t *src,
 			zcmd_free_nvlists(&zc);
 			return (-1);
 		}
-		if (zplprops)
-			nvlist_free(zplprops);
+		nvlist_free(zplprops);
 		zcmd_free_nvlists(&zc);
 		break;
 
 	case ZFS_PROP_INCONSISTENT:
 		*val = zhp->zfs_dmustats.dds_inconsistent;
+		break;
+
+	case ZFS_PROP_REDACTED:
+		*val = zhp->zfs_dmustats.dds_redacted;
 		break;
 
 	default:
@@ -2096,11 +2292,15 @@ get_numeric_property(zfs_handle_t *zhp, zfs_prop_t prop, zprop_source_t *src,
 			/*
 			 * If we tried to use a default value for a
 			 * readonly property, it means that it was not
-			 * present.
+			 * present.  Note this only applies to "truly"
+			 * readonly properties, not set-once properties
+			 * like volblocksize.
 			 */
 			if (zfs_prop_readonly(prop) &&
+			    !zfs_prop_setonce(prop) &&
 			    *source != NULL && (*source)[0] == '\0') {
 				*source = NULL;
+				return (-1);
 			}
 			break;
 
@@ -2123,8 +2323,10 @@ static void
 get_source(zfs_handle_t *zhp, zprop_source_t *srctype, char *source,
     char *statbuf, size_t statlen)
 {
-	if (statbuf == NULL || *srctype == ZPROP_SRC_TEMPORARY)
+	if (statbuf == NULL ||
+	    srctype == NULL || *srctype == ZPROP_SRC_TEMPORARY) {
 		return;
+	}
 
 	if (source == NULL) {
 		*srctype = ZPROP_SRC_NONE;
@@ -2203,10 +2405,10 @@ struct get_clones_arg {
 	uint64_t numclones;
 	nvlist_t *value;
 	const char *origin;
-	char buf[ZFS_MAXNAMELEN];
+	char buf[ZFS_MAX_DATASET_NAME_LEN];
 };
 
-int
+static int
 get_clones_cb(zfs_handle_t *zhp, void *arg)
 {
 	struct get_clones_arg *gca = arg;
@@ -2258,7 +2460,7 @@ zfs_get_clones_nvl(zfs_handle_t *zhp)
 
 		if (gca.numclones != 0) {
 			zfs_handle_t *root;
-			char pool[ZFS_MAXNAMELEN];
+			char pool[ZFS_MAX_DATASET_NAME_LEN];
 			char *cp = pool;
 
 			/* get the pool name */
@@ -2266,6 +2468,11 @@ zfs_get_clones_nvl(zfs_handle_t *zhp)
 			(void) strsep(&cp, "/@");
 			root = zfs_open(zhp->zfs_hdl, pool,
 			    ZFS_TYPE_FILESYSTEM);
+			if (root == NULL) {
+				nvlist_free(nv);
+				nvlist_free(value);
+				return (NULL);
+			}
 
 			(void) get_clones_cb(root, &gca);
 		}
@@ -2289,6 +2496,104 @@ zfs_get_clones_nvl(zfs_handle_t *zhp)
 	return (value);
 }
 
+static int
+get_rsnaps_string(zfs_handle_t *zhp, char *propbuf, size_t proplen)
+{
+	nvlist_t *value;
+	uint64_t *snaps;
+	uint_t nsnaps;
+
+	if (nvlist_lookup_nvlist(zhp->zfs_props,
+	    zfs_prop_to_name(ZFS_PROP_REDACT_SNAPS), &value) != 0)
+		return (-1);
+	if (nvlist_lookup_uint64_array(value, ZPROP_VALUE, &snaps,
+	    &nsnaps) != 0)
+		return (-1);
+	if (nsnaps == 0) {
+		/* There's no redaction snapshots; pass a special value back */
+		(void) snprintf(propbuf, proplen, "none");
+		return (0);
+	}
+	propbuf[0] = '\0';
+	for (int i = 0; i < nsnaps; i++) {
+		char buf[128];
+		if (propbuf[0] != '\0')
+			(void) strlcat(propbuf, ",", proplen);
+		(void) snprintf(buf, sizeof (buf), "%llu",
+		    (u_longlong_t)snaps[i]);
+		(void) strlcat(propbuf, buf, proplen);
+	}
+
+	return (0);
+}
+
+/*
+ * Accepts a property and value and checks that the value
+ * matches the one found by the channel program. If they are
+ * not equal, print both of them.
+ */
+static void
+zcp_check(zfs_handle_t *zhp, zfs_prop_t prop, uint64_t intval,
+    const char *strval)
+{
+	if (!zhp->zfs_hdl->libzfs_prop_debug)
+		return;
+	int error;
+	char *poolname = zhp->zpool_hdl->zpool_name;
+	const char *prop_name = zfs_prop_to_name(prop);
+	const char *program =
+	    "args = ...\n"
+	    "ds = args['dataset']\n"
+	    "prop = args['property']\n"
+	    "value, setpoint = zfs.get_prop(ds, prop)\n"
+	    "return {value=value, setpoint=setpoint}\n";
+	nvlist_t *outnvl;
+	nvlist_t *retnvl;
+	nvlist_t *argnvl = fnvlist_alloc();
+
+	fnvlist_add_string(argnvl, "dataset", zhp->zfs_name);
+	fnvlist_add_string(argnvl, "property", zfs_prop_to_name(prop));
+
+	error = lzc_channel_program_nosync(poolname, program,
+	    10 * 1000 * 1000, 10 * 1024 * 1024, argnvl, &outnvl);
+
+	if (error == 0) {
+		retnvl = fnvlist_lookup_nvlist(outnvl, "return");
+		if (zfs_prop_get_type(prop) == PROP_TYPE_NUMBER) {
+			int64_t ans;
+			error = nvlist_lookup_int64(retnvl, "value", &ans);
+			if (error != 0) {
+				(void) fprintf(stderr, "%s: zcp check error: "
+				    "%u\n", prop_name, error);
+				return;
+			}
+			if (ans != intval) {
+				(void) fprintf(stderr, "%s: zfs found %llu, "
+				    "but zcp found %llu\n", prop_name,
+				    (u_longlong_t)intval, (u_longlong_t)ans);
+			}
+		} else {
+			char *str_ans;
+			error = nvlist_lookup_string(retnvl, "value", &str_ans);
+			if (error != 0) {
+				(void) fprintf(stderr, "%s: zcp check error: "
+				    "%u\n", prop_name, error);
+				return;
+			}
+			if (strcmp(strval, str_ans) != 0) {
+				(void) fprintf(stderr,
+				    "%s: zfs found '%s', but zcp found '%s'\n",
+				    prop_name, strval, str_ans);
+			}
+		}
+	} else {
+		(void) fprintf(stderr, "%s: zcp check failed, channel program "
+		    "error: %u\n", prop_name, error);
+	}
+	nvlist_free(argnvl);
+	nvlist_free(outnvl);
+}
+
 /*
  * Retrieve a property from the given object.  If 'literal' is specified, then
  * numbers are left as exact values.  Otherwise, numbers are converted to a
@@ -2302,7 +2607,7 @@ zfs_prop_get(zfs_handle_t *zhp, zfs_prop_t prop, char *propbuf, size_t proplen,
 {
 	char *source = NULL;
 	uint64_t val;
-	char *str;
+	const char *str;
 	const char *strval;
 	boolean_t received = zfs_is_recvd_props_mode(zhp);
 
@@ -2334,8 +2639,9 @@ zfs_prop_get(zfs_handle_t *zhp, zfs_prop_t prop, char *propbuf, size_t proplen,
 			    strftime(propbuf, proplen, "%a %b %e %k:%M %Y",
 			    &t) == 0)
 				(void) snprintf(propbuf, proplen, "%llu",
-				    (u_longlong_t) val);
+				    (u_longlong_t)val);
 		}
+		zcp_check(zhp, prop, val, NULL);
 		break;
 
 	case ZFS_PROP_MOUNTPOINT:
@@ -2373,8 +2679,8 @@ zfs_prop_get(zfs_handle_t *zhp, zfs_prop_t prop, char *propbuf, size_t proplen,
 			}
 
 			if ((zpool_get_prop(zhp->zpool_hdl,
-			    ZPOOL_PROP_ALTROOT, buf, MAXPATHLEN, NULL)) ||
-			    (strcmp(root, "-") == 0))
+			    ZPOOL_PROP_ALTROOT, buf, MAXPATHLEN, NULL,
+			    B_FALSE)) || (strcmp(root, "-") == 0))
 				root[0] = '\0';
 			/*
 			 * Special case an alternate root of '/'. This will
@@ -2404,17 +2710,19 @@ zfs_prop_get(zfs_handle_t *zhp, zfs_prop_t prop, char *propbuf, size_t proplen,
 			/* 'legacy' or 'none' */
 			(void) strlcpy(propbuf, str, proplen);
 		}
-
+		zcp_check(zhp, prop, 0, propbuf);
 		break;
 
 	case ZFS_PROP_ORIGIN:
-		(void) strlcpy(propbuf, getprop_string(zhp, prop, &source),
-		    proplen);
-		/*
-		 * If there is no parent at all, return failure to indicate that
-		 * it doesn't apply to this dataset.
-		 */
-		if (propbuf[0] == '\0')
+		str = getprop_string(zhp, prop, &source);
+		if (str == NULL)
+			return (-1);
+		(void) strlcpy(propbuf, str, proplen);
+		zcp_check(zhp, prop, 0, str);
+		break;
+
+	case ZFS_PROP_REDACT_SNAPS:
+		if (get_rsnaps_string(zhp, propbuf, proplen) != 0)
 			return (-1);
 		break;
 
@@ -2430,7 +2738,6 @@ zfs_prop_get(zfs_handle_t *zhp, zfs_prop_t prop, char *propbuf, size_t proplen,
 
 		if (get_numeric_property(zhp, prop, src, &source, &val) != 0)
 			return (-1);
-
 		/*
 		 * If quota or reservation is 0, we translate this into 'none'
 		 * (unless literal is set), and indicate that it's the default
@@ -2447,8 +2754,9 @@ zfs_prop_get(zfs_handle_t *zhp, zfs_prop_t prop, char *propbuf, size_t proplen,
 				(void) snprintf(propbuf, proplen, "%llu",
 				    (u_longlong_t)val);
 			else
-				zfs_nicenum(val, propbuf, proplen);
+				zfs_nicebytes(val, propbuf, proplen);
 		}
+		zcp_check(zhp, prop, val, NULL);
 		break;
 
 	case ZFS_PROP_FILESYSTEM_LIMIT:
@@ -2473,15 +2781,23 @@ zfs_prop_get(zfs_handle_t *zhp, zfs_prop_t prop, char *propbuf, size_t proplen,
 		} else {
 			zfs_nicenum(val, propbuf, proplen);
 		}
+
+		zcp_check(zhp, prop, val, NULL);
 		break;
 
 	case ZFS_PROP_REFRATIO:
 	case ZFS_PROP_COMPRESSRATIO:
 		if (get_numeric_property(zhp, prop, src, &source, &val) != 0)
 			return (-1);
-		(void) snprintf(propbuf, proplen, "%llu.%02llux",
-		    (u_longlong_t)(val / 100),
-		    (u_longlong_t)(val % 100));
+		if (literal)
+			(void) snprintf(propbuf, proplen, "%llu.%02llu",
+			    (u_longlong_t)(val / 100),
+			    (u_longlong_t)(val % 100));
+		else
+			(void) snprintf(propbuf, proplen, "%llu.%02llux",
+			    (u_longlong_t)(val / 100),
+			    (u_longlong_t)(val % 100));
+		zcp_check(zhp, prop, val, NULL);
 		break;
 
 	case ZFS_PROP_TYPE:
@@ -2502,6 +2818,7 @@ zfs_prop_get(zfs_handle_t *zhp, zfs_prop_t prop, char *propbuf, size_t proplen,
 			abort();
 		}
 		(void) snprintf(propbuf, proplen, "%s", str);
+		zcp_check(zhp, prop, 0, propbuf);
 		break;
 
 	case ZFS_PROP_MOUNTED:
@@ -2527,6 +2844,7 @@ zfs_prop_get(zfs_handle_t *zhp, zfs_prop_t prop, char *propbuf, size_t proplen,
 		 * consumers.
 		 */
 		(void) strlcpy(propbuf, zhp->zfs_name, proplen);
+		zcp_check(zhp, prop, 0, propbuf);
 		break;
 
 	case ZFS_PROP_MLSLABEL:
@@ -2573,32 +2891,62 @@ zfs_prop_get(zfs_handle_t *zhp, zfs_prop_t prop, char *propbuf, size_t proplen,
 		break;
 
 	case ZFS_PROP_GUID:
+	case ZFS_PROP_CREATETXG:
+	case ZFS_PROP_OBJSETID:
 		/*
-		 * GUIDs are stored as numbers, but they are identifiers.
+		 * These properties are stored as numbers, but they are
+		 * identifiers.
 		 * We don't want them to be pretty printed, because pretty
 		 * printing mangles the ID into a truncated and useless value.
 		 */
 		if (get_numeric_property(zhp, prop, src, &source, &val) != 0)
 			return (-1);
 		(void) snprintf(propbuf, proplen, "%llu", (u_longlong_t)val);
+		zcp_check(zhp, prop, val, NULL);
+		break;
+
+	case ZFS_PROP_REFERENCED:
+	case ZFS_PROP_AVAILABLE:
+	case ZFS_PROP_USED:
+	case ZFS_PROP_USEDSNAP:
+	case ZFS_PROP_USEDDS:
+	case ZFS_PROP_USEDREFRESERV:
+	case ZFS_PROP_USEDCHILD:
+		if (get_numeric_property(zhp, prop, src, &source, &val) != 0)
+			return (-1);
+		if (literal) {
+			(void) snprintf(propbuf, proplen, "%llu",
+			    (u_longlong_t)val);
+		} else {
+			zfs_nicebytes(val, propbuf, proplen);
+		}
+		zcp_check(zhp, prop, val, NULL);
 		break;
 
 	default:
 		switch (zfs_prop_get_type(prop)) {
 		case PROP_TYPE_NUMBER:
 			if (get_numeric_property(zhp, prop, src,
-			    &source, &val) != 0)
+			    &source, &val) != 0) {
 				return (-1);
-			if (literal)
+			}
+
+			if (literal) {
 				(void) snprintf(propbuf, proplen, "%llu",
 				    (u_longlong_t)val);
-			else
+			} else {
 				zfs_nicenum(val, propbuf, proplen);
+			}
+			zcp_check(zhp, prop, val, NULL);
 			break;
 
 		case PROP_TYPE_STRING:
-			(void) strlcpy(propbuf,
-			    getprop_string(zhp, prop, &source), proplen);
+			str = getprop_string(zhp, prop, &source);
+			if (str == NULL)
+				return (-1);
+
+			(void) strlcpy(propbuf, str, proplen);
+			zcp_check(zhp, prop, 0, str);
 			break;
 
 		case PROP_TYPE_INDEX:
@@ -2607,7 +2955,9 @@ zfs_prop_get(zfs_handle_t *zhp, zfs_prop_t prop, char *propbuf, size_t proplen,
 				return (-1);
 			if (zfs_prop_index_to_string(prop, val, &strval) != 0)
 				return (-1);
+
 			(void) strlcpy(propbuf, strval, proplen);
+			zcp_check(zhp, prop, 0, strval);
 			break;
 
 		default:
@@ -2629,14 +2979,14 @@ uint64_t
 zfs_prop_get_int(zfs_handle_t *zhp, zfs_prop_t prop)
 {
 	char *source;
-	uint64_t val;
+	uint64_t val = 0;
 
 	(void) get_numeric_property(zhp, prop, NULL, &source, &val);
 
 	return (val);
 }
 
-int
+static int
 zfs_prop_set_int(zfs_handle_t *zhp, zfs_prop_t prop, uint64_t val)
 {
 	char buf[64];
@@ -2712,6 +3062,8 @@ out:
  * Eg: userused@matt@domain -> ZFS_PROP_USERUSED, "S-1-123-456", 789
  * Eg: groupquota@staff -> ZFS_PROP_GROUPQUOTA, "", 1234
  * Eg: groupused@staff -> ZFS_PROP_GROUPUSED, "", 1234
+ * Eg: projectquota@123 -> ZFS_PROP_PROJECTQUOTA, "", 123
+ * Eg: projectused@789 -> ZFS_PROP_PROJECTUSED, "", 789
  */
 static int
 userquota_propname_decode(const char *propname, boolean_t zoned,
@@ -2721,12 +3073,13 @@ userquota_propname_decode(const char *propname, boolean_t zoned,
 	char *cp;
 	boolean_t isuser;
 	boolean_t isgroup;
+	boolean_t isproject;
 	struct passwd *pw;
 	struct group *gr;
 
 	domain[0] = '\0';
 
-	/* Figure out the property type ({user|group}{quota|space}) */
+	/* Figure out the property type ({user|group|project}{quota|space}) */
 	for (type = 0; type < ZFS_NUM_USERQUOTA_PROPS; type++) {
 		if (strncmp(propname, zfs_userquota_prop_prefixes[type],
 		    strlen(zfs_userquota_prop_prefixes[type])) == 0)
@@ -2736,8 +3089,15 @@ userquota_propname_decode(const char *propname, boolean_t zoned,
 		return (EINVAL);
 	*typep = type;
 
-	isuser = (type == ZFS_PROP_USERQUOTA || type == ZFS_PROP_USERUSED);
-	isgroup = (type == ZFS_PROP_GROUPQUOTA || type == ZFS_PROP_GROUPUSED);
+	isuser = (type == ZFS_PROP_USERQUOTA || type == ZFS_PROP_USERUSED ||
+	    type == ZFS_PROP_USEROBJQUOTA ||
+	    type == ZFS_PROP_USEROBJUSED);
+	isgroup = (type == ZFS_PROP_GROUPQUOTA || type == ZFS_PROP_GROUPUSED ||
+	    type == ZFS_PROP_GROUPOBJQUOTA ||
+	    type == ZFS_PROP_GROUPOBJUSED);
+	isproject = (type == ZFS_PROP_PROJECTQUOTA ||
+	    type == ZFS_PROP_PROJECTUSED || type == ZFS_PROP_PROJECTOBJQUOTA ||
+	    type == ZFS_PROP_PROJECTOBJUSED);
 
 	cp = strchr(propname, '@') + 1;
 
@@ -2749,7 +3109,7 @@ userquota_propname_decode(const char *propname, boolean_t zoned,
 		if (zoned && getzoneid() == GLOBAL_ZONEID)
 			return (ENOENT);
 		*ridp = gr->gr_gid;
-	} else if (strchr(cp, '@')) {
+	} else if (!isproject && strchr(cp, '@')) {
 #ifdef HAVE_IDMAP
 		/*
 		 * It's a SID name (eg "user@domain") that needs to be
@@ -2790,13 +3150,13 @@ userquota_propname_decode(const char *propname, boolean_t zoned,
 		return (ENOSYS);
 #endif /* HAVE_IDMAP */
 	} else {
-		/* It's a user/group ID (eg "12345"). */
+		/* It's a user/group/project ID (eg "12345"). */
 		uid_t id;
 		char *end;
 		id = strtoul(cp, &end, 10);
 		if (*end != '\0')
 			return (EINVAL);
-		if (id > MAXUID) {
+		if (id > MAXUID && !isproject) {
 #ifdef HAVE_IDMAP
 			/* It's an ephemeral ID. */
 			idmap_rid_t rid;
@@ -2834,7 +3194,7 @@ zfs_prop_get_userquota_common(zfs_handle_t *zhp, const char *propname,
 	if (err)
 		return (err);
 
-	err = ioctl(zhp->zfs_hdl->libzfs_fd, ZFS_IOC_USERSPACE_ONE, &zc);
+	err = zfs_ioctl(zhp->zfs_hdl, ZFS_IOC_USERSPACE_ONE, &zc);
 	if (err)
 		return (err);
 
@@ -2870,14 +3230,24 @@ zfs_prop_get_userquota(zfs_handle_t *zhp, const char *propname,
 		(void) snprintf(propbuf, proplen, "%llu",
 		    (u_longlong_t)propvalue);
 	} else if (propvalue == 0 &&
-	    (type == ZFS_PROP_USERQUOTA || type == ZFS_PROP_GROUPQUOTA)) {
+	    (type == ZFS_PROP_USERQUOTA || type == ZFS_PROP_GROUPQUOTA ||
+	    type == ZFS_PROP_USEROBJQUOTA || type == ZFS_PROP_GROUPOBJQUOTA ||
+	    type == ZFS_PROP_PROJECTQUOTA ||
+	    type == ZFS_PROP_PROJECTOBJQUOTA)) {
 		(void) strlcpy(propbuf, "none", proplen);
+	} else if (type == ZFS_PROP_USERQUOTA || type == ZFS_PROP_GROUPQUOTA ||
+	    type == ZFS_PROP_USERUSED || type == ZFS_PROP_GROUPUSED ||
+	    type == ZFS_PROP_PROJECTUSED || type == ZFS_PROP_PROJECTQUOTA) {
+		zfs_nicebytes(propvalue, propbuf, proplen);
 	} else {
 		zfs_nicenum(propvalue, propbuf, proplen);
 	}
 	return (0);
 }
 
+/*
+ * propname must start with "written@" or "written#".
+ */
 int
 zfs_prop_get_written_int(zfs_handle_t *zhp, const char *propname,
     uint64_t *propvalue)
@@ -2888,8 +3258,10 @@ zfs_prop_get_written_int(zfs_handle_t *zhp, const char *propname,
 
 	(void) strlcpy(zc.zc_name, zhp->zfs_name, sizeof (zc.zc_name));
 
-	snapname = strchr(propname, '@') + 1;
-	if (strchr(snapname, '@')) {
+	assert(zfs_prop_written(propname));
+	snapname = propname + strlen("written@");
+	if (strchr(snapname, '@') != NULL || strchr(snapname, '#') != NULL) {
+		/* full snapshot or bookmark name specified */
 		(void) strlcpy(zc.zc_value, snapname, sizeof (zc.zc_value));
 	} else {
 		/* snapname is the short name, append it to zhp's fsname */
@@ -2900,11 +3272,10 @@ zfs_prop_get_written_int(zfs_handle_t *zhp, const char *propname,
 		cp = strchr(zc.zc_value, '@');
 		if (cp != NULL)
 			*cp = '\0';
-		(void) strlcat(zc.zc_value, "@", sizeof (zc.zc_value));
-		(void) strlcat(zc.zc_value, snapname, sizeof (zc.zc_value));
+		(void) strlcat(zc.zc_value, snapname - 1, sizeof (zc.zc_value));
 	}
 
-	err = ioctl(zhp->zfs_hdl->libzfs_fd, ZFS_IOC_SPACE_WRITTEN, &zc);
+	err = zfs_ioctl(zhp->zfs_hdl, ZFS_IOC_SPACE_WRITTEN, &zc);
 	if (err)
 		return (err);
 
@@ -2928,7 +3299,7 @@ zfs_prop_get_written(zfs_handle_t *zhp, const char *propname,
 		(void) snprintf(propbuf, proplen, "%llu",
 		    (u_longlong_t)propvalue);
 	} else {
-		zfs_nicenum(propvalue, propbuf, proplen);
+		zfs_nicebytes(propvalue, propbuf, proplen);
 	}
 
 	return (0);
@@ -2941,6 +3312,15 @@ const char *
 zfs_get_name(const zfs_handle_t *zhp)
 {
 	return (zhp->zfs_name);
+}
+
+/*
+ * Returns the name of the parent pool for the given zfs handle.
+ */
+const char *
+zfs_get_pool_name(const zfs_handle_t *zhp)
+{
+	return (zhp->zpool_hdl->zpool_name);
 }
 
 /*
@@ -2992,6 +3372,12 @@ parent_name(const char *path, char *buf, size_t buflen)
 	return (0);
 }
 
+int
+zfs_parent_name(zfs_handle_t *zhp, char *buf, size_t buflen)
+{
+	return (parent_name(zfs_get_name(zhp), buf, buflen));
+}
+
 /*
  * If accept_ancestor is false, then check to make sure that the given path has
  * a parent, and that it exists.  If accept_ancestor is true, then find the
@@ -3005,7 +3391,7 @@ check_parents(libzfs_handle_t *hdl, const char *path, uint64_t *zoned,
     boolean_t accept_ancestor, int *prefixlen)
 {
 	zfs_cmd_t zc = {"\0"};
-	char parent[ZFS_MAXNAMELEN];
+	char parent[ZFS_MAX_DATASET_NAME_LEN];
 	char *slash;
 	zfs_handle_t *zhp;
 	char errbuf[1024];
@@ -3026,7 +3412,7 @@ check_parents(libzfs_handle_t *hdl, const char *path, uint64_t *zoned,
 		slash = parent + strlen(parent);
 	(void) strncpy(zc.zc_name, parent, slash - parent);
 	zc.zc_name[slash - parent] = '\0';
-	if (ioctl(hdl->libzfs_fd, ZFS_IOC_OBJSET_STATS, &zc) != 0 &&
+	if (zfs_ioctl(hdl, ZFS_IOC_OBJSET_STATS, &zc) != 0 &&
 	    errno == ENOENT) {
 		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 		    "no such pool '%s'"), zc.zc_name);
@@ -3133,7 +3519,7 @@ create_parents(libzfs_handle_t *hdl, char *target, int prefixlen)
 	 * up to the prefixlen-long one.
 	 */
 	for (cp = target + prefixlen + 1;
-	    (cp = strchr(cp, '/')); *cp = '/', cp++) {
+	    (cp = strchr(cp, '/')) != NULL; *cp = '/', cp++) {
 
 		*cp = '\0';
 
@@ -3168,6 +3554,7 @@ create_parents(libzfs_handle_t *hdl, char *target, int prefixlen)
 
 		zfs_close(h);
 	}
+	zfs_commit_all_shares();
 
 	return (0);
 
@@ -3185,7 +3572,21 @@ zfs_create_ancestors(libzfs_handle_t *hdl, const char *path)
 {
 	int prefix;
 	char *path_copy;
+	char errbuf[1024];
 	int rc = 0;
+
+	(void) snprintf(errbuf, sizeof (errbuf), dgettext(TEXT_DOMAIN,
+	    "cannot create '%s'"), path);
+
+	/*
+	 * Check that we are not passing the nesting limit
+	 * before we start creating any ancestors.
+	 */
+	if (dataset_nestcheck(path) != 0) {
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+		    "maximum name nesting depth exceeded"));
+		return (zfs_error(hdl, EZFS_INVALIDNAME, errbuf));
+	}
 
 	if (check_parents(hdl, path, NULL, B_TRUE, &prefix) != 0)
 		return (-1);
@@ -3210,9 +3611,13 @@ zfs_create(libzfs_handle_t *hdl, const char *path, zfs_type_t type,
 	int ret;
 	uint64_t size = 0;
 	uint64_t blocksize = zfs_prop_default_numeric(ZFS_PROP_VOLBLOCKSIZE);
-	char errbuf[1024];
 	uint64_t zoned;
-	dmu_objset_type_t ost;
+	enum lzc_dataset_type ost;
+	zpool_handle_t *zpool_handle;
+	uint8_t *wkeydata = NULL;
+	uint_t wkeylen = 0;
+	char errbuf[1024];
+	char parent[ZFS_MAX_DATASET_NAME_LEN];
 
 	(void) snprintf(errbuf, sizeof (errbuf), dgettext(TEXT_DOMAIN,
 	    "cannot create '%s'"), path);
@@ -3220,6 +3625,12 @@ zfs_create(libzfs_handle_t *hdl, const char *path, zfs_type_t type,
 	/* validate the path, taking care to note the extended error message */
 	if (!zfs_validate_name(hdl, path, type, B_TRUE))
 		return (zfs_error(hdl, EZFS_INVALIDNAME, errbuf));
+
+	if (dataset_nestcheck(path) != 0) {
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+		    "maximum name nesting depth exceeded"));
+		return (zfs_error(hdl, EZFS_INVALIDNAME, errbuf));
+	}
 
 	/* validate parents exist */
 	if (check_parents(hdl, path, &zoned, B_FALSE, NULL) != 0)
@@ -3239,12 +3650,12 @@ zfs_create(libzfs_handle_t *hdl, const char *path, zfs_type_t type,
 	}
 
 	if (type == ZFS_TYPE_VOLUME)
-		ost = DMU_OST_ZVOL;
+		ost = LZC_DATSET_TYPE_ZVOL;
 	else
-		ost = DMU_OST_ZFS;
+		ost = LZC_DATSET_TYPE_ZFS;
 
 	/* open zpool handle for prop validation */
-	char pool_path[MAXNAMELEN];
+	char pool_path[ZFS_MAX_DATASET_NAME_LEN];
 	(void) strlcpy(pool_path, path, sizeof (pool_path));
 
 	/* truncate pool_path at first slash */
@@ -3252,10 +3663,11 @@ zfs_create(libzfs_handle_t *hdl, const char *path, zfs_type_t type,
 	if (p != NULL)
 		*p = '\0';
 
-	zpool_handle_t *zpool_handle = zpool_open(hdl, pool_path);
+	if ((zpool_handle = zpool_open(hdl, pool_path)) == NULL)
+		return (-1);
 
 	if (props && (props = zfs_valid_proplist(hdl, type, props,
-	    zoned, NULL, zpool_handle, errbuf)) == 0) {
+	    zoned, NULL, zpool_handle, B_TRUE, errbuf)) == 0) {
 		zpool_close(zpool_handle);
 		return (-1);
 	}
@@ -3307,31 +3719,43 @@ zfs_create(libzfs_handle_t *hdl, const char *path, zfs_type_t type,
 		}
 	}
 
+	(void) parent_name(path, parent, sizeof (parent));
+	if (zfs_crypto_create(hdl, parent, props, NULL, B_TRUE,
+	    &wkeydata, &wkeylen) != 0) {
+		nvlist_free(props);
+		return (zfs_error(hdl, EZFS_CRYPTOFAILED, errbuf));
+	}
+
 	/* create the dataset */
-	ret = lzc_create(path, ost, props);
+	ret = lzc_create(path, ost, props, wkeydata, wkeylen);
 	nvlist_free(props);
+	if (wkeydata != NULL)
+		free(wkeydata);
 
 	/* check for failure */
 	if (ret != 0) {
-		char parent[ZFS_MAXNAMELEN];
-		(void) parent_name(path, parent, sizeof (parent));
-
 		switch (errno) {
 		case ENOENT:
 			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 			    "no such parent '%s'"), parent);
 			return (zfs_error(hdl, EZFS_NOENT, errbuf));
 
-		case EINVAL:
-			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-			    "parent '%s' is not a filesystem"), parent);
-			return (zfs_error(hdl, EZFS_BADTYPE, errbuf));
-
 		case ENOTSUP:
 			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 			    "pool must be upgraded to set this "
 			    "property or value"));
 			return (zfs_error(hdl, EZFS_BADVERSION, errbuf));
+
+		case EACCES:
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			    "encryption root's key is not loaded "
+			    "or provided"));
+			return (zfs_error(hdl, EZFS_CRYPTOFAILED, errbuf));
+
+		case ERANGE:
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			    "invalid property value(s) specified"));
+			return (zfs_error(hdl, EZFS_BADPROP, errbuf));
 #ifdef _ILP32
 		case EOVERFLOW:
 			/*
@@ -3358,32 +3782,34 @@ zfs_create(libzfs_handle_t *hdl, const char *path, zfs_type_t type,
 int
 zfs_destroy(zfs_handle_t *zhp, boolean_t defer)
 {
-	zfs_cmd_t zc = {"\0"};
+	int error;
+
+	if (zhp->zfs_type != ZFS_TYPE_SNAPSHOT && defer)
+		return (EINVAL);
 
 	if (zhp->zfs_type == ZFS_TYPE_BOOKMARK) {
 		nvlist_t *nv = fnvlist_alloc();
 		fnvlist_add_boolean(nv, zhp->zfs_name);
-		int error = lzc_destroy_bookmarks(nv, NULL);
+		error = lzc_destroy_bookmarks(nv, NULL);
 		fnvlist_free(nv);
 		if (error != 0) {
-			return (zfs_standard_error_fmt(zhp->zfs_hdl, errno,
+			return (zfs_standard_error_fmt(zhp->zfs_hdl, error,
 			    dgettext(TEXT_DOMAIN, "cannot destroy '%s'"),
 			    zhp->zfs_name));
 		}
 		return (0);
 	}
 
-	(void) strlcpy(zc.zc_name, zhp->zfs_name, sizeof (zc.zc_name));
-
-	if (ZFS_IS_VOLUME(zhp)) {
-		zc.zc_objset_type = DMU_OST_ZVOL;
+	if (zhp->zfs_type == ZFS_TYPE_SNAPSHOT) {
+		nvlist_t *nv = fnvlist_alloc();
+		fnvlist_add_boolean(nv, zhp->zfs_name);
+		error = lzc_destroy_snaps(nv, defer, NULL);
+		fnvlist_free(nv);
 	} else {
-		zc.zc_objset_type = DMU_OST_ZFS;
+		error = lzc_destroy(zhp->zfs_name);
 	}
 
-	zc.zc_defer_destroy = defer;
-	if (zfs_ioctl(zhp->zfs_hdl, ZFS_IOC_DESTROY, &zc) != 0 &&
-	    errno != ENOENT) {
+	if (error != 0 && error != ENOENT) {
 		return (zfs_standard_error_fmt(zhp->zfs_hdl, errno,
 		    dgettext(TEXT_DOMAIN, "cannot destroy '%s'"),
 		    zhp->zfs_name));
@@ -3403,11 +3829,12 @@ static int
 zfs_check_snap_cb(zfs_handle_t *zhp, void *arg)
 {
 	struct destroydata *dd = arg;
-	char name[ZFS_MAXNAMELEN];
+	char name[ZFS_MAX_DATASET_NAME_LEN];
 	int rv = 0;
 
-	(void) snprintf(name, sizeof (name),
-	    "%s@%s", zhp->zfs_name, dd->snapname);
+	if (snprintf(name, sizeof (name), "%s@%s", zhp->zfs_name,
+	    dd->snapname) >= sizeof (name))
+		return (EINVAL);
 
 	if (lzc_exists(name))
 		verify(nvlist_add_boolean(dd->nvl, name) == 0);
@@ -3448,13 +3875,15 @@ int
 zfs_destroy_snaps_nvl(libzfs_handle_t *hdl, nvlist_t *snaps, boolean_t defer)
 {
 	int ret;
-	nvlist_t *errlist;
+	nvlist_t *errlist = NULL;
 	nvpair_t *pair;
 
 	ret = lzc_destroy_snaps(snaps, defer, &errlist);
 
-	if (ret == 0)
+	if (ret == 0) {
+		nvlist_free(errlist);
 		return (0);
+	}
 
 	if (nvlist_empty(errlist)) {
 		char errbuf[1024];
@@ -3482,6 +3911,7 @@ zfs_destroy_snaps_nvl(libzfs_handle_t *hdl, nvlist_t *snaps, boolean_t defer)
 		}
 	}
 
+	nvlist_free(errlist);
 	return (ret);
 }
 
@@ -3491,7 +3921,7 @@ zfs_destroy_snaps_nvl(libzfs_handle_t *hdl, nvlist_t *snaps, boolean_t defer)
 int
 zfs_clone(zfs_handle_t *zhp, const char *target, nvlist_t *props)
 {
-	char parent[ZFS_MAXNAMELEN];
+	char parent[ZFS_MAX_DATASET_NAME_LEN];
 	int ret;
 	char errbuf[1024];
 	libzfs_handle_t *hdl = zhp->zfs_hdl;
@@ -3516,14 +3946,24 @@ zfs_clone(zfs_handle_t *zhp, const char *target, nvlist_t *props)
 
 	if (props) {
 		zfs_type_t type;
+
 		if (ZFS_IS_VOLUME(zhp)) {
 			type = ZFS_TYPE_VOLUME;
 		} else {
 			type = ZFS_TYPE_FILESYSTEM;
 		}
 		if ((props = zfs_valid_proplist(hdl, type, props, zoned,
-		    zhp, zhp->zpool_hdl, errbuf)) == NULL)
+		    zhp, zhp->zpool_hdl, B_TRUE, errbuf)) == NULL)
 			return (-1);
+		if (zfs_fix_auto_resv(zhp, props) == -1) {
+			nvlist_free(props);
+			return (-1);
+		}
+	}
+
+	if (zfs_crypto_clone_check(hdl, zhp, parent, props) != 0) {
+		nvlist_free(props);
+		return (zfs_error(hdl, EZFS_CRYPTOFAILED, errbuf));
 	}
 
 	ret = lzc_clone(target, zhp->zfs_name, props);
@@ -3568,8 +4008,7 @@ int
 zfs_promote(zfs_handle_t *zhp)
 {
 	libzfs_handle_t *hdl = zhp->zfs_hdl;
-	zfs_cmd_t zc = {"\0"};
-	char parent[MAXPATHLEN];
+	char snapname[ZFS_MAX_DATASET_NAME_LEN];
 	int ret;
 	char errbuf[1024];
 
@@ -3582,31 +4021,38 @@ zfs_promote(zfs_handle_t *zhp)
 		return (zfs_error(hdl, EZFS_BADTYPE, errbuf));
 	}
 
-	(void) strlcpy(parent, zhp->zfs_dmustats.dds_origin, sizeof (parent));
-	if (parent[0] == '\0') {
+	if (zhp->zfs_dmustats.dds_origin[0] == '\0') {
 		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 		    "not a cloned filesystem"));
 		return (zfs_error(hdl, EZFS_BADTYPE, errbuf));
 	}
 
-	(void) strlcpy(zc.zc_value, zhp->zfs_dmustats.dds_origin,
-	    sizeof (zc.zc_value));
-	(void) strlcpy(zc.zc_name, zhp->zfs_name, sizeof (zc.zc_name));
-	ret = zfs_ioctl(hdl, ZFS_IOC_PROMOTE, &zc);
+	if (!zfs_validate_name(hdl, zhp->zfs_name, zhp->zfs_type, B_TRUE))
+		return (zfs_error(hdl, EZFS_INVALIDNAME, errbuf));
+
+	ret = lzc_promote(zhp->zfs_name, snapname, sizeof (snapname));
 
 	if (ret != 0) {
-		int save_errno = errno;
+		switch (ret) {
+		case EACCES:
+			/*
+			 * Promoting encrypted dataset outside its
+			 * encryption root.
+			 */
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			    "cannot promote dataset outside its "
+			    "encryption root"));
+			return (zfs_error(hdl, EZFS_EXISTS, errbuf));
 
-		switch (save_errno) {
 		case EEXIST:
 			/* There is a conflicting snapshot name. */
 			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 			    "conflicting snapshot '%s' from parent '%s'"),
-			    zc.zc_string, parent);
+			    snapname, zhp->zfs_dmustats.dds_origin);
 			return (zfs_error(hdl, EZFS_EXISTS, errbuf));
 
 		default:
-			return (zfs_standard_error(hdl, save_errno, errbuf));
+			return (zfs_standard_error(hdl, ret, errbuf));
 		}
 	}
 	return (ret);
@@ -3621,12 +4067,13 @@ static int
 zfs_snapshot_cb(zfs_handle_t *zhp, void *arg)
 {
 	snapdata_t *sd = arg;
-	char name[ZFS_MAXNAMELEN];
+	char name[ZFS_MAX_DATASET_NAME_LEN];
 	int rv = 0;
 
 	if (zfs_prop_get_int(zhp, ZFS_PROP_INCONSISTENT) == 0) {
-		(void) snprintf(name, sizeof (name),
-		    "%s@%s", zfs_get_name(zhp), sd->sd_snapname);
+		if (snprintf(name, sizeof (name), "%s@%s", zfs_get_name(zhp),
+		    sd->sd_snapname) >= sizeof (name))
+			return (EINVAL);
 
 		fnvlist_add_boolean(sd->sd_nvl, name);
 
@@ -3648,6 +4095,8 @@ zfs_snapshot_nvl(libzfs_handle_t *hdl, nvlist_t *snaps, nvlist_t *props)
 	char errbuf[1024];
 	nvpair_t *elem;
 	nvlist_t *errors;
+	zpool_handle_t *zpool_hdl;
+	char pool[ZFS_MAX_DATASET_NAME_LEN];
 
 	(void) snprintf(errbuf, sizeof (errbuf), dgettext(TEXT_DOMAIN,
 	    "cannot create snapshots "));
@@ -3670,15 +4119,16 @@ zfs_snapshot_nvl(libzfs_handle_t *hdl, nvlist_t *snaps, nvlist_t *props)
 	 * get pool handle for prop validation. assumes all snaps are in the
 	 * same pool, as does lzc_snapshot (below).
 	 */
-	char pool[MAXNAMELEN];
 	elem = nvlist_next_nvpair(snaps, NULL);
 	(void) strlcpy(pool, nvpair_name(elem), sizeof (pool));
 	pool[strcspn(pool, "/@")] = '\0';
-	zpool_handle_t *zpool_hdl = zpool_open(hdl, pool);
+	zpool_hdl = zpool_open(hdl, pool);
+	if (zpool_hdl == NULL)
+		return (-1);
 
 	if (props != NULL &&
 	    (props = zfs_valid_proplist(hdl, ZFS_TYPE_SNAPSHOT,
-	    props, B_FALSE, NULL, zpool_hdl, errbuf)) == NULL) {
+	    props, B_FALSE, NULL, zpool_hdl, B_FALSE, errbuf)) == NULL) {
 		zpool_close(zpool_hdl);
 		return (-1);
 	}
@@ -3724,7 +4174,7 @@ zfs_snapshot(libzfs_handle_t *hdl, const char *path, boolean_t recursive,
 {
 	int ret;
 	snapdata_t sd = { 0 };
-	char fsname[ZFS_MAXNAMELEN];
+	char fsname[ZFS_MAX_DATASET_NAME_LEN];
 	char *cp;
 	zfs_handle_t *zhp;
 	char errbuf[1024];
@@ -3827,6 +4277,7 @@ zfs_rollback(zfs_handle_t *zhp, zfs_handle_t *snap, boolean_t force)
 	boolean_t restore_resv = 0;
 	uint64_t old_volsize = 0, new_volsize;
 	zfs_prop_t resv_prop = { 0 };
+	uint64_t min_txg = 0;
 
 	assert(zhp->zfs_type == ZFS_TYPE_FILESYSTEM ||
 	    zhp->zfs_type == ZFS_TYPE_VOLUME);
@@ -3837,7 +4288,13 @@ zfs_rollback(zfs_handle_t *zhp, zfs_handle_t *snap, boolean_t force)
 	cb.cb_force = force;
 	cb.cb_target = snap->zfs_name;
 	cb.cb_create = zfs_prop_get_int(snap, ZFS_PROP_CREATETXG);
-	(void) zfs_iter_snapshots(zhp, B_FALSE, rollback_destroy, &cb);
+
+	if (cb.cb_create > 0)
+		min_txg = cb.cb_create;
+
+	(void) zfs_iter_snapshots(zhp, B_FALSE, rollback_destroy, &cb,
+	    min_txg, 0);
+
 	(void) zfs_iter_bookmarks(zhp, rollback_destroy, &cb);
 
 	if (cb.cb_error)
@@ -3857,17 +4314,36 @@ zfs_rollback(zfs_handle_t *zhp, zfs_handle_t *snap, boolean_t force)
 	}
 
 	/*
-	 * We rely on zfs_iter_children() to verify that there are no
-	 * newer snapshots for the given dataset.  Therefore, we can
-	 * simply pass the name on to the ioctl() call.  There is still
-	 * an unlikely race condition where the user has taken a
-	 * snapshot since we verified that this was the most recent.
+	 * Pass both the filesystem and the wanted snapshot names,
+	 * we would get an error back if the snapshot is destroyed or
+	 * a new snapshot is created before this request is processed.
 	 */
-	err = lzc_rollback(zhp->zfs_name, NULL, 0);
+	err = lzc_rollback_to(zhp->zfs_name, snap->zfs_name);
 	if (err != 0) {
-		(void) zfs_standard_error_fmt(zhp->zfs_hdl, errno,
+		char errbuf[1024];
+
+		(void) snprintf(errbuf, sizeof (errbuf),
 		    dgettext(TEXT_DOMAIN, "cannot rollback '%s'"),
 		    zhp->zfs_name);
+		switch (err) {
+		case EEXIST:
+			zfs_error_aux(zhp->zfs_hdl, dgettext(TEXT_DOMAIN,
+			    "there is a snapshot or bookmark more recent "
+			    "than '%s'"), snap->zfs_name);
+			(void) zfs_error(zhp->zfs_hdl, EZFS_EXISTS, errbuf);
+			break;
+		case ESRCH:
+			zfs_error_aux(zhp->zfs_hdl, dgettext(TEXT_DOMAIN,
+			    "'%s' is not found among snapshots of '%s'"),
+			    snap->zfs_name, zhp->zfs_name);
+			(void) zfs_error(zhp->zfs_hdl, EZFS_NOENT, errbuf);
+			break;
+		case EINVAL:
+			(void) zfs_error(zhp->zfs_hdl, EZFS_BADTYPE, errbuf);
+			break;
+		default:
+			(void) zfs_standard_error(zhp->zfs_hdl, err, errbuf);
+		}
 		return (err);
 	}
 
@@ -3897,13 +4373,11 @@ int
 zfs_rename(zfs_handle_t *zhp, const char *target, boolean_t recursive,
     boolean_t force_unmount)
 {
-	int ret;
+	int ret = 0;
 	zfs_cmd_t zc = {"\0"};
 	char *delim;
 	prop_changelist_t *cl = NULL;
-	zfs_handle_t *zhrp = NULL;
-	char *parentname = NULL;
-	char parent[ZFS_MAXNAMELEN];
+	char parent[ZFS_MAX_DATASET_NAME_LEN];
 	libzfs_handle_t *hdl = zhp->zfs_hdl;
 	char errbuf[1024];
 
@@ -3913,6 +4387,10 @@ zfs_rename(zfs_handle_t *zhp, const char *target, boolean_t recursive,
 
 	(void) snprintf(errbuf, sizeof (errbuf), dgettext(TEXT_DOMAIN,
 	    "cannot rename to '%s'"), target);
+
+	/* make sure source name is valid */
+	if (!zfs_validate_name(hdl, zhp->zfs_name, zhp->zfs_type, B_TRUE))
+		return (zfs_error(hdl, EZFS_INVALIDNAME, errbuf));
 
 	/*
 	 * Make sure the target name is valid
@@ -3947,6 +4425,7 @@ zfs_rename(zfs_handle_t *zhp, const char *target, boolean_t recursive,
 				    errbuf));
 			}
 		}
+
 		if (!zfs_validate_name(hdl, target, zhp->zfs_type, B_TRUE))
 			return (zfs_error(hdl, EZFS_INVALIDNAME, errbuf));
 	} else {
@@ -3992,7 +4471,8 @@ zfs_rename(zfs_handle_t *zhp, const char *target, boolean_t recursive,
 	}
 
 	if (recursive) {
-		parentname = zfs_strdup(zhp->zfs_hdl, zhp->zfs_name);
+		zfs_handle_t *zhrp;
+		char *parentname = zfs_strdup(zhp->zfs_hdl, zhp->zfs_name);
 		if (parentname == NULL) {
 			ret = -1;
 			goto error;
@@ -4000,12 +4480,15 @@ zfs_rename(zfs_handle_t *zhp, const char *target, boolean_t recursive,
 		delim = strchr(parentname, '@');
 		*delim = '\0';
 		zhrp = zfs_open(zhp->zfs_hdl, parentname, ZFS_TYPE_DATASET);
+		free(parentname);
 		if (zhrp == NULL) {
 			ret = -1;
 			goto error;
 		}
+		zfs_close(zhrp);
 	} else if (zhp->zfs_type != ZFS_TYPE_SNAPSHOT) {
-		if ((cl = changelist_gather(zhp, ZFS_PROP_NAME, 0,
+		if ((cl = changelist_gather(zhp, ZFS_PROP_NAME,
+		    CL_GATHER_ITER_MOUNTED,
 		    force_unmount ? MS_FORCE : 0)) == NULL)
 			return (-1);
 
@@ -4045,6 +4528,11 @@ zfs_rename(zfs_handle_t *zhp, const char *target, boolean_t recursive,
 			    "a child dataset already has a snapshot "
 			    "with the new name"));
 			(void) zfs_error(hdl, EZFS_EXISTS, errbuf);
+		} else if (errno == EACCES) {
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			    "cannot move encrypted child outside of "
+			    "its encryption root"));
+			(void) zfs_error(hdl, EZFS_CRYPTOFAILED, errbuf);
 		} else {
 			(void) zfs_standard_error(zhp->zfs_hdl, errno, errbuf);
 		}
@@ -4063,16 +4551,25 @@ zfs_rename(zfs_handle_t *zhp, const char *target, boolean_t recursive,
 	}
 
 error:
-	if (parentname != NULL) {
-		free(parentname);
-	}
-	if (zhrp != NULL) {
-		zfs_close(zhrp);
-	}
 	if (cl != NULL) {
 		changelist_free(cl);
 	}
 	return (ret);
+}
+
+nvlist_t *
+zfs_get_all_props(zfs_handle_t *zhp)
+{
+	return (zhp->zfs_props);
+}
+
+nvlist_t *
+zfs_get_recvd_props(zfs_handle_t *zhp)
+{
+	if (zhp->zfs_recvd_props == NULL)
+		if (get_recvd_props_ioctl(zhp) != 0)
+			return (NULL);
+	return (zhp->zfs_recvd_props);
 }
 
 nvlist_t *
@@ -4269,8 +4766,7 @@ zfs_smb_acl_mgmt(libzfs_handle_t *hdl, char *dataset, char *path,
 		return (-1);
 	}
 	error = ioctl(hdl->libzfs_fd, ZFS_IOC_SMB_ACL, &zc);
-	if (nvlist)
-		nvlist_free(nvlist);
+	nvlist_free(nvlist);
 	return (error);
 }
 
@@ -4324,7 +4820,18 @@ zfs_userspace(zfs_handle_t *zhp, zfs_userquota_prop_t type,
 
 		zc.zc_nvlist_dst_size = sizeof (buf);
 		if (zfs_ioctl(hdl, ZFS_IOC_USERSPACE_MANY, &zc) != 0) {
-			char errbuf[ZFS_MAXNAMELEN + 32];
+			char errbuf[1024];
+
+			if ((errno == ENOTSUP &&
+			    (type == ZFS_PROP_USEROBJUSED ||
+			    type == ZFS_PROP_GROUPOBJUSED ||
+			    type == ZFS_PROP_USEROBJQUOTA ||
+			    type == ZFS_PROP_GROUPOBJQUOTA ||
+			    type == ZFS_PROP_PROJECTOBJUSED ||
+			    type == ZFS_PROP_PROJECTOBJQUOTA ||
+			    type == ZFS_PROP_PROJECTUSED ||
+			    type == ZFS_PROP_PROJECTQUOTA)))
+				break;
 
 			(void) snprintf(errbuf, sizeof (errbuf),
 			    dgettext(TEXT_DOMAIN,
@@ -4358,11 +4865,12 @@ static int
 zfs_hold_one(zfs_handle_t *zhp, void *arg)
 {
 	struct holdarg *ha = arg;
-	char name[ZFS_MAXNAMELEN];
+	char name[ZFS_MAX_DATASET_NAME_LEN];
 	int rv = 0;
 
-	(void) snprintf(name, sizeof (name),
-	    "%s@%s", zhp->zfs_name, ha->snapname);
+	if (snprintf(name, sizeof (name), "%s@%s", zhp->zfs_name,
+	    ha->snapname) >= sizeof (name))
+		return (EINVAL);
 
 	if (lzc_exists(name))
 		fnvlist_add_string(ha->nvl, name, ha->tag);
@@ -4477,12 +4985,15 @@ static int
 zfs_release_one(zfs_handle_t *zhp, void *arg)
 {
 	struct holdarg *ha = arg;
-	char name[ZFS_MAXNAMELEN];
+	char name[ZFS_MAX_DATASET_NAME_LEN];
 	int rv = 0;
 	nvlist_t *existing_holds;
 
-	(void) snprintf(name, sizeof (name),
-	    "%s@%s", zhp->zfs_name, ha->snapname);
+	if (snprintf(name, sizeof (name), "%s@%s", zhp->zfs_name,
+	    ha->snapname) >= sizeof (name)) {
+		ha->error = EINVAL;
+		rv = EINVAL;
+	}
 
 	if (lzc_get_holds(name, &existing_holds) != 0) {
 		ha->error = ENOENT;
@@ -4606,9 +5117,9 @@ tryagain:
 	zc.zc_nvlist_dst_size = nvsz;
 	zc.zc_nvlist_dst = (uintptr_t)nvbuf;
 
-	(void) strlcpy(zc.zc_name, zhp->zfs_name, ZFS_MAXNAMELEN);
+	(void) strlcpy(zc.zc_name, zhp->zfs_name, sizeof (zc.zc_name));
 
-	if (ioctl(hdl->libzfs_fd, ZFS_IOC_GET_FSACL, &zc) != 0) {
+	if (zfs_ioctl(hdl, ZFS_IOC_GET_FSACL, &zc) != 0) {
 		(void) snprintf(errbuf, sizeof (errbuf),
 		    dgettext(TEXT_DOMAIN, "cannot get permissions on '%s'"),
 		    zc.zc_name);
@@ -4739,12 +5250,176 @@ zfs_get_holds(zfs_handle_t *zhp, nvlist_t **nvl)
 }
 
 /*
- * Convert the zvol's volume size to an appropriate reservation.
+ * The theory of raidz space accounting
+ *
+ * The "referenced" property of RAIDZ vdevs is scaled such that a 128KB block
+ * will "reference" 128KB, even though it allocates more than that, to store the
+ * parity information (and perhaps skip sectors). This concept of the
+ * "referenced" (and other DMU space accounting) being lower than the allocated
+ * space by a constant factor is called "raidz deflation."
+ *
+ * As mentioned above, the constant factor for raidz deflation assumes a 128KB
+ * block size. However, zvols typically have a much smaller block size (default
+ * 8KB). These smaller blocks may require proportionally much more parity
+ * information (and perhaps skip sectors). In this case, the change to the
+ * "referenced" property may be much more than the logical block size.
+ *
+ * Suppose a raidz vdev has 5 disks with ashift=12.  A 128k block may be written
+ * as follows.
+ *
+ * +-------+-------+-------+-------+-------+
+ * | disk1 | disk2 | disk3 | disk4 | disk5 |
+ * +-------+-------+-------+-------+-------+
+ * |  P0   |  D0   |  D8   |  D16  |  D24  |
+ * |  P1   |  D1   |  D9   |  D17  |  D25  |
+ * |  P2   |  D2   |  D10  |  D18  |  D26  |
+ * |  P3   |  D3   |  D11  |  D19  |  D27  |
+ * |  P4   |  D4   |  D12  |  D20  |  D28  |
+ * |  P5   |  D5   |  D13  |  D21  |  D29  |
+ * |  P6   |  D6   |  D14  |  D22  |  D30  |
+ * |  P7   |  D7   |  D15  |  D23  |  D31  |
+ * +-------+-------+-------+-------+-------+
+ *
+ * Above, notice that 160k was allocated: 8 x 4k parity sectors + 32 x 4k data
+ * sectors.  The dataset's referenced will increase by 128k and the pool's
+ * allocated and free properties will be adjusted by 160k.
+ *
+ * A 4k block written to the same raidz vdev will require two 4k sectors.  The
+ * blank cells represent unallocated space.
+ *
+ * +-------+-------+-------+-------+-------+
+ * | disk1 | disk2 | disk3 | disk4 | disk5 |
+ * +-------+-------+-------+-------+-------+
+ * |  P0   |  D0   |       |       |       |
+ * +-------+-------+-------+-------+-------+
+ *
+ * Above, notice that the 4k block required one sector for parity and another
+ * for data.  vdev_raidz_asize() will return 8k and as such the pool's allocated
+ * and free properties will be adjusted by 8k.  The dataset will not be charged
+ * 8k.  Rather, it will be charged a value that is scaled according to the
+ * overhead of the 128k block on the same vdev.  This 8k allocation will be
+ * charged 8k * 128k / 160k.  128k is from SPA_OLD_MAXBLOCKSIZE and 160k is as
+ * calculated in the 128k block example above.
+ *
+ * Every raidz allocation is sized to be a multiple of nparity+1 sectors.  That
+ * is, every raidz1 allocation will be a multiple of 2 sectors, raidz2
+ * allocations are a multiple of 3 sectors, and raidz3 allocations are a
+ * multiple of of 4 sectors.  When a block does not fill the required number of
+ * sectors, skip blocks (sectors) are used.
+ *
+ * An 8k block being written to a raidz vdev may be written as follows:
+ *
+ * +-------+-------+-------+-------+-------+
+ * | disk1 | disk2 | disk3 | disk4 | disk5 |
+ * +-------+-------+-------+-------+-------+
+ * |  P0   |  D0   |  D1   |  S0   |       |
+ * +-------+-------+-------+-------+-------+
+ *
+ * In order to maintain the nparity+1 allocation size, a skip block (S0) was
+ * added.  For this 8k block, the pool's allocated and free properties are
+ * adjusted by 16k and the dataset's referenced is increased by 16k * 128k /
+ * 160k.  Again, 128k is from SPA_OLD_MAXBLOCKSIZE and 160k is as calculated in
+ * the 128k block example above.
+ *
+ * Compression may lead to a variety of block sizes being written for the same
+ * volume or file.  There is no clear way to reserve just the amount of space
+ * that will be required, so the worst case (no compression) is assumed.
+ * Note that metadata blocks will typically be compressed, so the reservation
+ * size returned by zvol_volsize_to_reservation() will generally be slightly
+ * larger than the maximum that the volume can reference.
+ */
+
+/*
+ * Derived from function of same name in module/zfs/vdev_raidz.c.  Returns the
+ * amount of space (in bytes) that will be allocated for the specified block
+ * size. Note that the "referenced" space accounted will be less than this, but
+ * not necessarily equal to "blksize", due to RAIDZ deflation.
+ */
+static uint64_t
+vdev_raidz_asize(uint64_t ndisks, uint64_t nparity, uint64_t ashift,
+    uint64_t blksize)
+{
+	uint64_t asize, ndata;
+
+	ASSERT3U(ndisks, >, nparity);
+	ndata = ndisks - nparity;
+	asize = ((blksize - 1) >> ashift) + 1;
+	asize += nparity * ((asize + ndata - 1) / ndata);
+	asize = roundup(asize, nparity + 1) << ashift;
+
+	return (asize);
+}
+
+/*
+ * Determine how much space will be allocated if it lands on the most space-
+ * inefficient top-level vdev.  Returns the size in bytes required to store one
+ * copy of the volume data.  See theory comment above.
+ */
+static uint64_t
+volsize_from_vdevs(zpool_handle_t *zhp, uint64_t nblocks, uint64_t blksize)
+{
+	nvlist_t *config, *tree, **vdevs;
+	uint_t nvdevs, v;
+	uint64_t ret = 0;
+
+	config = zpool_get_config(zhp, NULL);
+	if (nvlist_lookup_nvlist(config, ZPOOL_CONFIG_VDEV_TREE, &tree) != 0 ||
+	    nvlist_lookup_nvlist_array(tree, ZPOOL_CONFIG_CHILDREN,
+	    &vdevs, &nvdevs) != 0) {
+		return (nblocks * blksize);
+	}
+
+	for (v = 0; v < nvdevs; v++) {
+		char *type;
+		uint64_t nparity, ashift, asize, tsize;
+		nvlist_t **disks;
+		uint_t ndisks;
+		uint64_t volsize;
+
+		if (nvlist_lookup_string(vdevs[v], ZPOOL_CONFIG_TYPE,
+		    &type) != 0 || strcmp(type, VDEV_TYPE_RAIDZ) != 0 ||
+		    nvlist_lookup_uint64(vdevs[v], ZPOOL_CONFIG_NPARITY,
+		    &nparity) != 0 ||
+		    nvlist_lookup_uint64(vdevs[v], ZPOOL_CONFIG_ASHIFT,
+		    &ashift) != 0 ||
+		    nvlist_lookup_nvlist_array(vdevs[v], ZPOOL_CONFIG_CHILDREN,
+		    &disks, &ndisks) != 0) {
+			continue;
+		}
+
+		/* allocation size for the "typical" 128k block */
+		tsize = vdev_raidz_asize(ndisks, nparity, ashift,
+		    SPA_OLD_MAXBLOCKSIZE);
+		/* allocation size for the blksize block */
+		asize = vdev_raidz_asize(ndisks, nparity, ashift, blksize);
+
+		/*
+		 * Scale this size down as a ratio of 128k / tsize.  See theory
+		 * statement above.
+		 */
+		volsize = nblocks * asize * SPA_OLD_MAXBLOCKSIZE / tsize;
+		if (volsize > ret) {
+			ret = volsize;
+		}
+	}
+
+	if (ret == 0) {
+		ret = nblocks * blksize;
+	}
+
+	return (ret);
+}
+
+/*
+ * Convert the zvol's volume size to an appropriate reservation.  See theory
+ * comment above.
+ *
  * Note: If this routine is updated, it is necessary to update the ZFS test
- * suite's shell version in reservation.kshlib.
+ * suite's shell version in reservation.shlib.
  */
 uint64_t
-zvol_volsize_to_reservation(uint64_t volsize, nvlist_t *props)
+zvol_volsize_to_reservation(zpool_handle_t *zph, uint64_t volsize,
+    nvlist_t *props)
 {
 	uint64_t numdb;
 	uint64_t nblocks, volblocksize;
@@ -4760,7 +5435,14 @@ zvol_volsize_to_reservation(uint64_t volsize, nvlist_t *props)
 	    zfs_prop_to_name(ZFS_PROP_VOLBLOCKSIZE),
 	    &volblocksize) != 0)
 		volblocksize = ZVOL_DEFAULT_BLOCKSIZE;
-	nblocks = volsize/volblocksize;
+
+	nblocks = volsize / volblocksize;
+	/*
+	 * Metadata defaults to using 128k blocks, not volblocksize blocks.  For
+	 * this reason, only the data blocks are scaled based on vdev config.
+	 */
+	volsize = volsize_from_vdevs(zph, nblocks, volblocksize);
+
 	/* start with metadnode L0-L6 */
 	numdb = 7;
 	/* calculate number of indirects */
@@ -4779,4 +5461,32 @@ zvol_volsize_to_reservation(uint64_t volsize, nvlist_t *props)
 	numdb *= 1ULL << DN_MAX_INDBLKSHIFT;
 	volsize += numdb;
 	return (volsize);
+}
+
+/*
+ * Wait for the given activity and return the status of the wait (whether or not
+ * any waiting was done) in the 'waited' parameter. Non-existent fses are
+ * reported via the 'missing' parameter, rather than by printing an error
+ * message. This is convenient when this function is called in a loop over a
+ * long period of time (as it is, for example, by zfs's wait cmd). In that
+ * scenario, a fs being exported or destroyed should be considered a normal
+ * event, so we don't want to print an error when we find that the fs doesn't
+ * exist.
+ */
+int
+zfs_wait_status(zfs_handle_t *zhp, zfs_wait_activity_t activity,
+    boolean_t *missing, boolean_t *waited)
+{
+	int error = lzc_wait_fs(zhp->zfs_name, activity, waited);
+	*missing = (error == ENOENT);
+	if (*missing)
+		return (0);
+
+	if (error != 0) {
+		(void) zfs_standard_error_fmt(zhp->zfs_hdl, error,
+		    dgettext(TEXT_DOMAIN, "error waiting in fs '%s'"),
+		    zhp->zfs_name);
+	}
+
+	return (error);
 }

@@ -24,7 +24,7 @@
 #
 
 #
-# Copyright (c) 2013 by Delphix. All rights reserved.
+# Copyright (c) 2013, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -37,26 +37,40 @@
 # should fail.
 #
 # STRATEGY:
-#	1. Create a file, and set an with an xattr
-#       2. Set the octal file permissions to 000 on the file.
+#	1. Create a file with an xattr
+#	2. Set the file permissions to 000
 #	3. Check that we're unable to read the xattr as a non-root user
 #	4. Check that we're unable to write an xattr as a non-root user
 #
 
 function cleanup {
 
-	log_must $RM $TESTDIR/myfile.$$
+	log_must rm $TESTDIR/myfile.$$
 
 }
 
 log_assert "read/write xattr on a file with no permissions fails"
 log_onexit cleanup
 
-log_must $TOUCH $TESTDIR/myfile.$$
+log_must touch $TESTDIR/myfile.$$
 create_xattr $TESTDIR/myfile.$$ passwd /etc/passwd
 
-log_must $CHMOD 000 $TESTDIR/myfile.$$
-log_mustnot $SU $ZFS_USER -c "$RUNAT $TESTDIR/myfile.$$ $CAT passwd"
-log_mustnot $SU $ZFS_USER -c "$RUNAT $TESTDIR/myfile.$$ $CP /etc/passwd ."
+log_must chmod 000 $TESTDIR/myfile.$$
+if is_illumos; then
+	log_mustnot su $ZFS_USER -c "runat $TESTDIR/myfile.$$ cat passwd"
+	log_mustnot su $ZFS_USER -c "runat $TESTDIR/myfile.$$ cp /etc/passwd ."
+else
+	user_run $ZFS_USER eval \
+	    "get_xattr passwd $TESTDIR/myfile.$$ >/tmp/passwd.$$"
+	log_mustnot diff /etc/passwd /tmp/passwd.$$
+	log_must rm /tmp/passwd.$$
+
+	user_run $ZFS_USER eval \
+	    "set_xattr_stdin passwd $TESTDIR/myfile.$$ </etc/group"
+	log_must chmod 644 $TESTDIR/myfile.$$
+	get_xattr passwd $TESTDIR/myfile.$$ >/tmp/passwd.$$
+	log_must diff /etc/passwd /tmp/passwd.$$
+	log_must rm /tmp/passwd.$$
+fi
 
 log_pass "read/write xattr on a file with no permissions fails"

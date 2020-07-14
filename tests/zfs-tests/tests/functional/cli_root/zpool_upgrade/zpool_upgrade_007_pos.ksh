@@ -42,7 +42,7 @@
 #
 # STRATEGY:
 # 1. Import pools of all versions
-# 2. Setup a test enviorment over the old pools.
+# 2. Setup a test environment over the old pools.
 # 3. Verify the commands related to 'zfs upgrade' succeed as expected.
 #
 
@@ -53,11 +53,13 @@ function cleanup
 	destroy_upgraded_pool $config
 }
 
+POOL_CONFIGS="1raidz 1mirror 2raidz 2mirror 3raidz 3mirror"
+
 log_assert "Import pools of all versions - 'zfs upgrade' on each pool works"
 log_onexit cleanup
 
 # $CONFIGS gets set in the .cfg script
-for config in $CONFIGS; do
+for config in $POOL_CONFIGS; do
 	typeset -n pool_name=ZPOOL_VERSION_${config}_NAME
 
 	create_old_pool $config

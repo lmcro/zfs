@@ -33,6 +33,7 @@
  */
 
 #include <sys/zfs_context.h>
+#include <sys/zio_compress.h>
 
 static int real_LZ4_compress(const char *source, char *dest, int isize,
     int osize);
@@ -63,10 +64,10 @@ lz4_compress_zfs(void *s_start, void *d_start, size_t s_len,
 		return (s_len);
 
 	/*
-	 * Encode the compresed buffer size at the start. We'll need this in
-	 * decompression to counter the effects of padding which might be
-	 * added to the compressed buffer and which, if unhandled, would
-	 * confuse the hell out of our decompression function.
+	 * The exact compressed size is needed by the decompression routine,
+	 * so it is stored at the start of the buffer. Note that this may be
+	 * less than the compressed block size, which is rounded up to a
+	 * multiple of 1<<ashift.
 	 */
 	*(uint32_t *)dest = BE_32(bufsiz);
 
@@ -87,7 +88,7 @@ lz4_decompress_zfs(void *s_start, void *d_start, size_t s_len,
 
 	/*
 	 * Returns 0 on success (decompression function returned non-negative)
-	 * and non-zero on failure (decompression function returned negative.
+	 * and non-zero on failure (decompression function returned negative).
 	 */
 	return (LZ4_uncompress_unknownOutputSize(&src[sizeof (bufsiz)],
 	    d_start, bufsiz, d_len) < 0);
@@ -205,7 +206,7 @@ lz4_decompress_zfs(void *s_start, void *d_start, size_t s_len,
 
 /*
  * Little Endian or Big Endian?
- * Note: overwrite the below #define if you know your architecture endianess.
+ * Note: overwrite the below #define if you know your architecture endianness.
  */
 #if defined(_BIG_ENDIAN)
 #define	LZ4_BIG_ENDIAN 1
@@ -383,7 +384,7 @@ static inline int
 LZ4_NbCommonBytes(register U64 val)
 {
 #if defined(LZ4_BIG_ENDIAN)
-#if defined(__GNUC__) && (GCC_VERSION >= 304) && \
+#if ((defined(__GNUC__) && (GCC_VERSION >= 304)) || defined(__clang__)) && \
 	!defined(LZ4_FORCE_SW_BITCOUNT)
 	return (__builtin_clzll(val) >> 3);
 #else
@@ -404,7 +405,7 @@ LZ4_NbCommonBytes(register U64 val)
 	return (r);
 #endif
 #else
-#if defined(__GNUC__) && (GCC_VERSION >= 304) && \
+#if ((defined(__GNUC__) && (GCC_VERSION >= 304)) || defined(__clang__)) && \
 	!defined(LZ4_FORCE_SW_BITCOUNT)
 	return (__builtin_ctzll(val) >> 3);
 #else
@@ -426,7 +427,7 @@ static inline int
 LZ4_NbCommonBytes(register U32 val)
 {
 #if defined(LZ4_BIG_ENDIAN)
-#if defined(__GNUC__) && (GCC_VERSION >= 304) && \
+#if ((defined(__GNUC__) && (GCC_VERSION >= 304)) || defined(__clang__)) && \
 	!defined(LZ4_FORCE_SW_BITCOUNT)
 	return (__builtin_clz(val) >> 3);
 #else
@@ -873,6 +874,11 @@ real_LZ4_compress(const char *source, char *dest, int isize, int osize)
  *	its code is not present here.
  */
 
+static const int dec32table[] = {0, 3, 2, 3, 0, 0, 0, 0};
+#if LZ4_ARCH64
+static const int dec64table[] = {0, 0, 0, -1, 0, 1, 2, 3};
+#endif
+
 static int
 LZ4_uncompress_unknownOutputSize(const char *source, char *dest, int isize,
     int maxOutputSize)
@@ -886,11 +892,6 @@ LZ4_uncompress_unknownOutputSize(const char *source, char *dest, int isize,
 	BYTE *const oend = op + maxOutputSize;
 	BYTE *cpy;
 
-	size_t dec32table[] = {0, 3, 2, 3, 0, 0, 0, 0};
-#if LZ4_ARCH64
-	size_t dec64table[] = {0, 0, 0, (size_t)-1, 0, 1, 2, 3};
-#endif
-
 	/* Main Loop */
 	while (ip < iend) {
 		unsigned token;
@@ -902,6 +903,8 @@ LZ4_uncompress_unknownOutputSize(const char *source, char *dest, int isize,
 			int s = 255;
 			while ((ip < iend) && (s == 255)) {
 				s = *ip++;
+				if (unlikely(length > (size_t)(length + s)))
+					goto _output_error;
 				length += s;
 			}
 		}
@@ -944,6 +947,8 @@ LZ4_uncompress_unknownOutputSize(const char *source, char *dest, int isize,
 		if ((length = (token & ML_MASK)) == ML_MASK) {
 			while (ip < iend) {
 				int s = *ip++;
+				if (unlikely(length > (size_t)(length + s)))
+					goto _output_error;
 				length += s;
 				if (s == 255)
 					continue;
@@ -953,7 +958,7 @@ LZ4_uncompress_unknownOutputSize(const char *source, char *dest, int isize,
 		/* copy repeated sequence */
 		if (unlikely(op - ref < STEPSIZE)) {
 #if LZ4_ARCH64
-			size_t dec64 = dec64table[op-ref];
+			int dec64 = dec64table[op - ref];
 #else
 			const int dec64 = 0;
 #endif
@@ -963,7 +968,7 @@ LZ4_uncompress_unknownOutputSize(const char *source, char *dest, int isize,
 			op[3] = ref[3];
 			op += 4;
 			ref += 4;
-			ref -= dec32table[op-ref];
+			ref -= dec32table[op - ref];
 			A32(op) = A32(ref);
 			op += STEPSIZE - 4;
 			ref -= dec64;
@@ -977,6 +982,13 @@ LZ4_uncompress_unknownOutputSize(const char *source, char *dest, int isize,
 				 * Error: request to write outside of
 				 * destination buffer
 				 */
+				goto _output_error;
+#if LZ4_ARCH64
+			if ((ref + COPYLENGTH) > oend)
+#else
+			if ((ref + COPYLENGTH) > oend ||
+			    (op + COPYLENGTH) > oend)
+#endif
 				goto _output_error;
 			LZ4_SECURECOPY(ref, op, (oend - COPYLENGTH));
 			while (op < cpy)
@@ -999,14 +1011,14 @@ LZ4_uncompress_unknownOutputSize(const char *source, char *dest, int isize,
 
 	/* write overflow error detected */
 	_output_error:
-	return (int)(-(((char *)ip) - source));
+	return (-1);
 }
 
 void
 lz4_init(void)
 {
 	lz4_cache = kmem_cache_create("lz4_cache",
-		sizeof (struct refTables), 0, NULL, NULL, NULL, NULL, NULL, 0);
+	    sizeof (struct refTables), 0, NULL, NULL, NULL, NULL, NULL, 0);
 }
 
 void

@@ -26,7 +26,7 @@
 #
 
 #
-# Copyright (c) 2013 by Delphix. All rights reserved.
+# Copyright (c) 2013, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/tests/functional/delegate/delegate_common.kshlib
@@ -48,9 +48,55 @@ log_assert "Verify privileged user has correct permissions once which was "\
 	"delegated to him in datasets"
 log_onexit restore_root_datasets
 
+if is_linux; then
 #
 #				Results in	Results in
 #		Permission	Filesystem	Volume
+#
+# Removed for Linux:
+# - mount	- mount(8) does not permit non-superuser mounts
+# - mountpoint	- mount(8) does not permit non-superuser mounts
+# - canmount	- mount(8) does not permit non-superuser mounts
+# - rename      - mount(8) does not permit non-superuser mounts
+# - zoned	- zones are not supported
+# - destroy     - umount(8) does not permit non-superuser umounts
+# - sharenfs	- sharing requires superuser privileges
+# - share	- sharing requires superuser privileges
+# - readonly	- mount(8) does not permit non-superuser remounts
+#
+set -A perms	create		true		false	\
+		snapshot	true		true	\
+		send		true		true	\
+		allow		true		true	\
+		quota		true		false	\
+		reservation	true		true	\
+		dnodesize	true		false	\
+		recordsize	true		false	\
+		checksum	true		true	\
+		compression	true		true	\
+		atime		true		false	\
+		devices		true		false	\
+		exec		true		false	\
+		volsize		false		true	\
+		setuid		true		false	\
+		snapdir		true		false	\
+		userprop	true		true	\
+		aclinherit	true		false	\
+		rollback	true		true	\
+		clone		true		true	\
+		promote		true		true	\
+		xattr		true		false	\
+		receive		true		false
+
+elif is_freebsd; then
+#				Results in	Results in
+#		Permission	Filesystem	Volume
+#
+# Removed for FreeBSD
+# - jailed	- jailing requires superuser privileges
+# - sharenfs	- sharing requires superuser privileges
+# - share	- sharing requires superuser privileges
+# - xattr	- Not supported on FreeBSD
 #
 set -A perms	create		true		false	\
 		snapshot	true		true	\
@@ -59,6 +105,39 @@ set -A perms	create		true		false	\
 		allow		true		true	\
 		quota		true		false	\
 		reservation	true		true	\
+		dnodesize	true		false	\
+		recordsize	true		false	\
+		mountpoint	true		false	\
+		checksum	true		true	\
+		compression	true		true	\
+		canmount	true		false	\
+		atime		true		false	\
+		devices		true		false	\
+		exec		true		false	\
+		volsize		false		true	\
+		setuid		true		false	\
+		readonly	true		true	\
+		snapdir		true		false	\
+		userprop	true		true	\
+		aclmode		true		false	\
+		aclinherit	true		false	\
+		rollback	true		true	\
+		clone		true		true	\
+		rename		true		true	\
+		promote		true		true	\
+		receive		true		false   \
+		destroy		true		true
+
+else
+
+set -A perms	create		true		false	\
+		snapshot	true		true	\
+		mount		true		false	\
+		send		true		true	\
+		allow		true		true	\
+		quota		true		false	\
+		reservation	true		true	\
+		dnodesize	true		false	\
 		recordsize	true		false	\
 		mountpoint	true		false	\
 		checksum	true		true	\
@@ -82,10 +161,12 @@ set -A perms	create		true		false	\
 		xattr		true		false	\
 		receive		true		false	\
 		destroy		true		true
+
 if is_global_zone; then
 	typeset -i n=${#perms[@]}
 	perms[((n))]="sharenfs"; perms[((n+1))]="true"; perms[((n+2))]="false"
 	perms[((n+3))]="share"; perms[((n+4))]="true"; perms[((n+5))]="false"
+fi
 fi
 
 for dtst in $DATASETS; do
@@ -95,7 +176,7 @@ for dtst in $DATASETS; do
 
 	typeset -i i=0
 	while (( i < ${#perms[@]} )); do
-		log_must $ZFS allow $STAFF1 ${perms[$i]} $dtst
+		log_must zfs allow $STAFF1 ${perms[$i]} $dtst
 
 		if [[ ${perms[((i+k))]} == "true" ]]; then
 			log_must verify_perm $dtst ${perms[$i]} $STAFF1

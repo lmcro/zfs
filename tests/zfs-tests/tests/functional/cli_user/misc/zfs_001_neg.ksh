@@ -26,11 +26,11 @@
 #
 
 #
-# Copyright (c) 2013 by Delphix. All rights reserved.
+# Copyright (c) 2013, 2016 by Delphix. All rights reserved.
 #
 
-. $STF_SUITE/tests/functional/cli_user/misc/misc.cfg
 . $STF_SUITE/include/libtest.shlib
+. $STF_SUITE/tests/functional/cli_user/misc/misc.cfg
 
 #
 # DESCRIPTION:
@@ -44,16 +44,17 @@
 
 function cleanup
 {
-	if [ -e /tmp/zfs_001_neg.$$.txt ]
-	then
-		$RM /tmp/zfs_001_neg.$$.txt
-	fi
+	rm -f "$TEMPFILE"
 }
 
 log_onexit cleanup
 log_assert "zfs shows a usage message when run as a user"
 
-eval "$ZFS > /tmp/zfs_001_neg.$$.txt 2>&1"
-log_must $GREP "usage: zfs command args" /tmp/zfs_001_neg.$$.txt
+TEMPFILE="$TEST_BASE_DIR/zfs_001_neg.$$.txt"
+
+zfs > $TEMPFILE 2>&1
+log_must grep "usage: zfs command args" "$TEMPFILE"
+
+log_must eval "awk '{if (length(\$0) > 80) exit 1}' < $TEMPFILE"
 
 log_pass "zfs shows a usage message when run as a user"

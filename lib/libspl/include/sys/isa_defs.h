@@ -46,8 +46,12 @@ extern "C" {
 #define	__x86
 #endif
 
+#if defined(_ILP32)
+/* x32-specific defines; careful to *not* define _LP64 here */
+#else
 #if !defined(_LP64)
 #define	_LP64
+#endif
 #endif
 
 #if !defined(_LITTLE_ENDIAN)
@@ -55,6 +59,7 @@ extern "C" {
 #endif
 
 #define	_SUNOS_VTOC_16
+#define	HAVE_EFFICIENT_UNALIGNED_ACCESS
 
 /* i386 arch specific defines */
 #elif defined(__i386) || defined(__i386__)
@@ -76,6 +81,7 @@ extern "C" {
 #endif
 
 #define	_SUNOS_VTOC_16
+#define	HAVE_EFFICIENT_UNALIGNED_ACCESS
 
 /* powerpc arch specific defines */
 #elif defined(__powerpc) || defined(__powerpc__) || defined(__powerpc64__)
@@ -98,11 +104,8 @@ extern "C" {
 #endif
 #endif
 
-#if !defined(_BIG_ENDIAN)
-#define	_BIG_ENDIAN
-#endif
-
 #define	_SUNOS_VTOC_16
+#define	HAVE_EFFICIENT_UNALIGNED_ACCESS
 
 /* arm arch specific defines */
 #elif defined(__arm) || defined(__arm__) || defined(__aarch64__)
@@ -133,8 +136,12 @@ extern "C" {
 
 #define	_SUNOS_VTOC_16
 
+#if defined(__ARM_FEATURE_UNALIGNED)
+#define	HAVE_EFFICIENT_UNALIGNED_ACCESS
+#endif
+
 /* sparc arch specific defines */
-#elif defined(__sparc) || defined(__sparc__) || defined(__sparc64__)
+#elif defined(__sparc) || defined(__sparc__)
 
 #if !defined(__sparc)
 #define	__sparc
@@ -147,7 +154,7 @@ extern "C" {
 #define	_BIG_ENDIAN
 #define	_SUNOS_VTOC_16
 
-#if defined(__sparc64__)
+#if defined(__arch64__)
 #if !defined(_LP64)
 #define	_LP64
 #endif
@@ -172,7 +179,47 @@ extern "C" {
 #define	_BIG_ENDIAN
 #define	_SUNOS_VTOC_16
 
-#else /* Currently x86_64, i386, arm, powerpc, s390, and sparc are supported */
+/* MIPS arch specific defines */
+#elif defined(__mips__)
+
+#if defined(__MIPSEB__)
+#define	_BIG_ENDIAN
+#elif defined(__MIPSEL__)
+#define	_LITTLE_ENDIAN
+#else
+#error MIPS no endian specified
+#endif
+
+#ifndef _LP64
+#define	_ILP32
+#endif
+
+#define	_SUNOS_VTOC_16
+
+/*
+ * RISC-V arch specific defines
+ * only RV64G (including atomic) LP64 is supported yetxi
+ */
+#elif defined(__riscv) && defined(_LP64) && _LP64 && \
+	defined(__riscv_atomic) && __riscv_atomic
+
+#ifndef	__riscv__
+#define	__riscv__
+#endif
+
+#ifndef	__rv64g__
+#define	__rv64g__
+#endif
+
+#define	_LITTLE_ENDIAN
+
+#define	_SUNOS_VTOC_16
+
+#else
+/*
+ * Currently supported:
+ * x86_64, x32, i386, arm, powerpc, s390, sparc, mips, and RV64G
+ */
 #error "Unsupported ISA type"
 #endif
 

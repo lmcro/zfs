@@ -25,6 +25,7 @@ struct zed_conf {
 	unsigned	do_memlock:1;		/* true if locking memory */
 	unsigned	do_verbose:1;		/* true if verbosity enabled */
 	unsigned	do_zero:1;		/* true if zeroing state */
+	unsigned	do_idle:1;		/* true if idle enabled */
 	int		syslog_facility;	/* syslog facility value */
 	int		min_events;		/* RESERVED FOR FUTURE USE */
 	int		max_events;		/* RESERVED FOR FUTURE USE */
@@ -37,6 +38,7 @@ struct zed_conf {
 	int		state_fd;		/* fd to state file */
 	libzfs_handle_t	*zfs_hdl;		/* handle to libzfs */
 	int		zevent_fd;		/* fd for access to zevents */
+	char		*path;		/* custom $PATH for zedlets to use */
 };
 
 struct zed_conf *zed_conf_create(void);

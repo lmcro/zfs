@@ -7,30 +7,32 @@ systemdunit_DATA = \
 	zfs-import-scan.service \
 	zfs-mount.service \
 	zfs-share.service \
+	zfs-volume-wait.service \
+	zfs-import.target \
+	zfs-volumes.target \
 	zfs.target
 
 EXTRA_DIST = \
-	$(top_srcdir)/etc/systemd/system/zfs-zed.service.in \
-	$(top_srcdir)/etc/systemd/system/zfs-import-cache.service.in \
-	$(top_srcdir)/etc/systemd/system/zfs-import-scan.service.in \
-	$(top_srcdir)/etc/systemd/system/zfs-mount.service.in \
-	$(top_srcdir)/etc/systemd/system/zfs-share.service.in \
-	$(top_srcdir)/etc/systemd/system/zfs.target.in \
-	$(top_srcdir)/etc/systemd/system/50-zfs.preset.in
+	zfs-zed.service.in \
+	zfs-import-cache.service.in \
+	zfs-import-scan.service.in \
+	zfs-mount.service.in \
+	zfs-share.service.in \
+	zfs-import.target.in \
+	zfs-volume-wait.service.in \
+	zfs-volumes.target.in \
+	zfs.target.in \
+	50-zfs.preset.in
 
-$(systemdunit_DATA):
+$(systemdunit_DATA) $(systemdpreset_DATA):%:%.in
 	-$(SED) -e 's,@bindir\@,$(bindir),g' \
 		-e 's,@runstatedir\@,$(runstatedir),g' \
 		-e 's,@sbindir\@,$(sbindir),g' \
 		-e 's,@sysconfdir\@,$(sysconfdir),g' \
-		"$(top_srcdir)/etc/systemd/system/$@.in" >'$@'
+		$< >'$@'
 
-$(systemdpreset_DATA):
-	-$(SED) -e 's,@bindir\@,$(bindir),g' \
-		-e 's,@runstatedir\@,$(runstatedir),g' \
-		-e 's,@sbindir\@,$(sbindir),g' \
-		-e 's,@sysconfdir\@,$(sysconfdir),g' \
-		"$(top_srcdir)/etc/systemd/system/$@.in" >'$@'
+install-data-hook:
+	$(MKDIR_P) "$(DESTDIR)$(systemdunitdir)"
+	ln -sf /dev/null "$(DESTDIR)$(systemdunitdir)/zfs-import.service"
 
-distclean-local::
-	-$(RM) $(systemdunit_DATA) $(systemdpreset_DATA)
+CLEANFILES = $(systemdunit_DATA) $(systemdpreset_DATA)

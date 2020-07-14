@@ -24,6 +24,11 @@
 # Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
 # Use is subject to license terms.
 #
+
+#
+# Copyright (c) 2016 by Delphix. All rights reserved.
+#
+
 . $STF_SUITE/include/libtest.shlib
 . $STF_SUITE/tests/functional/cli_root/zpool_add/zpool_add.kshlib
 
@@ -42,12 +47,7 @@ verify_runnable "global"
 
 function cleanup
 {
-
-        poolexists "$TESTPOOL" && \
-                destroy_pool "$TESTPOOL"
-
-	partition_cleanup
-
+        poolexists $TESTPOOL && destroy_pool $TESTPOOL
 }
 
 log_assert "'zpool add' should fail if vdevs are the same or vdev is " \
@@ -55,12 +55,11 @@ log_assert "'zpool add' should fail if vdevs are the same or vdev is " \
 
 log_onexit cleanup
 
-create_pool "$TESTPOOL" "${disk}${SLICE_PREFIX}${SLICE0}"
-log_must poolexists "$TESTPOOL"
+create_pool $TESTPOOL $DISK0
+log_must poolexists $TESTPOOL
 
-log_mustnot $ZPOOL add -f "$TESTPOOL" ${disk}${SLICE_PREFIX}${SLICE1} \
-	${disk}${SLICE_PREFIX}${SLICE1}
-log_mustnot $ZPOOL add -f "$TESTPOOL" ${disk}${SLICE_PREFIX}${SLICE0}
+log_mustnot zpool add -f $TESTPOOL $DISK1 $DISK1
+log_mustnot zpool add -f $TESTPOOL $DISK0
 
 log_pass "'zpool add' get fail as expected if vdevs are the same or vdev is " \
 	"contained in the given pool."

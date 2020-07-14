@@ -20,6 +20,7 @@
  */
 /*
  * Copyright (c) 2009, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016 by Delphix. All rights reserved.
  */
 
 #ifndef _SYS_DDT_H
@@ -34,6 +35,8 @@
 #ifdef	__cplusplus
 extern "C" {
 #endif
+
+struct abd;
 
 /*
  * On-disk DDT formats, in the desired search order (newest version first).
@@ -64,9 +67,10 @@ enum ddt_class {
 typedef struct ddt_key {
 	zio_cksum_t	ddk_cksum;	/* 256-bit block checksum */
 	/*
-	 * Encoded with logical & physical size, and compression, as follows:
+	 * Encoded with logical & physical size, encryption, and compression,
+	 * as follows:
 	 *   +-------+-------+-------+-------+-------+-------+-------+-------+
-	 *   |   0   |   0   |   0   | comp  |     PSIZE     |     LSIZE     |
+	 *   |   0   |   0   |   0   |X| comp|     PSIZE     |     LSIZE     |
 	 *   +-------+-------+-------+-------+-------+-------+-------+-------+
 	 */
 	uint64_t	ddk_prop;
@@ -82,10 +86,16 @@ typedef struct ddt_key {
 #define	DDK_SET_PSIZE(ddk, x)	\
 	BF64_SET_SB((ddk)->ddk_prop, 16, 16, SPA_MINBLOCKSHIFT, 1, x)
 
-#define	DDK_GET_COMPRESS(ddk)		BF64_GET((ddk)->ddk_prop, 32, 8)
-#define	DDK_SET_COMPRESS(ddk, x)	BF64_SET((ddk)->ddk_prop, 32, 8, x)
+#define	DDK_GET_COMPRESS(ddk)		BF64_GET((ddk)->ddk_prop, 32, 7)
+#define	DDK_SET_COMPRESS(ddk, x)	BF64_SET((ddk)->ddk_prop, 32, 7, x)
+
+#define	DDK_GET_CRYPT(ddk)		BF64_GET((ddk)->ddk_prop, 39, 1)
+#define	DDK_SET_CRYPT(ddk, x)	BF64_SET((ddk)->ddk_prop, 39, 1, x)
 
 #define	DDT_KEY_WORDS	(sizeof (ddt_key_t) / sizeof (uint64_t))
+
+#define	DDE_GET_NDVAS(dde) (DDK_GET_CRYPT(&dde->dde_key) \
+	? SPA_DVAS_PER_BP - 1 : SPA_DVAS_PER_BP)
 
 typedef struct ddt_phys {
 	dva_t		ddp_dva[SPA_DVAS_PER_BP];
@@ -93,6 +103,10 @@ typedef struct ddt_phys {
 	uint64_t	ddp_phys_birth;
 } ddt_phys_t;
 
+/*
+ * Note, we no longer generate new DDT_PHYS_DITTO-type blocks.  However,
+ * we maintain the ability to free existing dedup-ditto blocks.
+ */
 enum ddt_phys_type {
 	DDT_PHYS_DITTO = 0,
 	DDT_PHYS_SINGLE = 1,
@@ -108,7 +122,7 @@ struct ddt_entry {
 	ddt_key_t	dde_key;
 	ddt_phys_t	dde_phys[DDT_PHYS_TYPES];
 	zio_t		*dde_lead_zio[DDT_PHYS_TYPES];
-	void		*dde_repair_data;
+	struct abd	*dde_repair_abd;
 	enum ddt_type	dde_type;
 	enum ddt_class	dde_class;
 	uint8_t		dde_loading;
@@ -165,18 +179,18 @@ typedef struct ddt_ops {
 	int (*ddt_op_count)(objset_t *os, uint64_t object, uint64_t *count);
 } ddt_ops_t;
 
-#define	DDT_NAMELEN	80
+#define	DDT_NAMELEN	102
 
 extern void ddt_object_name(ddt_t *ddt, enum ddt_type type,
-    enum ddt_class class, char *name);
+    enum ddt_class clazz, char *name);
 extern int ddt_object_walk(ddt_t *ddt, enum ddt_type type,
-    enum ddt_class class, uint64_t *walk, ddt_entry_t *dde);
+    enum ddt_class clazz, uint64_t *walk, ddt_entry_t *dde);
 extern int ddt_object_count(ddt_t *ddt, enum ddt_type type,
-    enum ddt_class class, uint64_t *count);
+    enum ddt_class clazz, uint64_t *count);
 extern int ddt_object_info(ddt_t *ddt, enum ddt_type type,
-    enum ddt_class class, dmu_object_info_t *);
+    enum ddt_class clazz, dmu_object_info_t *);
 extern boolean_t ddt_object_exists(ddt_t *ddt, enum ddt_type type,
-    enum ddt_class class);
+    enum ddt_class clazz);
 
 extern void ddt_bp_fill(const ddt_phys_t *ddp, blkptr_t *bp,
     uint64_t txg);
@@ -206,10 +220,6 @@ extern void ddt_get_dedup_stats(spa_t *spa, ddt_stat_t *dds_total);
 extern uint64_t ddt_get_dedup_dspace(spa_t *spa);
 extern uint64_t ddt_get_pool_dedup_ratio(spa_t *spa);
 
-extern int ddt_ditto_copies_needed(ddt_t *ddt, ddt_entry_t *dde,
-    ddt_phys_t *ddp_willref);
-extern int ddt_ditto_copies_present(ddt_entry_t *dde);
-
 extern size_t ddt_compress(void *src, uchar_t *dst, size_t s_len, size_t d_len);
 extern void ddt_decompress(uchar_t *src, void *dst, size_t s_len, size_t d_len);
 
@@ -236,7 +246,7 @@ extern void ddt_unload(spa_t *spa);
 extern void ddt_sync(spa_t *spa, uint64_t txg);
 extern int ddt_walk(spa_t *spa, ddt_bookmark_t *ddb, ddt_entry_t *dde);
 extern int ddt_object_update(ddt_t *ddt, enum ddt_type type,
-    enum ddt_class class, ddt_entry_t *dde, dmu_tx_t *tx);
+    enum ddt_class clazz, ddt_entry_t *dde, dmu_tx_t *tx);
 
 extern const ddt_ops_t ddt_zap_ops;
 

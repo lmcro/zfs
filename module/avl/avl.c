@@ -24,7 +24,8 @@
  */
 
 /*
- * Copyright (c) 2014 by Delphix. All rights reserved.
+ * Copyright 2015 Nexenta Systems, Inc.  All rights reserved.
+ * Copyright (c) 2015 by Delphix. All rights reserved.
  */
 
 /*
@@ -102,6 +103,7 @@
 #include <sys/debug.h>
 #include <sys/avl.h>
 #include <sys/cmn_err.h>
+#include <sys/mod.h>
 
 /*
  * Small arrays to translate between balance (or diff) values and child indices.
@@ -158,7 +160,7 @@ avl_walk(avl_tree_t *tree, void	*oldnode, int left)
 		    node = node->avl_child[right])
 			;
 	/*
-	 * Otherwise, return thru left children as far as we can.
+	 * Otherwise, return through left children as far as we can.
 	 */
 	} else {
 		for (;;) {
@@ -625,25 +627,16 @@ avl_insert_here(
 }
 
 /*
- * Add a new node to an AVL tree.
+ * Add a new node to an AVL tree.  Strictly enforce that no duplicates can
+ * be added to the tree with a VERIFY which is enabled for non-DEBUG builds.
  */
 void
 avl_add(avl_tree_t *tree, void *new_node)
 {
-	avl_index_t where;
+	avl_index_t where = 0;
 
-	/*
-	 * This is unfortunate.  We want to call panic() here, even for
-	 * non-DEBUG kernels.  In userland, however, we can't depend on anything
-	 * in libc or else the rtld build process gets confused.  So, all we can
-	 * do in userland is resort to a normal ASSERT().
-	 */
-	if (avl_find(tree, new_node, &where) != NULL)
-#ifdef _KERNEL
-		panic("avl_find() succeeded inside avl_add()");
-#else
-		ASSERT(0);
-#endif
+	VERIFY(avl_find(tree, new_node, &where) == NULL);
+
 	avl_insert(tree, new_node, where);
 }
 
@@ -948,8 +941,8 @@ avl_is_empty(avl_tree_t *tree)
 
 /*
  * Post-order tree walk used to visit all tree nodes and destroy the tree
- * in post order. This is used for destroying a tree without paying any cost
- * for rebalancing it.
+ * in post order. This is used for removing all the nodes from a tree without
+ * paying any cost for rebalancing it.
  *
  * example:
  *
@@ -1058,7 +1051,8 @@ done:
 	return (AVL_NODE2DATA(node, off));
 }
 
-#if defined(_KERNEL) && defined(HAVE_SPL)
+#if defined(_KERNEL)
+
 static int __init
 avl_init(void)
 {
@@ -1072,11 +1066,12 @@ avl_fini(void)
 
 module_init(avl_init);
 module_exit(avl_fini);
+#endif
 
-MODULE_DESCRIPTION("Generic AVL tree implementation");
-MODULE_AUTHOR(ZFS_META_AUTHOR);
-MODULE_LICENSE(ZFS_META_LICENSE);
-MODULE_VERSION(ZFS_META_VERSION "-" ZFS_META_RELEASE);
+ZFS_MODULE_DESCRIPTION("Generic AVL tree implementation");
+ZFS_MODULE_AUTHOR(ZFS_META_AUTHOR);
+ZFS_MODULE_LICENSE(ZFS_META_LICENSE);
+ZFS_MODULE_VERSION(ZFS_META_VERSION "-" ZFS_META_RELEASE);
 
 EXPORT_SYMBOL(avl_create);
 EXPORT_SYMBOL(avl_find);
@@ -1093,4 +1088,6 @@ EXPORT_SYMBOL(avl_remove);
 EXPORT_SYMBOL(avl_numnodes);
 EXPORT_SYMBOL(avl_destroy_nodes);
 EXPORT_SYMBOL(avl_destroy);
-#endif
+EXPORT_SYMBOL(avl_update_lt);
+EXPORT_SYMBOL(avl_update_gt);
+EXPORT_SYMBOL(avl_update);

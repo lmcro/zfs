@@ -1,18 +1,18 @@
 include $(top_srcdir)/config/Rules.am
 
-DEFAULT_INCLUDES += \
-	-I$(top_srcdir)/include \
-	-I$(top_srcdir)/lib/libspl/include
+AM_CFLAGS += $(LIBUDEV_CFLAGS) $(LIBUUID_CFLAGS)
 
-EXTRA_DIST = zed.d/README
+SUBDIRS = zed.d
 
 sbin_PROGRAMS = zed
 
-zed_SOURCES = \
+ZED_SRC = \
 	zed.c \
 	zed.h \
 	zed_conf.c \
 	zed_conf.h \
+	zed_disk_event.c \
+	zed_disk_event.h \
 	zed_event.c \
 	zed_event.h \
 	zed_exec.c \
@@ -24,49 +24,26 @@ zed_SOURCES = \
 	zed_strings.c \
 	zed_strings.h
 
+FMA_SRC = \
+	agents/zfs_agents.c \
+	agents/zfs_agents.h \
+	agents/zfs_diagnosis.c \
+	agents/zfs_mod.c \
+	agents/zfs_retire.c \
+	agents/fmd_api.c \
+	agents/fmd_api.h \
+	agents/fmd_serd.c \
+	agents/fmd_serd.h
+
+zed_SOURCES = $(ZED_SRC) $(FMA_SRC)
+
 zed_LDADD = \
-	$(top_builddir)/lib/libavl/libavl.la \
-	$(top_builddir)/lib/libnvpair/libnvpair.la \
-	$(top_builddir)/lib/libspl/libspl.la \
-	$(top_builddir)/lib/libzpool/libzpool.la \
-	$(top_builddir)/lib/libzfs/libzfs.la \
-	$(top_builddir)/lib/libzfs_core/libzfs_core.la
+	$(abs_top_builddir)/lib/libzfs/libzfs.la \
+	$(abs_top_builddir)/lib/libzfs_core/libzfs_core.la \
+	$(abs_top_builddir)/lib/libnvpair/libnvpair.la \
+	$(abs_top_builddir)/lib/libuutil/libuutil.la
 
-zedconfdir = $(sysconfdir)/zfs/zed.d
+zed_LDADD += -lrt $(LIBUDEV_LIBS) $(LIBUUID_LIBS)
+zed_LDFLAGS = -pthread
 
-dist_zedconf_DATA = \
-	zed.d/zed-functions.sh \
-	zed.d/zed.rc
-
-zedexecdir = $(libexecdir)/zfs/zed.d
-
-dist_zedexec_SCRIPTS = \
-	zed.d/all-debug.sh \
-	zed.d/all-syslog.sh \
-	zed.d/checksum-notify.sh \
-	zed.d/checksum-spare.sh \
-	zed.d/data-notify.sh \
-	zed.d/generic-notify.sh \
-	zed.d/io-notify.sh \
-	zed.d/io-spare.sh \
-	zed.d/resilver.finish-notify.sh \
-	zed.d/scrub.finish-notify.sh
-
-zedconfdefaults = \
-	all-syslog.sh \
-	checksum-notify.sh \
-	checksum-spare.sh \
-	data-notify.sh \
-	io-notify.sh \
-	io-spare.sh \
-	resilver.finish-notify.sh \
-	scrub.finish-notify.sh
-
-install-data-hook:
-	$(MKDIR_P) "$(DESTDIR)$(zedconfdir)"
-	for f in $(zedconfdefaults); do \
-	  test -f "$(DESTDIR)$(zedconfdir)/$${f}" -o \
-	       -L "$(DESTDIR)$(zedconfdir)/$${f}" || \
-	    ln -s "$(zedexecdir)/$${f}" "$(DESTDIR)$(zedconfdir)"; \
-	done
-	chmod 0600 "$(DESTDIR)$(zedconfdir)/zed.rc"
+EXTRA_DIST = agents/README.md

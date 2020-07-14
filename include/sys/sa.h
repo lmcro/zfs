@@ -51,7 +51,7 @@ typedef uint16_t	sa_attr_type_t;
 typedef struct sa_attr_reg {
 	char 			*sa_name;	/* attribute name */
 	uint16_t 		sa_length;
-	sa_bswap_type_t		sa_byteswap;	/* bswap functon enum */
+	sa_bswap_type_t		sa_byteswap;	/* bswap function enum */
 	sa_attr_type_t 		sa_attr; /* filled in during registration */
 } sa_attr_reg_t;
 
@@ -134,8 +134,6 @@ int sa_bulk_lookup(sa_handle_t *, sa_bulk_attr_t *, int count);
 int sa_bulk_lookup_locked(sa_handle_t *, sa_bulk_attr_t *, int count);
 int sa_bulk_update(sa_handle_t *, sa_bulk_attr_t *, int count, dmu_tx_t *);
 int sa_size(sa_handle_t *, sa_attr_type_t, int *);
-int sa_update_from_cb(sa_handle_t *, sa_attr_type_t,
-    uint32_t buflen, sa_data_locator_t *, void *userdata, dmu_tx_t *);
 void sa_object_info(sa_handle_t *, dmu_object_info_t *);
 void sa_object_size(sa_handle_t *, uint32_t *, u_longlong_t *);
 void *sa_get_userdata(sa_handle_t *);
@@ -161,6 +159,7 @@ void sa_handle_unlock(sa_handle_t *);
 
 #ifdef _KERNEL
 int sa_lookup_uio(sa_handle_t *, sa_attr_type_t, uio_t *);
+int sa_add_projid(sa_handle_t *, dmu_tx_t *, uint64_t);
 #endif
 
 #ifdef	__cplusplus

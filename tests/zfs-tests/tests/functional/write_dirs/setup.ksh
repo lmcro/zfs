@@ -33,25 +33,6 @@
 
 verify_runnable "global"
 
-export SIZE="1gb"
-
-if is_linux; then
-	export SLICE_PREFIX="p"
-	export SLICE=0
-else
-	export SLICE_PREFIX="s"
-	export SLICE=0
-fi
-
-if ! $(is_physical_device $DISKS) ; then
-	log_unsupported "This directory cannot be run on raw files."
-fi
-
-DISK=${DISKS%% *}
-
-log_must set_partition $SLICE "" $SIZE $DISK
-
-if is_linux; then
-	export SLICE=1
-fi
-default_setup "${DISK}${SLICE_PREFIX}${SLICE}"
+DISK=$TEST_BASE_DIR/disk0
+truncate -s 2G $DISK
+default_setup $DISK

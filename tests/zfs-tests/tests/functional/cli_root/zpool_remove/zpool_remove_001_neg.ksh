@@ -26,7 +26,7 @@
 #
 
 #
-# Copyright (c) 2012 by Delphix. All rights reserved.
+# Copyright (c) 2012, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -42,14 +42,13 @@
 # 3. Verify that the remove failed.
 #
 
-typeset disk=${DISK}
-typeset vdev_devs="${disk}${SLICE_PREFIX}${SLICE0}"
-typeset mirror_devs="${disk}${SLICE_PREFIX}${SLICE0} ${disk}${SLICE_PREFIX}${SLICE1}"
+typeset vdev_devs="${DISK0}"
+typeset mirror_devs="${DISK0} ${DISK1}"
 typeset raidz_devs=${mirror_devs}
 typeset raidz1_devs=${mirror_devs}
-typeset raidz2_devs="${mirror_devs} ${disk}${SLICE_PREFIX}${SLICE3}"
-typeset spare_devs1="${disk}${SLICE_PREFIX}${SLICE0}"
-typeset spare_devs2="${disk}${SLICE_PREFIX}${SLICE1}"
+typeset raidz2_devs="${mirror_devs} ${DISK2}"
+typeset spare_devs1="${DISK0}"
+typeset spare_devs2="${DISK1}"
 
 function check_remove
 {
@@ -58,7 +57,7 @@ function check_remove
         typeset dev
 
         for dev in $devs; do
-                log_mustnot $ZPOOL remove $dev
+                log_mustnot zpool remove $dev
         done
 
         destroy_pool $pool
@@ -88,7 +87,7 @@ log_onexit cleanup
 
 typeset -i i=0
 while [[ $i -lt ${#create_args[*]} ]]; do
-	log_must $ZPOOL create $TESTPOOL ${create_args[i]}
+	log_must zpool create $TESTPOOL ${create_args[i]}
 	check_remove $TESTPOOL "${verify_disks[i]}"
 	(( i = i + 1))
 done

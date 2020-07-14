@@ -26,7 +26,7 @@
 #
 
 #
-# Copyright (c) 2012 by Delphix. All rights reserved.
+# Copyright (c) 2012, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -34,30 +34,17 @@
 
 verify_runnable "global"
 
+log_must set_tunable32 SCAN_SUSPEND_PROGRESS 0
+
 for pool in "$TESTPOOL" "$TESTPOOL1"; do
 	datasetexists $pool/$TESTFS && \
-		log_must $ZFS destroy -Rf $pool/$TESTFS
+		log_must zfs destroy -Rf $pool/$TESTFS
 	destroy_pool "$pool"
 done
 
-ismounted $DEVICE_DIR $NEWFS_DEFAULT_FS
-(( $? == 0 )) && log_must $UMOUNT -f $DEVICE_DIR
-
 for dir in "$TESTDIR" "$TESTDIR1" "$DEVICE_DIR" ; do
 	[[ -d $dir ]] && \
-		log_must $RM -rf $dir
+		log_must rm -rf $dir
 done
-
-# recreate and destroy a zpool over the disks to restore the partitions to
-# normal
-case $DISK_COUNT in
-0|1)
-	log_note "No disk devices to restore"
-	;;
-*)
-	log_must cleanup_devices $ZFS_DISK1
-	log_must cleanup_devices $ZFS_DISK2
-	;;
-esac
 
 log_pass

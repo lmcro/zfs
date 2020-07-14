@@ -25,6 +25,10 @@
 # Use is subject to license terms.
 #
 
+#
+# Copyright (c) 2016 by Delphix. All rights reserved.
+#
+
 . $STF_SUITE/tests/functional/cli_root/zfs_mount/zfs_mount.kshlib
 
 #
@@ -41,7 +45,7 @@
 #	  setuid		setuid/nosetuid
 #
 # STRATEGY:
-#	1. Create filesystem and get origianl property value.
+#	1. Create filesystem and get original property value.
 #	2. Using 'zfs mount -o' to set filesystem property.
 #	3. Verify the property was set temporarily.
 #	4. Verify it will not affect the property that is stored on disk.
@@ -50,7 +54,7 @@
 function cleanup
 {
 	if ! ismounted $TESTPOOL/$TESTFS; then
-		log_must $ZFS mount $TESTPOOL/$TESTFS
+		log_must zfs mount $TESTPOOL/$TESTFS
 	fi
 }
 
@@ -58,7 +62,10 @@ log_assert "Verify '-o' will set filesystem property temporarily, " \
 	"without affecting the property that is stored on disk."
 log_onexit cleanup
 
-set -A properties "atime" "devices" "exec" "readonly" "setuid"
+set -A properties "atime" "exec" "readonly" "setuid"
+if ! is_freebsd; then
+	properties+=("devices")
+fi
 
 #
 # Get the specified filesystem property reverse mount option.
@@ -72,11 +79,24 @@ function get_reverse_option
 	typeset prop=$2
 
 	# Define property value: "reverse if value=on" "reverse if value=off"
-	set -A values "noatime"   "atime" \
-		      "nodevices" "devices" \
-		      "noexec"    "exec" \
-		      "rw"        "ro" \
-		      "nosetuid"  "setuid"
+	if is_linux; then
+		set -A values "noatime"   "atime" \
+			      "noexec"    "exec" \
+			      "rw"        "ro" \
+			      "nosuid"    "suid" \
+			      "nodev"     "dev"
+	elif is_freebsd; then
+		set -A values "noatime"   "atime" \
+			      "noexec"    "exec" \
+			      "rw"        "ro" \
+			      "nosetuid"  "setuid"
+	else
+		set -A values "noatime"   "atime" \
+			      "noexec"    "exec" \
+			      "rw"        "ro" \
+			      "nosetuid"  "setuid" \
+			      "nodevices" "devices"
+	fi
 
 	typeset -i i=0
 	while (( i < ${#properties[@]} )); do
@@ -99,7 +119,7 @@ function get_reverse_option
 		(( ind = i * 2 + 1 ))
 	fi
 
-	$ECHO ${values[$ind]}
+	echo ${values[$ind]}
 }
 
 fs=$TESTPOOL/$TESTFS
@@ -111,7 +131,8 @@ for property in ${properties[@]}; do
 
 	# Set filesystem property temporarily
 	reverse_opt=$(get_reverse_option $fs $property)
-	log_must $ZFS mount -o remount,$reverse_opt $fs
+	log_must zfs unmount $fs
+	log_must zfs mount -o $reverse_opt $fs
 
 	cur_val=$(get_prop $property $fs)
 	(($? != 0)) && log_fail "get_prop $property $fs"
@@ -123,18 +144,18 @@ for property in ${properties[@]}; do
 				"be enabled in LZ"
 		fi
 	elif [[ $orig_val == $cur_val ]]; then
-		log_fail "zfs mount -o remount,$reverse_opt " \
+		log_fail "zfs mount -o $reverse_opt " \
 			"doesn't change property."
 	fi
 
 	# unmount & mount will revert property to the original value
-	log_must $ZFS unmount $fs
-	log_must $ZFS mount $fs
+	log_must zfs unmount $fs
+	log_must zfs mount $fs
 
 	cur_val=$(get_prop $property $fs)
 	(($? != 0)) && log_fail "get_prop $property $fs"
 	if [[ $orig_val != $cur_val ]]; then
-		log_fail "zfs mount -o remount,$reverse_opt " \
+		log_fail "zfs mount -o $reverse_opt " \
 			"change the property that is stored on disks"
 	fi
 done

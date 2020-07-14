@@ -26,7 +26,7 @@
 #
 
 #
-# Copyright (c) 2012 by Delphix. All rights reserved.
+# Copyright (c) 2012, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -49,37 +49,36 @@ function cleanup
 {
 	poolexists $TESTPOOL2 && destroy_pool $TESTPOOL2
 	datasetexists $TESTPOOL1/$TESTVOL && \
-		log_must $ZFS destroy -f $TESTPOOL1/$TESTVOL
+		log_must zfs destroy -f $TESTPOOL1/$TESTVOL
 
 	typeset pool
 	for pool in $TESTPOOL1 $TESTPOOL; do
 		poolexists $pool && destroy_pool $pool
 	done
 
-	zero_partitions $DISK
+	[ -n "$recursive" ] && set_tunable64 VOL_RECURSIVE $recursive
 }
 
 set -A datasets "$TESTPOOL" "$TESTPOOL2"
-
-if ! $(is_physical_device $DISKS) ; then
-	log_unsupported "This case cannot be run on raw files."
-fi
 
 log_assert "'zpool destroy <pool>' can destroy a specified pool."
 
 log_onexit cleanup
 
-partition_disk $SLICE_SIZE $DISK 2
-
-create_pool "$TESTPOOL" "${DISK}${SLICE_PREFIX}${SLICE0}"
-create_pool "$TESTPOOL1" "${DISK}${SLICE_PREFIX}${SLICE1}"
-log_must $ZFS create -s -V $VOLSIZE $TESTPOOL1/$TESTVOL
-create_pool "$TESTPOOL2" "${ZVOL_DEVDIR}/$TESTPOOL1/$TESTVOL"
+create_pool $TESTPOOL $DISK0
+create_pool $TESTPOOL1 $DISK1
+log_must zfs create -s -V $VOLSIZE $TESTPOOL1/$TESTVOL
+block_device_wait
+if is_freebsd; then
+	typeset recursive=$(get_tunable VOL_RECURSIVE)
+	log_must set_tunable64 VOL_RECURSIVE 1
+fi
+create_pool $TESTPOOL2 $ZVOL_DEVDIR/$TESTPOOL1/$TESTVOL
 
 typeset -i i=0
 while (( i < ${#datasets[*]} )); do
 	log_must poolexists "${datasets[i]}"
-	log_must $ZPOOL destroy "${datasets[i]}"
+	log_must zpool destroy "${datasets[i]}"
 	log_mustnot poolexists "${datasets[i]}"
 	((i = i + 1))
 done

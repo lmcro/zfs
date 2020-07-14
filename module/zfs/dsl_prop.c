@@ -20,9 +20,9 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2014 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
  * Copyright (c) 2013 Martin Matuska. All rights reserved.
- * Copyright 2015, Joyent, Inc.
+ * Copyright 2019 Joyent, Inc.
  */
 
 #include <sys/zfs_context.h>
@@ -73,7 +73,7 @@ int
 dsl_prop_get_dd(dsl_dir_t *dd, const char *propname,
     int intsz, int numints, void *buf, char *setpoint, boolean_t snapshot)
 {
-	int err = ENOENT;
+	int err;
 	dsl_dir_t *target = dd;
 	objset_t *mos = dd->dd_pool->dp_meta_objset;
 	zfs_prop_t prop;
@@ -98,8 +98,10 @@ dsl_prop_get_dd(dsl_dir_t *dd, const char *propname,
 	 */
 	for (; dd != NULL; dd = dd->dd_parent) {
 		if (dd != target || snapshot) {
-			if (!inheritable)
+			if (!inheritable) {
+				err = SET_ERROR(ENOENT);
 				break;
+			}
 			inheriting = B_TRUE;
 		}
 
@@ -130,8 +132,9 @@ dsl_prop_get_dd(dsl_dir_t *dd, const char *propname,
 					if (inheriting) {
 						dsl_dir_name(dd, setpoint);
 					} else {
-						(void) strcpy(setpoint,
-						    ZPROP_SOURCE_VAL_RECVD);
+						(void) strlcpy(setpoint,
+						    ZPROP_SOURCE_VAL_RECVD,
+						    MAXNAMELEN);
 					}
 				}
 				break;
@@ -150,8 +153,8 @@ dsl_prop_get_dd(dsl_dir_t *dd, const char *propname,
 	if (err == ENOENT)
 		err = dodefault(prop, intsz, numints, buf);
 
-	strfree(inheritstr);
-	strfree(recvdstr);
+	kmem_strfree(inheritstr);
+	kmem_strfree(recvdstr);
 
 	return (err);
 }
@@ -190,7 +193,7 @@ dsl_prop_get_ds(dsl_dataset_t *ds, const char *propname,
 			char *inheritstr = kmem_asprintf("%s%s", propname,
 			    ZPROP_INHERIT_SUFFIX);
 			err = zap_contains(mos, zapobj, inheritstr);
-			strfree(inheritstr);
+			kmem_strfree(inheritstr);
 			if (err != 0 && err != ENOENT)
 				return (err);
 		}
@@ -201,11 +204,12 @@ dsl_prop_get_ds(dsl_dataset_t *ds, const char *propname,
 			    ZPROP_RECVD_SUFFIX);
 			err = zap_lookup(mos, zapobj, recvdstr,
 			    intsz, numints, buf);
-			strfree(recvdstr);
+			kmem_strfree(recvdstr);
 			if (err != ENOENT) {
 				if (setpoint != NULL && err == 0)
-					(void) strcpy(setpoint,
-					    ZPROP_SOURCE_VAL_RECVD);
+					(void) strlcpy(setpoint,
+					    ZPROP_SOURCE_VAL_RECVD,
+					    MAXNAMELEN);
 				return (err);
 			}
 		}
@@ -261,7 +265,7 @@ dsl_prop_fini(dsl_dir_t *dd)
 
 	while ((pr = list_remove_head(&dd->dd_props)) != NULL) {
 		list_destroy(&pr->pr_cbs);
-		strfree((char *)pr->pr_propname);
+		spa_strfree((char *)pr->pr_propname);
 		kmem_free(pr, sizeof (dsl_prop_record_t));
 	}
 	list_destroy(&dd->dd_props);
@@ -283,7 +287,7 @@ dsl_prop_register(dsl_dataset_t *ds, const char *propname,
 	dsl_prop_record_t *pr;
 	dsl_prop_cb_record_t *cbr;
 	int err;
-	ASSERTV(dsl_pool_t *dp = dd->dd_pool);
+	dsl_pool_t *dp __maybe_unused = dd->dd_pool;
 
 	ASSERT(dsl_pool_config_held(dp));
 
@@ -424,7 +428,7 @@ dsl_prop_predict(dsl_dir_t *dd, const char *propname,
 		panic("unexpected property source: %d", source);
 	}
 
-	strfree(recvdstr);
+	kmem_strfree(recvdstr);
 
 	if (err == ENOENT)
 		return (0);
@@ -649,7 +653,7 @@ dsl_prop_set_sync_impl(dsl_dataset_t *ds, const char *propname,
     dmu_tx_t *tx)
 {
 	objset_t *mos = ds->ds_dir->dd_pool->dp_meta_objset;
-	uint64_t zapobj, intval, dummy;
+	uint64_t zapobj, intval, dummy, count;
 	int isint;
 	char valbuf[32];
 	const char *valstr = NULL;
@@ -663,7 +667,8 @@ dsl_prop_set_sync_impl(dsl_dataset_t *ds, const char *propname,
 
 	if (ds->ds_is_snapshot) {
 		ASSERT(version >= SPA_VERSION_SNAP_PROPS);
-		if (dsl_dataset_phys(ds)->ds_props_obj == 0) {
+		if (dsl_dataset_phys(ds)->ds_props_obj == 0 &&
+		    (source & ZPROP_SRC_NONE) == 0) {
 			dmu_buf_will_dirty(ds->ds_dbuf, tx);
 			dsl_dataset_phys(ds)->ds_props_obj =
 			    zap_create(mos,
@@ -673,6 +678,10 @@ dsl_prop_set_sync_impl(dsl_dataset_t *ds, const char *propname,
 	} else {
 		zapobj = dsl_dir_phys(ds->ds_dir)->dd_props_zapobj;
 	}
+
+	/* If we are removing objects from a non-existent ZAP just return */
+	if (zapobj == 0)
+		return;
 
 	if (version < SPA_VERSION_RECVD_PROPS) {
 		if (source & ZPROP_SRC_NONE)
@@ -752,8 +761,20 @@ dsl_prop_set_sync_impl(dsl_dataset_t *ds, const char *propname,
 		cmn_err(CE_PANIC, "unexpected property source: %d", source);
 	}
 
-	strfree(inheritstr);
-	strfree(recvdstr);
+	kmem_strfree(inheritstr);
+	kmem_strfree(recvdstr);
+
+	/*
+	 * If we are left with an empty snap zap we can destroy it.
+	 * This will prevent unnecessary calls to zap_lookup() in
+	 * the "zfs list" and "zfs get" code paths.
+	 */
+	if (ds->ds_is_snapshot &&
+	    zap_count(mos, zapobj, &count) == 0 && count == 0) {
+		dmu_buf_will_dirty(ds->ds_dbuf, tx);
+		dsl_dataset_phys(ds)->ds_props_obj = 0;
+		zap_destroy(mos, zapobj, tx);
+	}
 
 	if (isint) {
 		VERIFY0(dsl_prop_get_int_ds(ds, propname, &intval));
@@ -839,13 +860,7 @@ dsl_prop_inherit(const char *dsname, const char *propname,
 	return (error);
 }
 
-typedef struct dsl_props_set_arg {
-	const char *dpsa_dsname;
-	zprop_source_t dpsa_source;
-	nvlist_t *dpsa_props;
-} dsl_props_set_arg_t;
-
-static int
+int
 dsl_props_set_check(void *arg, dmu_tx_t *tx)
 {
 	dsl_props_set_arg_t *dpsa = arg;
@@ -871,7 +886,7 @@ dsl_props_set_check(void *arg, dmu_tx_t *tx)
 			    SPA_VERSION_STMF_PROP ?
 			    ZAP_OLDMAXVALUELEN : ZAP_MAXVALUELEN)) {
 				dsl_dataset_rele(ds, FTAG);
-				return (E2BIG);
+				return (SET_ERROR(E2BIG));
 			}
 		}
 	}
@@ -892,11 +907,15 @@ dsl_props_set_sync_impl(dsl_dataset_t *ds, zprop_source_t source,
 
 	while ((elem = nvlist_next_nvpair(props, elem)) != NULL) {
 		nvpair_t *pair = elem;
+		const char *name = nvpair_name(pair);
 
 		if (nvpair_type(pair) == DATA_TYPE_NVLIST) {
 			/*
-			 * dsl_prop_get_all_impl() returns properties in this
-			 * format.
+			 * This usually happens when we reuse the nvlist_t data
+			 * returned by the counterpart dsl_prop_get_all_impl().
+			 * For instance we do this to restore the original
+			 * received properties when an error occurs in the
+			 * zfs_ioc_recv() codepath.
 			 */
 			nvlist_t *attrs = fnvpair_value_nvlist(pair);
 			pair = fnvlist_lookup_nvpair(attrs, ZPROP_VALUE);
@@ -904,14 +923,14 @@ dsl_props_set_sync_impl(dsl_dataset_t *ds, zprop_source_t source,
 
 		if (nvpair_type(pair) == DATA_TYPE_STRING) {
 			const char *value = fnvpair_value_string(pair);
-			dsl_prop_set_sync_impl(ds, nvpair_name(pair),
+			dsl_prop_set_sync_impl(ds, name,
 			    source, 1, strlen(value) + 1, value, tx);
 		} else if (nvpair_type(pair) == DATA_TYPE_UINT64) {
 			uint64_t intval = fnvpair_value_uint64(pair);
-			dsl_prop_set_sync_impl(ds, nvpair_name(pair),
+			dsl_prop_set_sync_impl(ds, name,
 			    source, sizeof (intval), 1, &intval, tx);
 		} else if (nvpair_type(pair) == DATA_TYPE_BOOLEAN) {
-			dsl_prop_set_sync_impl(ds, nvpair_name(pair),
+			dsl_prop_set_sync_impl(ds, name,
 			    source, 0, 0, NULL, tx);
 		} else {
 			panic("invalid nvpair type");
@@ -919,7 +938,7 @@ dsl_props_set_sync_impl(dsl_dataset_t *ds, zprop_source_t source,
 	}
 }
 
-static void
+void
 dsl_props_set_sync(void *arg, dmu_tx_t *tx)
 {
 	dsl_props_set_arg_t *dpsa = arg;
@@ -959,7 +978,7 @@ typedef enum dsl_prop_getflags {
 	DSL_PROP_GET_INHERITING = 0x1,	/* searching parent of target ds */
 	DSL_PROP_GET_SNAPSHOT = 0x2,	/* snapshot dataset */
 	DSL_PROP_GET_LOCAL = 0x4,	/* local properties */
-	DSL_PROP_GET_RECEIVED = 0x8	/* received properties */
+	DSL_PROP_GET_RECEIVED = 0x8,	/* received properties */
 } dsl_prop_getflags_t;
 
 static int
@@ -1016,7 +1035,7 @@ dsl_prop_get_all_impl(objset_t *mos, uint64_t propobj,
 				valstr = kmem_asprintf("%s%s", propname,
 				    ZPROP_INHERIT_SUFFIX);
 				err = zap_contains(mos, propobj, valstr);
-				strfree(valstr);
+				kmem_strfree(valstr);
 				if (err == 0)
 					continue;
 				if (err != ENOENT)
@@ -1095,7 +1114,7 @@ dsl_prop_get_all_ds(dsl_dataset_t *ds, nvlist_t **nvp,
 	dsl_pool_t *dp = dd->dd_pool;
 	objset_t *mos = dp->dp_meta_objset;
 	int err = 0;
-	char setpoint[MAXNAMELEN];
+	char setpoint[ZFS_MAX_DATASET_NAME_LEN];
 
 	VERIFY(nvlist_alloc(nvp, NV_UNIQUE_NAME, KM_SLEEP) == 0);
 
@@ -1126,7 +1145,12 @@ dsl_prop_get_all_ds(dsl_dataset_t *ds, nvlist_t **nvp,
 		if (err)
 			break;
 	}
+
 out:
+	if (err) {
+		nvlist_free(*nvp);
+		*nvp = NULL;
+	}
 	return (err);
 }
 
@@ -1242,7 +1266,7 @@ dsl_prop_nvlist_add_string(nvlist_t *nv, zfs_prop_t prop, const char *value)
 	nvlist_free(propval);
 }
 
-#if defined(_KERNEL) && defined(HAVE_SPL)
+#if defined(_KERNEL)
 EXPORT_SYMBOL(dsl_prop_register);
 EXPORT_SYMBOL(dsl_prop_unregister);
 EXPORT_SYMBOL(dsl_prop_unregister_all);

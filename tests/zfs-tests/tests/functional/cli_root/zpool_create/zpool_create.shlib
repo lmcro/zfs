@@ -25,7 +25,7 @@
 #
 
 #
-# Copyright (c) 2012 by Delphix. All rights reserved.
+# Copyright (c) 2012, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -45,7 +45,7 @@ function create_pool_test
 	typeset vdevs
 	eval "typeset -a diskarray=($3)"
 
-	for vdevs in "${diskarray[@]}";do
+	for vdevs in "${diskarray[@]}"; do
 		create_pool $pool $keywd $vdevs
 		log_must poolexists $pool
 		destroy_pool $pool
@@ -53,67 +53,15 @@ function create_pool_test
 }
 
 #
-# Create a ufs|ext2 file system and make a file within the file
-# system for storage pool vdev
+# Create a file for storage pool vdev
 # $1, file size
-# $2, file name
-# $3, disk name to create ufs|ext2 file system
 #
 function create_blockfile
 {
 	typeset size=$1
-	typeset file=$2
-	typeset disk=$3
-	typeset dir=`$DIRNAME $file`
-
-	if [[ -d $dir ]]; then
-		ismounted $dir $NEWFS_DEFAULT_FS
-		(( $? == 0 )) && \
-			log_must $UMOUNT -f $dir
-	else
-		log_must $MKDIR -p $dir
-	fi
-
-	$ECHO "y" | $NEWFS ${DEV_RDSKDIR}/$disk >/dev/null 2>&1
-	(( $? != 0 )) &&
-		log_fail "Create file system fail."
-
-        log_must $MOUNT ${DEV_DSKDIR}/$disk $dir
-        log_must $MKFILE $size $file
-}
-
-#
-# Umount the ext2|ufs filesystem and remove the mountpoint
-# $1, the mount point
-#
-function clean_blockfile
-{
-	typeset dirs=$1
-
-	for dir in $dirs; do
-		if [[ -d $dir ]]; then
-			if is_linux; then
-				if ismounted $dir ext2; then
-					typeset dev=$($DF -lht ext2 | \
-						$GREP "$dir" | \
-						$AWK '{print $1}')
-					log_must $UMOUNT -f $dir
-					create_pool ${TESTPOOL}.tmp $dev
-					destroy_pool ${TESTPOOL}.tmp
-				fi
-			else
-				if ismounted $dir ufs; then
-					typeset dev=$($DF -lhF ufs | \
-						$GREP "$dir" | \
-						$AWK '{print $1}')
-					log_must $UMOUNT -f $dir
-					create_pool ${TESTPOOL}.tmp $dev
-					destroy_pool ${TESTPOOL}.tmp
-				fi
-			fi
-			log_must $RM -rf $dir
-		fi
-	done
+	typeset file=$(mktemp)
+	truncate -s $size $file
+	echo $file
 }
 
 #
@@ -121,34 +69,41 @@ function clean_blockfile
 #
 function find_vfstab_dev
 {
-	typeset vfstab="/etc/vfstab"
-	typeset tmpfile="/tmp/vfstab.tmp"
 	typeset vfstabdev
 	typeset vfstabdevs=""
 	typeset line
 
-	$CAT $vfstab | $GREP "^${DEV_DSKDIR}" >$tmpfile
+	if is_illumos; then
+		vfstab="/etc/vfstab"
+		tmpfile="$TEST_BASE_DIR/vfstab.tmp"
+	else
+		vfstab="/etc/fstab"
+		tmpfile="$TEST_BASE_DIR/fstab.tmp"
+	fi
+
+	cat $vfstab | grep "^${DEV_DSKDIR}" >$tmpfile
 	while read -r line
 	do
-		vfstabdev=`$ECHO "$line" | $AWK '{print $1}'`
+		vfstabdev=`echo "$line" | awk '{print $1}'`
 		vfstabdev=${vfstabdev%%:}
 		vfstabdevs="$vfstabdev $vfstabdevs"
 	done <$tmpfile
 
-	$RM -f $tmpfile
-	$ECHO $vfstabdevs
+	rm -f $tmpfile
+	echo $vfstabdevs
 }
 
 #
-# Save the systme current dump device configuration
+# Save the system current dump device configuration
 #
 function save_dump_dev
 {
+	typeset dumpdev=""
 
-	typeset dumpdev
-	typeset fnd="Dump device"
-
-	dumpdev=`$DUMPADM | $GREP "$fnd" | $CUT -f2 -d : | \
-		$AWK '{print $1}'`
-	$ECHO $dumpdev
+	if is_illumos; then
+		typeset fnd="Dump device"
+		dumpdev=`dumpadm | grep "$fnd" | cut -f2 -d : | \
+			awk '{print $1}'`
+	fi
+	echo $dumpdev
 }

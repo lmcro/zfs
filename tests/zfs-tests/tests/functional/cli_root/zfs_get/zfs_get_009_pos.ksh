@@ -25,6 +25,10 @@
 # Use is subject to license terms.
 #
 
+#
+# Copyright (c) 2016 by Delphix. All rights reserved.
+#
+
 . $STF_SUITE/tests/functional/cli_root/zfs_get/zfs_get_common.kshlib
 . $STF_SUITE/tests/functional/cli_root/zfs_get/zfs_get_list_d.kshlib
 
@@ -36,10 +40,14 @@
 #	1. Create a multiple depth filesystem.
 #	2. 'zfs get -d <n>' to get the output.
 #	3. 'zfs get -r|egrep' to get the expected output.
-#	4. Compare the two outputs, they shoud be same.
+#	4. Compare the two outputs, they should be same.
 #
 
 verify_runnable "both"
+
+if is_kmemleak; then
+	log_unsupported "Test case runs slowly when kmemleak is enabled"
+fi
 
 log_assert "'zfs get -d <n>' should get expected output."
 log_onexit depth_fs_cleanup
@@ -47,11 +55,16 @@ log_onexit depth_fs_cleanup
 set -A all_props type used available creation volsize referenced \
 	compressratio mounted origin recordsize quota reservation mountpoint \
 	sharenfs checksum compression atime devices exec readonly setuid \
-	zoned snapdir acltype aclinherit canmount primarycache secondarycache \
+	snapdir aclinherit canmount primarycache secondarycache \
 	usedbychildren usedbydataset usedbyrefreservation usedbysnapshots \
 	userquota@root groupquota@root userused@root groupused@root
+if is_freebsd; then
+	set -A all_props ${all_props[*]} jailed aclmode
+else
+	set -A all_props ${all_props[*]} zoned acltype
+fi
 
-$ZFS upgrade -v > /dev/null 2>&1
+zfs upgrade -v > /dev/null 2>&1
 if [[ $? -eq 0 ]]; then
 	set -A all_props ${all_props[*]} version
 fi
@@ -72,12 +85,28 @@ for dp in ${depth_array[@]}; do
 		(( j+=1 ))
 	done
 	for prop in $(gen_option_str "${all_props[*]}" "" "," $prop_numb); do
-		log_must eval "$ZFS get -H -d $dp -o name $prop $DEPTH_FS > $DEPTH_OUTPUT"
-		log_must eval "$ZFS get -rH -o name $prop $DEPTH_FS | $EGREP -e '$eg_opt' > $EXPECT_OUTPUT"
-		log_must $DIFF $DEPTH_OUTPUT $EXPECT_OUTPUT
+		log_must eval "zfs get -H -d $dp -o name $prop $DEPTH_FS > $DEPTH_OUTPUT"
+		log_must eval "zfs get -rH -o name $prop $DEPTH_FS | egrep -e '$eg_opt' > $EXPECT_OUTPUT"
+		log_must diff $DEPTH_OUTPUT $EXPECT_OUTPUT
 	done
 	(( old_val=dp ))
 done
+
+# Ensure 'zfs get -t snapshot <dataset>' works as though -d 1 was specified
+log_must eval "zfs get -H -t snapshot -o name creation $DEPTH_FS > $DEPTH_OUTPUT"
+log_must eval "zfs get -H -t snapshot -d 1 -o name creation $DEPTH_FS > $EXPECT_OUTPUT"
+log_must diff $DEPTH_OUTPUT $EXPECT_OUTPUT
+
+# Ensure 'zfs get -t snap' works as a shorthand for 'zfs get -t snapshot'
+log_must eval "zfs get -H -t snap -d 1 -o name creation $DEPTH_FS > $DEPTH_OUTPUT"
+log_must eval "zfs get -H -t snapshot -d 1 -o name creation $DEPTH_FS > $EXPECT_OUTPUT"
+log_must diff $DEPTH_OUTPUT $EXPECT_OUTPUT
+
+# Ensure 'zfs get -t bookmark <dataset>' works as though -d 1 was specified
+log_must eval "zfs get -H -t bookmark -o name creation $DEPTH_FS > $DEPTH_OUTPUT"
+log_must eval "zfs get -H -t bookmark -d 1 -o name creation $DEPTH_FS > $EXPECT_OUTPUT"
+log_must diff $DEPTH_OUTPUT $EXPECT_OUTPUT
+
 
 log_pass "'zfs get -d <n>' should get expected output."
 

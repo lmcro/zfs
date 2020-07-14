@@ -26,10 +26,11 @@
 #
 
 . $STF_SUITE/include/libtest.shlib
+. $STF_SUITE/tests/functional/cli_root/zpool_export/zpool_export.cfg
 
 DISK=${DISKS%% *}
 
-if ! $(is_physical_device $DISK) ; then
+if ! is_physical_device $DISK; then
 	log_unsupported "Only partitionable physical disks can be used"
 fi
 

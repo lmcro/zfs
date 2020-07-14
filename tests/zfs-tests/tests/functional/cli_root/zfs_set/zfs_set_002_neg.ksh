@@ -26,7 +26,7 @@
 #
 
 #
-# Copyright (c) 2011 by Delphix. All rights reserved.
+# Copyright (c) 2011, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/tests/functional/cli_root/zfs_set/zfs_set_common.kshlib
@@ -47,14 +47,19 @@ log_assert "'zfs set' fails with invalid arguments"
 
 set -A editable_props "quota" "reservation" "reserv" "volsize" "recordsize" "recsize" \
 		"mountpoint" "checksum" "compression" "compress" "atime" \
-		"devices" "exec" "setuid" "readonly" "zoned" "snapdir" "aclmode" \
+		"devices" "exec" "setuid" "readonly" "snapdir" "aclmode" \
 		"aclinherit" "canmount" "xattr" "copies" "version"
+if is_freebsd; then
+	editable_props+=("jailed")
+else
+	editable_props+=("zoned")
+fi
 
 for ds in $TESTPOOL $TESTPOOL/$TESTFS $TESTPOOL/$TESTVOL \
 	$TESTPOOL/$TESTFS@$TESTSNAP; do
 	for badarg in "" "-" "-?"; do
 		for prop in ${editable_props[@]}; do
-			log_mustnot eval "$ZFS set $badarg $prop= $ds >/dev/null 2>&1"
+			log_mustnot eval "zfs set $badarg $prop= $ds >/dev/null 2>&1"
 		done
 	done
 done

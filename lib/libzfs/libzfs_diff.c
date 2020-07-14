@@ -22,7 +22,9 @@
 /*
  * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright 2015 Nexenta Systems, Inc. All rights reserved.
+ * Copyright (c) 2015, 2018 by Delphix. All rights reserved.
  * Copyright 2016 Joyent, Inc.
+ * Copyright 2016 Igor Kozhukhov <ikozhukhov@gmail.com>
  */
 
 /*
@@ -35,7 +37,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <attr.h>
 #include <stddef.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -47,7 +48,6 @@
 #include "libzfs_impl.h"
 
 #define	ZDIFF_SNAPDIR		"/.zfs/snapshot/"
-#define	ZDIFF_SHARESDIR 	"/.zfs/shares/"
 #define	ZDIFF_PREFIX		"zfs-diff-%d"
 
 #define	ZDIFF_ADDED	'+'
@@ -55,26 +55,6 @@
 #define	ZDIFF_REMOVED	'-'
 #define	ZDIFF_RENAMED	'R'
 
-typedef struct differ_info {
-	zfs_handle_t *zhp;
-	char *fromsnap;
-	char *frommnt;
-	char *tosnap;
-	char *tomnt;
-	char *ds;
-	char *dsmnt;
-	char *tmpsnap;
-	char errbuf[1024];
-	boolean_t isclone;
-	boolean_t scripted;
-	boolean_t classify;
-	boolean_t timestamped;
-	uint64_t shares;
-	int zerr;
-	int cleanupfd;
-	int outputfd;
-	int datafd;
-} differ_info_t;
 
 /*
  * Given a {dsname, object id}, get the object path
@@ -90,7 +70,7 @@ get_stats_for_obj(differ_info_t *di, const char *dsname, uint64_t obj,
 	zc.zc_obj = obj;
 
 	errno = 0;
-	error = ioctl(di->zhp->zfs_hdl->libzfs_fd, ZFS_IOC_OBJ_TO_STATS, &zc);
+	error = zfs_ioctl(di->zhp->zfs_hdl, ZFS_IOC_OBJ_TO_STATS, &zc);
 	di->zerr = errno;
 
 	/* we can get stats even if we failed to get a path */
@@ -101,11 +81,19 @@ get_stats_for_obj(differ_info_t *di, const char *dsname, uint64_t obj,
 		return (0);
 	}
 
-	if (di->zerr == EPERM) {
+	if (di->zerr == ESTALE) {
+		(void) snprintf(pn, maxlen, "(on_delete_queue)");
+		return (0);
+	} else if (di->zerr == EPERM) {
 		(void) snprintf(di->errbuf, sizeof (di->errbuf),
 		    dgettext(TEXT_DOMAIN,
 		    "The sys_config privilege or diff delegated permission "
 		    "is needed\nto discover path names"));
+		return (-1);
+	} else if (di->zerr == EACCES) {
+		(void) snprintf(di->errbuf, sizeof (di->errbuf),
+		    dgettext(TEXT_DOMAIN,
+		    "Key must be loaded to discover path names"));
 		return (-1);
 	} else {
 		(void) snprintf(di->errbuf, sizeof (di->errbuf),
@@ -344,7 +332,7 @@ write_inuse_diffs(FILE *fp, differ_info_t *di, dmu_diff_record_t *dr)
 	int err;
 
 	for (o = dr->ddr_first; o <= dr->ddr_last; o++) {
-		if ((err = write_inuse_diffs_one(fp, di, o)))
+		if ((err = write_inuse_diffs_one(fp, di, o)) != 0)
 			return (err);
 	}
 	return (0);
@@ -358,12 +346,12 @@ describe_free(FILE *fp, differ_info_t *di, uint64_t object, char *namebuf,
 
 	if (get_stats_for_obj(di, di->fromsnap, object, namebuf,
 	    maxlen, &sb) != 0) {
-		/* Let it slide, if in the delete queue on from side */
-		if (di->zerr == ENOENT && sb.zs_links == 0) {
-			di->zerr = 0;
-			return (0);
-		}
 		return (-1);
+	}
+	/* Don't print if in the delete queue on from side */
+	if (di->zerr == ESTALE) {
+		di->zerr = 0;
+		return (0);
 	}
 
 	print_file(fp, di, ZDIFF_REMOVED, namebuf, &sb);
@@ -385,7 +373,7 @@ write_free_diffs(FILE *fp, differ_info_t *di, dmu_diff_record_t *dr)
 	while (zc.zc_obj < dr->ddr_last) {
 		int err;
 
-		err = ioctl(lhdl->libzfs_fd, ZFS_IOC_NEXT_OBJ, &zc);
+		err = zfs_ioctl(lhdl, ZFS_IOC_NEXT_OBJ, &zc);
 		if (err == 0) {
 			if (zc.zc_obj == di->shares) {
 				zc.zc_obj++;
@@ -424,7 +412,7 @@ differ(void *arg)
 
 	if ((ofp = fdopen(di->outputfd, "w")) == NULL) {
 		di->zerr = errno;
-		strncpy(di->errbuf, strerror(errno), sizeof (di->errbuf));
+		strlcpy(di->errbuf, strerror(errno), sizeof (di->errbuf));
 		(void) close(di->datafd);
 		return ((void *)-1);
 	}
@@ -469,32 +457,13 @@ differ(void *arg)
 	if (err)
 		return ((void *)-1);
 	if (di->zerr) {
-		ASSERT(di->zerr == EINVAL);
+		ASSERT(di->zerr == EPIPE);
 		(void) snprintf(di->errbuf, sizeof (di->errbuf),
 		    dgettext(TEXT_DOMAIN,
 		    "Internal error: bad data from diff IOCTL"));
 		return ((void *)-1);
 	}
 	return ((void *)0);
-}
-
-static int
-find_shares_object(differ_info_t *di)
-{
-	char fullpath[MAXPATHLEN];
-	struct stat64 sb = { 0 };
-
-	(void) strlcpy(fullpath, di->dsmnt, MAXPATHLEN);
-	(void) strlcat(fullpath, ZDIFF_SHARESDIR, MAXPATHLEN);
-
-	if (stat64(fullpath, &sb) != 0) {
-		(void) snprintf(di->errbuf, sizeof (di->errbuf),
-		    dgettext(TEXT_DOMAIN, "Cannot stat %s"), fullpath);
-		return (zfs_error(di->zhp->zfs_hdl, EZFS_DIFF, di->errbuf));
-	}
-
-	di->shares = (uint64_t)sb.st_ino;
-	return (0);
 }
 
 static int
@@ -508,7 +477,7 @@ make_temp_snapshot(differ_info_t *di)
 	(void) strlcpy(zc.zc_name, di->ds, sizeof (zc.zc_name));
 	zc.zc_cleanup_fd = di->cleanupfd;
 
-	if (ioctl(hdl->libzfs_fd, ZFS_IOC_TMP_SNAPSHOT, &zc) != 0) {
+	if (zfs_ioctl(hdl, ZFS_IOC_TMP_SNAPSHOT, &zc) != 0) {
 		int err = errno;
 		if (err == EPERM) {
 			(void) snprintf(di->errbuf, sizeof (di->errbuf),
@@ -554,11 +523,13 @@ get_snapshot_names(differ_info_t *di, const char *fromsnap,
 
 	/*
 	 * Can accept
-	 *    dataset@snap1
-	 *    dataset@snap1 dataset@snap2
-	 *    dataset@snap1 @snap2
-	 *    dataset@snap1 dataset
-	 *    @snap1 dataset@snap2
+	 *                                      fdslen fsnlen tdslen tsnlen
+	 *       dataset@snap1
+	 *    0. dataset@snap1 dataset@snap2      >0     >1     >0     >1
+	 *    1. dataset@snap1 @snap2             >0     >1    ==0     >1
+	 *    2. dataset@snap1 dataset            >0     >1     >0    ==0
+	 *    3. @snap1 dataset@snap2            ==0     >1     >0     >1
+	 *    4. @snap1 dataset                  ==0     >1     >0    ==0
 	 */
 	if (tosnap == NULL) {
 		/* only a from snapshot given, must be valid */
@@ -595,8 +566,7 @@ get_snapshot_names(differ_info_t *di, const char *fromsnap,
 	fsnlen = strlen(fromsnap) - fdslen;	/* includes @ sign */
 	tsnlen = strlen(tosnap) - tdslen;	/* includes @ sign */
 
-	if (fsnlen <= 1 || tsnlen == 1 || (fdslen == 0 && tdslen == 0) ||
-	    (fsnlen == 0 && tsnlen == 0)) {
+	if (fsnlen <= 1 || tsnlen == 1 || (fdslen == 0 && tdslen == 0)) {
 		return (zfs_error(hdl, EZFS_INVALIDNAME, di->errbuf));
 	} else if ((fdslen > 0 && tdslen > 0) &&
 	    ((tdslen != fdslen || strncmp(fromsnap, tosnap, fdslen) != 0))) {
@@ -604,7 +574,7 @@ get_snapshot_names(differ_info_t *di, const char *fromsnap,
 		 * not the same dataset name, might be okay if
 		 * tosnap is a clone of a fromsnap descendant.
 		 */
-		char origin[ZFS_MAXNAMELEN];
+		char origin[ZFS_MAX_DATASET_NAME_LEN];
 		zprop_source_t src;
 		zfs_handle_t *zhp;
 
@@ -788,7 +758,7 @@ zfs_show_diffs(zfs_handle_t *zhp, int outfd, const char *fromsnap,
 	(void) strlcpy(zc.zc_name, di.tosnap, strlen(di.tosnap) + 1);
 	zc.zc_cookie = pipefd[1];
 
-	iocerr = ioctl(zhp->zfs_hdl->libzfs_fd, ZFS_IOC_DIFF, &zc);
+	iocerr = zfs_ioctl(zhp->zfs_hdl, ZFS_IOC_DIFF, &zc);
 	if (iocerr != 0) {
 		(void) snprintf(errbuf, sizeof (errbuf),
 		    dgettext(TEXT_DOMAIN, "Unable to obtain diffs"));

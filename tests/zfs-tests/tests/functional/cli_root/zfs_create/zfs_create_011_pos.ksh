@@ -24,11 +24,16 @@
 # Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
 # Use is subject to license terms.
 #
+
+#
+# Copyright (c) 2016 by Delphix. All rights reserved.
+#
+
 . $STF_SUITE/include/libtest.shlib
 
 #
 # DESCRIPTION:
-# 'zfs create -p'  should work as expecteed
+# 'zfs create -p'  should work as expected
 #
 # STRATEGY:
 # 1. To create $newdataset with -p option, first make sure the upper level
@@ -44,7 +49,7 @@ verify_runnable "both"
 function cleanup
 {
 	if datasetexists $TESTPOOL/$TESTFS1 ; then
-		log_must $ZFS destroy -rf $TESTPOOL/$TESTFS1
+		log_must zfs destroy -rf $TESTPOOL/$TESTFS1
 	fi
 }
 

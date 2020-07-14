@@ -26,7 +26,7 @@
 #
 
 #
-# Copyright (c) 2014 by Delphix. All rights reserved.
+# Copyright (c) 2014, 2016 by Delphix. All rights reserved.
 #
 . $STF_SUITE/include/libtest.shlib
 . $STF_SUITE/tests/functional/cli_root/zpool_add/zpool_add.kshlib
@@ -48,10 +48,7 @@ verify_runnable "global"
 
 function cleanup
 {
-        poolexists $TESTPOOL && \
-                destroy_pool $TESTPOOL
-
-	partition_cleanup
+        poolexists $TESTPOOL && destroy_pool $TESTPOOL
 }
 
 log_assert "'zpool add -f <pool> <vdev> ...' can successfully add" \
@@ -59,14 +56,13 @@ log_assert "'zpool add -f <pool> <vdev> ...' can successfully add" \
 
 log_onexit cleanup
 
-create_pool "$TESTPOOL" mirror "${disk}${SLICE_PREFIX}${SLICE0}" \
-	"${disk}${SLICE_PREFIX}${SLICE1}"
-log_must poolexists "$TESTPOOL"
+create_pool $TESTPOOL mirror $DISK0 $DISK1
+log_must poolexists $TESTPOOL
 
-log_mustnot $ZPOOL add "$TESTPOOL" ${disk}${SLICE_PREFIX}${SLICE3}
-log_mustnot vdevs_in_pool "$TESTPOOL" "${disk}${SLICE_PREFIX}${SLICE3}"
+log_mustnot zpool add $TESTPOOL $DISK2
+log_mustnot vdevs_in_pool $TESTPOOL $DISK2
 
-log_must $ZPOOL add -f "$TESTPOOL" ${disk}${SLICE_PREFIX}${SLICE3}
-log_must vdevs_in_pool "$TESTPOOL" "${disk}${SLICE_PREFIX}${SLICE3}"
+log_must zpool add -f $TESTPOOL $DISK2
+log_must vdevs_in_pool $TESTPOOL $DISK2
 
 log_pass "'zpool add -f <pool> <vdev> ...' executes successfully."

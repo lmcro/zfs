@@ -4,22 +4,37 @@ pkgdracut_SCRIPTS = \
 	module-setup.sh \
 	mount-zfs.sh \
 	parse-zfs.sh \
+	zfs-generator.sh \
+	zfs-load-key.sh \
+	zfs-needshutdown.sh \
 	zfs-lib.sh
 
-EXTRA_DIST = \
-	$(top_srcdir)/contrib/dracut/90zfs/export-zfs.sh.in \
-	$(top_srcdir)/contrib/dracut/90zfs/module-setup.sh.in \
-	$(top_srcdir)/contrib/dracut/90zfs/mount-zfs.sh.in \
-	$(top_srcdir)/contrib/dracut/90zfs/parse-zfs.sh.in \
-	$(top_srcdir)/contrib/dracut/90zfs/zfs-lib.sh.in
+pkgdracut_DATA = \
+	zfs-env-bootfs.service \
+	zfs-snapshot-bootfs.service \
+	zfs-rollback-bootfs.service
 
-$(pkgdracut_SCRIPTS):
+EXTRA_DIST = \
+	export-zfs.sh.in \
+	module-setup.sh.in \
+	mount-zfs.sh.in \
+	parse-zfs.sh.in \
+	zfs-generator.sh.in \
+	zfs-load-key.sh.in \
+	zfs-needshutdown.sh.in \
+	zfs-lib.sh.in \
+	zfs-env-bootfs.service.in \
+	zfs-snapshot-bootfs.service.in \
+	zfs-rollback-bootfs.service.in
+
+$(pkgdracut_SCRIPTS) $(pkgdracut_DATA) :%:%.in
 	-$(SED) -e 's,@bindir\@,$(bindir),g' \
 		-e 's,@sbindir\@,$(sbindir),g' \
 		-e 's,@udevdir\@,$(udevdir),g' \
 		-e 's,@udevruledir\@,$(udevruledir),g' \
 		-e 's,@sysconfdir\@,$(sysconfdir),g' \
-		"$(top_srcdir)/contrib/dracut/90zfs/$@.in" >'$@'
+		-e 's,@systemdunitdir\@,$(systemdunitdir),g' \
+		-e 's,@mounthelperdir\@,$(mounthelperdir),g' \
+		$< >'$@'
 
-distclean-local::
-	-$(RM) $(pkgdracut_SCRIPTS)
+CLEANFILES = $(pkgdracut_SCRIPTS) $(pkgdracut_DATA)

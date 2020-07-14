@@ -26,7 +26,7 @@
 #
 
 #
-# Copyright (c) 2012 by Delphix. All rights reserved.
+# Copyright (c) 2012, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -48,10 +48,9 @@ function cleanup
 {
 	if [[ $exported_pool == true ]]; then
 		if [[ $force_pool == true ]]; then
-			log_must $ZPOOL create \
-				-f $TESTPOOL ${disk}${SLICE_PREFIX}${SLICE0}
+			log_must zpool create -f $TESTPOOL $DISK0
 		else
-			log_must $ZPOOL import $TESTPOOL
+			log_must zpool import $TESTPOOL
 		fi
 	fi
 
@@ -62,49 +61,6 @@ function cleanup
 	if poolexists $TESTPOOL1 ; then
                 destroy_pool $TESTPOOL1
 	fi
-
-	#
-	# recover it back to EFI label
-	#
-	create_pool $TESTPOOL $disk
-	destroy_pool $TESTPOOL
-
-        partition_disk $SIZE $disk 6
-}
-
-#
-# create overlap slice 0 and 1 on $disk
-#
-function create_overlap_slice
-{
-        typeset format_file=/var/tmp/format_overlap.$$
-        typeset disk=$1
-
-        $ECHO "partition" >$format_file
-        $ECHO "0" >> $format_file
-        $ECHO "" >> $format_file
-        $ECHO "" >> $format_file
-        $ECHO "0" >> $format_file
-        $ECHO "200m" >> $format_file
-        $ECHO "1" >> $format_file
-        $ECHO "" >> $format_file
-        $ECHO "" >> $format_file
-        $ECHO "0" >> $format_file
-        $ECHO "400m" >> $format_file
-        $ECHO "label" >> $format_file
-        $ECHO "" >> $format_file
-        $ECHO "q" >> $format_file
-        $ECHO "q" >> $format_file
-
-        $FORMAT -e -s -d $disk -f $format_file
-	typeset -i ret=$?
-        $RM -fr $format_file
-
-	if (( ret != 0 )); then
-                log_fail "unable to create overlap slice."
-        fi
-
-        return 0
 }
 
 log_assert "'zpool create' have to use '-f' scenarios"
@@ -113,39 +69,21 @@ log_onexit cleanup
 typeset exported_pool=false
 typeset force_pool=false
 
-if [[ -n $DISK ]]; then
-        disk=$DISK
-else
-        disk=$DISK0
-fi
-
 # overlapped slices as vdev need -f to create pool
 
 # Make the disk is EFI labeled first via pool creation
-create_pool $TESTPOOL $disk
-destroy_pool $TESTPOOL
-
-# Make the disk is VTOC labeled since only VTOC label supports overlap
-log_must labelvtoc $disk
-log_must create_overlap_slice $disk
-
-log_mustnot $ZPOOL create $TESTPOOL ${disk}${SLICE_PREFIX}${SLICE0}
-log_must $ZPOOL create -f $TESTPOOL ${disk}${SLICE_PREFIX}${SLICE0}
+create_pool $TESTPOOL $DISK0
 destroy_pool $TESTPOOL
 
 # exported device to be as spare vdev need -f to create pool
 
-log_must $ZPOOL create -f $TESTPOOL $disk
+log_must zpool create -f $TESTPOOL $DISK0
 destroy_pool $TESTPOOL
-log_must partition_disk $SIZE $disk 6
-create_pool $TESTPOOL ${disk}${SLICE_PREFIX}${SLICE0} \
-	${disk}${SLICE_PREFIX}${SLICE1}
-log_must $ZPOOL export $TESTPOOL
+create_pool $TESTPOOL $DISK0 $DISK1
+log_must zpool export $TESTPOOL
 exported_pool=true
-log_mustnot $ZPOOL create $TESTPOOL1 ${disk}${SLICE_PREFIX}${SLICE3} \
-	spare ${disk}${SLICE_PREFIX}${SLICE1}
-create_pool $TESTPOOL1 ${disk}${SLICE_PREFIX}${SLICE3} \
-	spare ${disk}${SLICE_PREFIX}${SLICE1}
+log_mustnot zpool create $TESTPOOL1 $DISK1 spare $DISK2
+create_pool $TESTPOOL1 $DISK1 spare $DISK2
 force_pool=true
 destroy_pool $TESTPOOL1
 

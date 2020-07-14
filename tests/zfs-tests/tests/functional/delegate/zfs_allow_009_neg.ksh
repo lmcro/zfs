@@ -26,7 +26,7 @@
 #
 
 #
-# Copyright (c) 2013 by Delphix. All rights reserved.
+# Copyright (c) 2013, 2016 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/tests/functional/delegate/delegate_common.kshlib
@@ -36,7 +36,7 @@
 #	zfs allow can deal with invalid arguments.(Invalid options or combination)
 #
 # STRATEGY:
-#	1. Verify invalid argumets will cause error.
+#	1. Verify invalid arguments will cause error.
 #	2. Verify non-optional argument was missing will cause error.
 #	3. Verify invalid options cause error.
 #
@@ -49,16 +49,15 @@ log_onexit restore_root_datasets
 # Permission sets are limited to 64 characters in length.
 longset="set123456789012345678901234567890123456789012345678901234567890123"
 for dtst in $DATASETS ; do
-	log_mustnot eval "$ZFS allow -s @$longset $dtst"
+	log_mustnot eval "zfs allow -s @$longset $dtst"
 	# Create non-existent permission set
-	typeset timestamp=$($DATE +'%F-%R:%S')
-	log_mustnot $ZFS allow -s @non-existent $dtst
-	log_mustnot $ZFS allow $STAFF "atime,created,mounted" $dtst
-	log_mustnot $ZFS allow $dtst $TESTPOOL
-	log_mustnot $ZFS allow -c $dtst
-	log_mustnot $ZFS allow -u $STAFF1 $dtst
-	log_mustnot $ZFS allow -u $STAFF1 -g $STAFF_GROUP "create,destroy" $dtst
-	log_mustnot $ZFS allow -u $STAFF1 -e "mountpoint" $dtst
+	log_mustnot zfs allow -s @non-existent $dtst
+	log_mustnot zfs allow $STAFF "atime,created,mounted" $dtst
+	log_mustnot zfs allow $dtst $TESTPOOL
+	log_mustnot zfs allow -c $dtst
+	log_mustnot zfs allow -u $STAFF1 $dtst
+	log_mustnot zfs allow -u $STAFF1 -g $STAFF_GROUP "create,destroy" $dtst
+	log_mustnot zfs allow -u $STAFF1 -e "mountpoint" $dtst
 done
 
 log_pass "Invalid arguments are handled correctly."
