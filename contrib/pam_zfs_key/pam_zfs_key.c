@@ -41,20 +41,23 @@
 
 #if	defined(__linux__)
 #include <security/pam_ext.h>
+#define	MAP_FLAGS MAP_PRIVATE | MAP_ANONYMOUS
 #elif	defined(__FreeBSD__)
 #include <security/pam_appl.h>
 static void
 pam_syslog(pam_handle_t *pamh, int loglevel, const char *fmt, ...)
 {
+	(void) pamh;
 	va_list args;
 	va_start(args, fmt);
 	vsyslog(loglevel, fmt, args);
 	va_end(args);
 }
+#define	MAP_FLAGS MAP_PRIVATE | MAP_ANON | MAP_NOCORE
 #endif
 
 #include <string.h>
-
+#include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/file.h>
@@ -69,10 +72,37 @@ static libzfs_handle_t *g_zfs;
 
 static void destroy_pw(pam_handle_t *pamh, void *data, int errcode);
 
+typedef int (*mlock_func_t) (const void *, size_t);
+
 typedef struct {
 	size_t len;
 	char *value;
 } pw_password_t;
+
+/*
+ * Try to mlock(2) or munlock(2) addr while handling EAGAIN by retrying ten
+ * times and sleeping 10 milliseconds in between for a total of 0.1
+ * seconds. lock_func must point to either mlock(2) or munlock(2).
+ */
+static int
+try_lock(mlock_func_t lock_func, const void *addr, size_t len)
+{
+	int err;
+	int retries = 10;
+	useconds_t sleep_dur = 10 * 1000;
+
+	if ((err = (*lock_func)(addr, len)) != EAGAIN) {
+		return (err);
+	}
+	for (int i = retries; i > 0; --i) {
+		(void) usleep(sleep_dur);
+		if ((err = (*lock_func)(addr, len)) != EAGAIN) {
+			break;
+		}
+	}
+	return (err);
+}
+
 
 static pw_password_t *
 alloc_pw_size(size_t len)
@@ -82,29 +112,39 @@ alloc_pw_size(size_t len)
 		return (NULL);
 	}
 	pw->len = len;
-	pw->value = malloc(len);
-	if (!pw->value) {
+	/*
+	 * We use mmap(2) rather than malloc(3) since later on we mlock(2) the
+	 * memory region. Since mlock(2) and munlock(2) operate on whole memory
+	 * pages we should allocate a whole page here as mmap(2) does. Further
+	 * this ensures that the addresses passed to mlock(2) an munlock(2) are
+	 * on a page boundary as suggested by FreeBSD and required by some
+	 * other implementations. Finally we avoid inadvertently munlocking
+	 * memory mlocked by an concurrently running instance of us.
+	 */
+	pw->value = mmap(NULL, pw->len, PROT_READ | PROT_WRITE, MAP_FLAGS,
+	    -1, 0);
+
+	if (pw->value == MAP_FAILED) {
 		free(pw);
 		return (NULL);
 	}
-	mlock(pw->value, pw->len);
+	if (try_lock(mlock, pw->value, pw->len) != 0) {
+		(void) munmap(pw->value, pw->len);
+		free(pw);
+		return (NULL);
+	}
 	return (pw);
 }
 
 static pw_password_t *
 alloc_pw_string(const char *source)
 {
-	pw_password_t *pw = malloc(sizeof (pw_password_t));
+	size_t len = strlen(source) + 1;
+	pw_password_t *pw = alloc_pw_size(len);
+
 	if (!pw) {
 		return (NULL);
 	}
-	pw->len = strlen(source) + 1;
-	pw->value = malloc(pw->len);
-	if (!pw->value) {
-		free(pw);
-		return (NULL);
-	}
-	mlock(pw->value, pw->len);
 	memcpy(pw->value, source, pw->len);
 	return (pw);
 }
@@ -112,9 +152,10 @@ alloc_pw_string(const char *source)
 static void
 pw_free(pw_password_t *pw)
 {
-	bzero(pw->value, pw->len);
-	munlock(pw->value, pw->len);
-	free(pw->value);
+	memset(pw->value, 0, pw->len);
+	if (try_lock(munlock, pw->value, pw->len) == 0) {
+		(void) munmap(pw->value, pw->len);
+	}
 	free(pw);
 }
 
@@ -179,6 +220,8 @@ pw_clear(pam_handle_t *pamh)
 static void
 destroy_pw(pam_handle_t *pamh, void *data, int errcode)
 {
+	(void) pamh, (void) errcode;
+
 	if (data != NULL) {
 		pw_free((pw_password_t *)data);
 	}
@@ -386,6 +429,8 @@ unmount_unload(pam_handle_t *pamh, const char *ds_name)
 typedef struct {
 	char *homes_prefix;
 	char *runstatedir;
+	char *homedir;
+	char *dsname;
 	uid_t uid;
 	const char *username;
 	int unmount_and_unload;
@@ -423,6 +468,8 @@ zfs_key_config_load(pam_handle_t *pamh, zfs_key_config_t *config,
 	config->uid = entry->pw_uid;
 	config->username = name;
 	config->unmount_and_unload = 1;
+	config->dsname = NULL;
+	config->homedir = NULL;
 	for (int c = 0; c < argc; c++) {
 		if (strncmp(argv[c], "homes=", 6) == 0) {
 			free(config->homes_prefix);
@@ -432,6 +479,9 @@ zfs_key_config_load(pam_handle_t *pamh, zfs_key_config_t *config,
 			config->runstatedir = strdup(argv[c] + 12);
 		} else if (strcmp(argv[c], "nounmount") == 0) {
 			config->unmount_and_unload = 0;
+		} else if (strcmp(argv[c], "prop_mountpoint") == 0) {
+			if (config->homedir == NULL)
+				config->homedir = strdup(entry->pw_dir);
 		}
 	}
 	return (0);
@@ -441,11 +491,62 @@ static void
 zfs_key_config_free(zfs_key_config_t *config)
 {
 	free(config->homes_prefix);
+	free(config->runstatedir);
+	free(config->homedir);
+	free(config->dsname);
+}
+
+static int
+find_dsname_by_prop_value(zfs_handle_t *zhp, void *data)
+{
+	zfs_type_t type = zfs_get_type(zhp);
+	zfs_key_config_t *target = data;
+	char mountpoint[ZFS_MAXPROPLEN];
+
+	/* Skip any datasets whose type does not match */
+	if ((type & ZFS_TYPE_FILESYSTEM) == 0) {
+		zfs_close(zhp);
+		return (0);
+	}
+
+	/* Skip any datasets whose mountpoint does not match */
+	(void) zfs_prop_get(zhp, ZFS_PROP_MOUNTPOINT, mountpoint,
+	    sizeof (mountpoint), NULL, NULL, 0, B_FALSE);
+	if (strcmp(target->homedir, mountpoint) != 0) {
+		zfs_close(zhp);
+		return (0);
+	}
+
+	target->dsname = strdup(zfs_get_name(zhp));
+	zfs_close(zhp);
+	return (1);
 }
 
 static char *
 zfs_key_config_get_dataset(zfs_key_config_t *config)
 {
+	if (config->homedir != NULL &&
+	    config->homes_prefix != NULL) {
+		zfs_handle_t *zhp = zfs_open(g_zfs, config->homes_prefix,
+		    ZFS_TYPE_FILESYSTEM);
+		if (zhp == NULL) {
+			pam_syslog(NULL, LOG_ERR, "dataset %s not found",
+			    config->homes_prefix);
+			return (NULL);
+		}
+
+		(void) zfs_iter_filesystems(zhp, find_dsname_by_prop_value,
+		    config);
+		zfs_close(zhp);
+		char *dsname = config->dsname;
+		config->dsname = NULL;
+		return (dsname);
+	}
+
+	if (config->homes_prefix == NULL) {
+		return (NULL);
+	}
+
 	size_t len = ZFS_MAX_DATASET_NAME_LEN;
 	size_t total_len = strlen(config->homes_prefix) + 1
 	    + strlen(config->username);
@@ -457,9 +558,8 @@ zfs_key_config_get_dataset(zfs_key_config_t *config)
 		return (NULL);
 	}
 	ret[0] = 0;
-	strcat(ret, config->homes_prefix);
-	strcat(ret, "/");
-	strcat(ret, config->username);
+	(void) snprintf(ret, len + 1, "%s/%s", config->homes_prefix,
+	    config->username);
 	return (ret);
 }
 
@@ -544,6 +644,8 @@ PAM_EXTERN int
 pam_sm_authenticate(pam_handle_t *pamh, int flags,
     int argc, const char **argv)
 {
+	(void) flags, (void) argc, (void) argv;
+
 	if (pw_fetch_lazy(pamh) == NULL) {
 		return (PAM_AUTH_ERR);
 	}
@@ -556,6 +658,7 @@ PAM_EXTERN int
 pam_sm_setcred(pam_handle_t *pamh, int flags,
     int argc, const char **argv)
 {
+	(void) pamh, (void) flags, (void) argc, (void) argv;
 	return (PAM_SUCCESS);
 }
 
@@ -643,13 +746,18 @@ PAM_EXTERN int
 pam_sm_open_session(pam_handle_t *pamh, int flags,
     int argc, const char **argv)
 {
+	(void) flags;
+
 	if (geteuid() != 0) {
 		pam_syslog(pamh, LOG_ERR,
 		    "Cannot zfs_mount when not being root.");
 		return (PAM_SUCCESS);
 	}
 	zfs_key_config_t config;
-	zfs_key_config_load(pamh, &config, argc, argv);
+	if (zfs_key_config_load(pamh, &config, argc, argv) != 0) {
+		return (PAM_SESSION_ERR);
+	}
+
 	if (config.uid < 1000) {
 		zfs_key_config_free(&config);
 		return (PAM_SUCCESS);
@@ -697,13 +805,17 @@ PAM_EXTERN int
 pam_sm_close_session(pam_handle_t *pamh, int flags,
     int argc, const char **argv)
 {
+	(void) flags;
+
 	if (geteuid() != 0) {
 		pam_syslog(pamh, LOG_ERR,
 		    "Cannot zfs_mount when not being root.");
 		return (PAM_SUCCESS);
 	}
 	zfs_key_config_t config;
-	zfs_key_config_load(pamh, &config, argc, argv);
+	if (zfs_key_config_load(pamh, &config, argc, argv) != 0) {
+		return (PAM_SESSION_ERR);
+	}
 	if (config.uid < 1000) {
 		zfs_key_config_free(&config);
 		return (PAM_SUCCESS);

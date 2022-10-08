@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -25,6 +25,7 @@
  * Use is subject to license terms.
  */
 
+#include <sys/types.h>
 #include <sys/param.h>
 #include <sys/string.h>
 #include <sys/kmem.h>
@@ -101,6 +102,6 @@ kmem_asprintf(const char *fmt, ...)
 void
 kmem_strfree(char *str)
 {
-	ASSERT(str != NULL);
+	ASSERT3P(str, !=, NULL);
 	kmem_free(str, strlen(str) + 1);
 }

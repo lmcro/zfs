@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -155,7 +155,7 @@ typedef struct dsl_scan {
 	dsl_scan_phys_t scn_phys;	/* on disk representation of scan */
 	dsl_scan_phys_t scn_phys_cached;
 	avl_tree_t scn_queue;		/* queue of datasets to scan */
-	uint64_t scn_bytes_pending;	/* outstanding data to issue */
+	uint64_t scn_queues_pending;	/* outstanding data to issue */
 } dsl_scan_t;
 
 typedef struct dsl_scan_io_queue dsl_scan_io_queue_t;
@@ -163,6 +163,8 @@ typedef struct dsl_scan_io_queue dsl_scan_io_queue_t;
 void scan_init(void);
 void scan_fini(void);
 int dsl_scan_init(struct dsl_pool *dp, uint64_t txg);
+int dsl_scan_setup_check(void *, dmu_tx_t *);
+void dsl_scan_setup_sync(void *, dmu_tx_t *);
 void dsl_scan_fini(struct dsl_pool *dp);
 void dsl_scan_sync(struct dsl_pool *, dmu_tx_t *);
 int dsl_scan_cancel(struct dsl_pool *);

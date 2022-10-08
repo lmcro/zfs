@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -25,6 +25,9 @@
  * Copyright 2012 Martin Matuska <mm@FreeBSD.org>. All rights reserved.
  */
 
+#include <sys/cdefs.h>
+#include <sys/param.h>
+#include <sys/systm.h>
 #include <sys/cmn_err.h>
 
 void

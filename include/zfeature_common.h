@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -27,7 +27,7 @@
  */
 
 #ifndef _ZFEATURE_COMMON_H
-#define	_ZFEATURE_COMMON_H
+#define	_ZFEATURE_COMMON_H extern __attribute__((visibility("default")))
 
 #include <sys/fs/zfs.h>
 #include <sys/inttypes.h>
@@ -56,9 +56,7 @@ typedef enum spa_feature {
 	SPA_FEATURE_LARGE_DNODE,
 	SPA_FEATURE_SHA512,
 	SPA_FEATURE_SKEIN,
-#if !defined(__FreeBSD__)
 	SPA_FEATURE_EDONR,
-#endif
 	SPA_FEATURE_USEROBJ_ACCOUNTING,
 	SPA_FEATURE_ENCRYPTION,
 	SPA_FEATURE_PROJECT_QUOTA,
@@ -75,6 +73,11 @@ typedef enum spa_feature {
 	SPA_FEATURE_LOG_SPACEMAP,
 	SPA_FEATURE_LIVELIST,
 	SPA_FEATURE_DEVICE_REBUILD,
+	SPA_FEATURE_ZSTD_COMPRESS,
+	SPA_FEATURE_DRAID,
+	SPA_FEATURE_ZILSAXATTR,
+	SPA_FEATURE_HEAD_ERRLOG,
+	SPA_FEATURE_BLAKE3,
 	SPA_FEATURES
 } spa_feature_t;
 
@@ -116,16 +119,17 @@ typedef int (zfeature_func_t)(zfeature_info_t *, void *);
 
 #define	ZFS_FEATURE_DEBUG
 
-extern zfeature_info_t spa_feature_table[SPA_FEATURES];
+_ZFEATURE_COMMON_H zfeature_info_t spa_feature_table[SPA_FEATURES];
+_ZFEATURE_COMMON_H boolean_t zfeature_checks_disable;
 
-extern boolean_t zfeature_is_valid_guid(const char *);
+_ZFEATURE_COMMON_H boolean_t zfeature_is_valid_guid(const char *);
 
-extern boolean_t zfeature_is_supported(const char *);
-extern int zfeature_lookup_guid(const char *, spa_feature_t *);
-extern int zfeature_lookup_name(const char *, spa_feature_t *);
-extern boolean_t zfeature_depends_on(spa_feature_t, spa_feature_t);
+_ZFEATURE_COMMON_H boolean_t zfeature_is_supported(const char *);
+_ZFEATURE_COMMON_H int zfeature_lookup_guid(const char *, spa_feature_t *);
+_ZFEATURE_COMMON_H int zfeature_lookup_name(const char *, spa_feature_t *);
+_ZFEATURE_COMMON_H boolean_t zfeature_depends_on(spa_feature_t, spa_feature_t);
 
-extern void zpool_feature_init(void);
+_ZFEATURE_COMMON_H void zpool_feature_init(void);
 
 #ifdef	__cplusplus
 }

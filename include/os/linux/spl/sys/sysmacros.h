@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -77,6 +76,7 @@
 #define	max_ncpus			num_possible_cpus()
 #define	boot_ncpus			num_online_cpus()
 #define	CPU_SEQID			smp_processor_id()
+#define	CPU_SEQID_UNSTABLE		raw_smp_processor_id()
 #define	is_system_labeled()		0
 
 #ifndef RLIM64_INFINITY
@@ -113,7 +113,6 @@
 #endif
 
 /* Missing globals */
-extern char spl_gitrev[64];
 extern unsigned long spl_hostid;
 
 /* Missing misc functions */

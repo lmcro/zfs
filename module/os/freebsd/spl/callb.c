@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -23,8 +23,8 @@
  * Use is subject to license terms.
  */
 
-#include <sys/param.h>
 #include <sys/types.h>
+#include <sys/param.h>
 #include <sys/time.h>
 #include <sys/sysmacros.h>
 #include <sys/systm.h>
@@ -75,7 +75,7 @@ typedef struct callb {
 typedef struct callb_table {
 	kmutex_t ct_lock;		/* protect all callb states */
 	callb_t	*ct_freelist; 		/* free callb structures */
-	int	ct_busy;		/* != 0 prevents additions */
+	boolean_t ct_busy;		/* B_TRUE prevents additions */
 	kcondvar_t ct_busy_cv;		/* to wait for not busy    */
 	int	ct_ncallb; 		/* num of callbs allocated */
 	callb_t	*ct_first_cb[NCBCLASS];	/* ptr to 1st callb in a class */
@@ -98,7 +98,7 @@ callb_cpr_t	callb_cprinfo_safe = {
 static void
 callb_init(void *dummy __unused)
 {
-	callb_table.ct_busy = 0;	/* mark table open for additions */
+	callb_table.ct_busy = B_FALSE;	/* mark table open for additions */
 	mutex_init(&callb_safe_mutex, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&callb_table.ct_lock, NULL, MUTEX_DEFAULT, NULL);
 }
@@ -139,7 +139,7 @@ callb_add_common(boolean_t (*func)(void *arg, int code),
 {
 	callb_t *cp;
 
-	ASSERT(class < NCBCLASS);
+	ASSERT3S(class, <, NCBCLASS);
 
 	mutex_enter(&ct->ct_lock);
 	while (ct->ct_busy)
@@ -154,14 +154,13 @@ callb_add_common(boolean_t (*func)(void *arg, int code),
 	cp->c_arg = arg;
 	cp->c_class = (uchar_t)class;
 	cp->c_flag |= CALLB_TAKEN;
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 	if (strlen(name) > CB_MAXNAME)
 		cmn_err(CE_WARN, "callb_add: name of callback function '%s' "
 		    "too long -- truncated to %d chars",
 		    name, CB_MAXNAME);
 #endif
-	(void) strncpy(cp->c_name, name, CB_MAXNAME);
-	cp->c_name[CB_MAXNAME] = '\0';
+	(void) strlcpy(cp->c_name, name, sizeof (cp->c_name));
 
 	/*
 	 * Insert the new callb at the head of its class list.
@@ -217,7 +216,7 @@ callb_delete(callb_id_t id)
 		while (*pp != NULL && *pp != me)
 			pp = &(*pp)->c_next;
 
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 		if (*pp != me) {
 			cmn_err(CE_WARN, "callb delete bogus entry 0x%p",
 			    (void *)me);
@@ -259,7 +258,7 @@ callb_execute_class(int class, int code)
 	callb_t *cp;
 	void *ret = NULL;
 
-	ASSERT(class < NCBCLASS);
+	ASSERT3S(class, <, NCBCLASS);
 
 	mutex_enter(&ct->ct_lock);
 
@@ -338,10 +337,10 @@ callb_generic_cpr(void *arg, int code)
  * The generic callback function associated with kernel threads which
  * are always considered safe.
  */
-/* ARGSUSED */
 boolean_t
 callb_generic_cpr_safe(void *arg, int code)
 {
+	(void) arg, (void) code;
 	return (B_TRUE);
 }
 /*
@@ -351,8 +350,8 @@ void
 callb_lock_table(void)
 {
 	mutex_enter(&ct->ct_lock);
-	ASSERT(ct->ct_busy == 0);
-	ct->ct_busy = 1;
+	ASSERT(!ct->ct_busy);
+	ct->ct_busy = B_TRUE;
 	mutex_exit(&ct->ct_lock);
 }
 
@@ -363,8 +362,8 @@ void
 callb_unlock_table(void)
 {
 	mutex_enter(&ct->ct_lock);
-	ASSERT(ct->ct_busy != 0);
-	ct->ct_busy = 0;
+	ASSERT(ct->ct_busy);
+	ct->ct_busy = B_FALSE;
 	cv_broadcast(&ct->ct_busy_cv);
 	mutex_exit(&ct->ct_lock);
 }

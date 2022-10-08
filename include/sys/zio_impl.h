@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -73,9 +73,9 @@ extern "C" {
  * the supported transformations:
  *
  * Compression:
- * ZFS supports three different flavors of compression -- gzip, lzjb, and
- * zle. Compression occurs as part of the write pipeline and is performed
- * in the ZIO_STAGE_WRITE_BP_INIT stage.
+ * ZFS supports five different flavors of compression -- gzip, lzjb, lz4, zle,
+ * and zstd. Compression occurs as part of the write pipeline and is
+ * performed in the ZIO_STAGE_WRITE_BP_INIT stage.
  *
  * Dedup:
  * Dedup reads are handled by the ZIO_STAGE_DDT_READ_START and

@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -40,13 +40,14 @@
  * This controls the number of entries in the buffer the redaction_list_update
  * synctask uses to buffer writes to the redaction list.
  */
-int redact_sync_bufsize = 1024;
+static const int redact_sync_bufsize = 1024;
 
 /*
  * Controls how often to update the redaction list when creating a redaction
  * list.
  */
-uint64_t redaction_list_update_interval_ns = 1000 * 1000 * 1000ULL; /* NS */
+static const uint64_t redaction_list_update_interval_ns =
+    1000 * 1000 * 1000ULL; /* 1s */
 
 /*
  * This tunable controls the length of the queues that zfs redact worker threads
@@ -56,7 +57,7 @@ uint64_t redaction_list_update_interval_ns = 1000 * 1000 * 1000ULL; /* NS */
  * available IO resources, or the queues are consuming too much memory, this
  * variable may need to be decreased.
  */
-int zfs_redact_queue_length = 1024 * 1024;
+static const int zfs_redact_queue_length = 1024 * 1024;
 
 /*
  * These tunables control the fill fraction of the queues by zfs redact. The
@@ -65,7 +66,7 @@ int zfs_redact_queue_length = 1024 * 1024;
  * should be tuned down.  If the queues empty before the signalled thread can
  * catch up, then these should be tuned up.
  */
-uint64_t zfs_redact_queue_ff = 20;
+static const uint64_t zfs_redact_queue_ff = 20;
 
 struct redact_record {
 	bqueue_node_t		ln;
@@ -141,7 +142,7 @@ record_merge_enqueue(bqueue_t *q, struct redact_record **build,
 {
 	if (new->eos_marker) {
 		if (*build != NULL)
-			bqueue_enqueue(q, *build, sizeof (*build));
+			bqueue_enqueue(q, *build, sizeof (**build));
 		bqueue_enqueue_flush(q, new, sizeof (*new));
 		return;
 	}
@@ -249,11 +250,11 @@ zfs_get_deleteq(objset_t *os)
  * Third, if there is a deleted object, we need to create a redaction record for
  * all of the blocks in that object.
  */
-/*ARGSUSED*/
 static int
 redact_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
     const zbookmark_phys_t *zb, const struct dnode_phys *dnp, void *arg)
 {
+	(void) spa, (void) zilog;
 	struct redact_thread_arg *rta = arg;
 	struct redact_record *record;
 
@@ -350,7 +351,7 @@ redact_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	return (0);
 }
 
-static void
+static __attribute__((noreturn)) void
 redact_traverse_thread(void *arg)
 {
 	struct redact_thread_arg *rt_arg = arg;
@@ -568,8 +569,7 @@ commit_rl_updates(objset_t *os, struct merge_data *md, uint64_t object,
 	uint64_t txg = dmu_tx_get_txg(tx);
 	if (!md->md_synctask_txg[txg & TXG_MASK]) {
 		dsl_sync_task_nowait(dmu_tx_pool(tx),
-		    redaction_list_update_sync, md, 5, ZFS_SPACE_CHECK_NONE,
-		    tx);
+		    redaction_list_update_sync, md, tx);
 		md->md_synctask_txg[txg & TXG_MASK] = B_TRUE;
 		md->md_latest_synctask_txg = txg;
 	}
@@ -817,13 +817,14 @@ perform_thread_merge(bqueue_t *q, uint32_t num_threads,
 		avl_remove(&end_tree, &redact_nodes[i]);
 		kmem_free(redact_nodes[i].record,
 		    sizeof (struct redact_record));
+		bqueue_destroy(&thread_args[i].q);
 	}
 
 	avl_destroy(&start_tree);
 	avl_destroy(&end_tree);
 	kmem_free(redact_nodes, num_threads * sizeof (*redact_nodes));
 	if (current_record != NULL)
-		bqueue_enqueue(q, current_record, sizeof (current_record));
+		bqueue_enqueue(q, current_record, sizeof (*current_record));
 	return (err);
 }
 
@@ -836,7 +837,7 @@ struct redact_merge_thread_arg {
 	int error_code;
 };
 
-static void
+static __attribute__((noreturn)) void
 redact_merge_thread(void *arg)
 {
 	struct redact_merge_thread_arg *rmta = arg;
@@ -854,12 +855,12 @@ redact_merge_thread(void *arg)
  * object number.
  */
 static int
-hold_next_object(objset_t *os, struct redact_record *rec, void *tag,
+hold_next_object(objset_t *os, struct redact_record *rec, const void *tag,
     uint64_t *object, dnode_t **dn)
 {
 	int err = 0;
 	if (*dn != NULL)
-		dnode_rele(*dn, FTAG);
+		dnode_rele(*dn, tag);
 	*dn = NULL;
 	if (*object < rec->start_object) {
 		*object = rec->start_object - 1;
@@ -1007,9 +1008,13 @@ dmu_redact_snap(const char *snapname, nvlist_t *redactnvl,
 	objset_t *os;
 	struct redact_thread_arg *args = NULL;
 	redaction_list_t *new_rl = NULL;
+	char *newredactbook;
 
 	if ((err = dsl_pool_hold(snapname, FTAG, &dp)) != 0)
 		return (err);
+
+	newredactbook = kmem_zalloc(sizeof (char) * ZFS_MAX_DATASET_NAME_LEN,
+	    KM_SLEEP);
 
 	if ((err = dsl_dataset_hold_flags(dp, snapname, DS_HOLD_FLAG_DECRYPT,
 	    FTAG, &ds)) != 0) {
@@ -1059,12 +1064,11 @@ dmu_redact_snap(const char *snapname, nvlist_t *redactnvl,
 
 		}
 	}
-	VERIFY3P(nvlist_next_nvpair(redactnvl, pair), ==, NULL);
 	if (err != 0)
 		goto out;
+	VERIFY3P(nvlist_next_nvpair(redactnvl, pair), ==, NULL);
 
 	boolean_t resuming = B_FALSE;
-	char newredactbook[ZFS_MAX_DATASET_NAME_LEN];
 	zfs_bookmark_phys_t bookmark;
 
 	(void) strlcpy(newredactbook, snapname, ZFS_MAX_DATASET_NAME_LEN);
@@ -1074,6 +1078,10 @@ dmu_redact_snap(const char *snapname, nvlist_t *redactnvl,
 	    "#%s", redactbook);
 	if (n >= ZFS_MAX_DATASET_NAME_LEN - (c - newredactbook)) {
 		dsl_pool_rele(dp, FTAG);
+		kmem_free(newredactbook,
+		    sizeof (char) * ZFS_MAX_DATASET_NAME_LEN);
+		if (args != NULL)
+			kmem_free(args, numsnaps * sizeof (*args));
 		return (SET_ERROR(ENAMETOOLONG));
 	}
 	err = dsl_bookmark_lookup(dp, newredactbook, NULL, &bookmark);
@@ -1146,16 +1154,24 @@ dmu_redact_snap(const char *snapname, nvlist_t *redactnvl,
 		(void) thread_create(NULL, 0, redact_traverse_thread, rta,
 		    0, curproc, TS_RUN, minclsyspri);
 	}
-	struct redact_merge_thread_arg rmta = { { {0} } };
-	(void) bqueue_init(&rmta.q, zfs_redact_queue_ff,
+
+	struct redact_merge_thread_arg *rmta;
+	rmta = kmem_zalloc(sizeof (struct redact_merge_thread_arg), KM_SLEEP);
+
+	(void) bqueue_init(&rmta->q, zfs_redact_queue_ff,
 	    zfs_redact_queue_length, offsetof(struct redact_record, ln));
-	rmta.numsnaps = numsnaps;
-	rmta.spa = os->os_spa;
-	rmta.thr_args = args;
-	(void) thread_create(NULL, 0, redact_merge_thread, &rmta, 0, curproc,
+	rmta->numsnaps = numsnaps;
+	rmta->spa = os->os_spa;
+	rmta->thr_args = args;
+	(void) thread_create(NULL, 0, redact_merge_thread, rmta, 0, curproc,
 	    TS_RUN, minclsyspri);
-	err = perform_redaction(os, new_rl, &rmta);
+	err = perform_redaction(os, new_rl, rmta);
+	bqueue_destroy(&rmta->q);
+	kmem_free(rmta, sizeof (struct redact_merge_thread_arg));
+
 out:
+	kmem_free(newredactbook, sizeof (char) * ZFS_MAX_DATASET_NAME_LEN);
+
 	if (new_rl != NULL) {
 		dsl_redaction_list_long_rele(new_rl, FTAG);
 		dsl_redaction_list_rele(new_rl, FTAG);

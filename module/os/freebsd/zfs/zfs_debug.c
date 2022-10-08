@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -29,29 +29,29 @@
 typedef struct zfs_dbgmsg {
 	list_node_t zdm_node;
 	time_t zdm_timestamp;
-	int zdm_size;
+	uint_t zdm_size;
 	char zdm_msg[1]; /* variable length allocation */
 } zfs_dbgmsg_t;
 
-list_t zfs_dbgmsgs;
-int zfs_dbgmsg_size = 0;
-kmutex_t zfs_dbgmsgs_lock;
-int zfs_dbgmsg_maxsize = 4<<20; /* 4MB */
-kstat_t *zfs_dbgmsg_kstat;
+static list_t zfs_dbgmsgs;
+static uint_t zfs_dbgmsg_size = 0;
+static kmutex_t zfs_dbgmsgs_lock;
+uint_t zfs_dbgmsg_maxsize = 4<<20; /* 4MB */
+static kstat_t *zfs_dbgmsg_kstat;
 
 /*
  * Internal ZFS debug messages are enabled by default.
  *
- * # Print debug messages
- * cat /proc/spl/kstat/zfs/dbgmsg
+ * # Print debug messages as they're logged
+ * dtrace -n 'zfs-dbgmsg { print(stringof(arg0)); }'
+ *
+ * # Print all logged dbgmsg entries
+ * sysctl kstat.zfs.misc.dbgmsg
  *
  * # Disable the kernel debug message log.
- * echo 0 > /sys/module/zfs/parameters/zfs_dbgmsg_enable
- *
- * # Clear the kernel debug message log.
- * echo 0 >/proc/spl/kstat/zfs/dbgmsg
+ * sysctl vfs.zfs.dbgmsg_enable=0
  */
-int zfs_dbgmsg_enable = 1;
+int zfs_dbgmsg_enable = B_TRUE;
 
 static int
 zfs_dbgmsg_headers(char *buf, size_t size)
@@ -88,10 +88,10 @@ zfs_dbgmsg_addr(kstat_t *ksp, loff_t n)
 }
 
 static void
-zfs_dbgmsg_purge(int max_size)
+zfs_dbgmsg_purge(uint_t max_size)
 {
 	zfs_dbgmsg_t *zdm;
-	int size;
+	uint_t size;
 
 	ASSERT(MUTEX_HELD(&zfs_dbgmsgs_lock));
 
@@ -155,7 +155,7 @@ void
 __zfs_dbgmsg(char *buf)
 {
 	zfs_dbgmsg_t *zdm;
-	int size;
+	uint_t size;
 
 	DTRACE_PROBE1(zfs__dbgmsg, char *, buf);
 
@@ -168,7 +168,7 @@ __zfs_dbgmsg(char *buf)
 	mutex_enter(&zfs_dbgmsgs_lock);
 	list_insert_tail(&zfs_dbgmsgs, zdm);
 	zfs_dbgmsg_size += size;
-	zfs_dbgmsg_purge(MAX(zfs_dbgmsg_maxsize, 0));
+	zfs_dbgmsg_purge(zfs_dbgmsg_maxsize);
 	mutex_exit(&zfs_dbgmsgs_lock);
 }
 
@@ -181,7 +181,7 @@ __set_error(const char *file, const char *func, int line, int err)
 	 * $ echo 512 >/sys/module/zfs/parameters/zfs_flags
 	 */
 	if (zfs_flags & ZFS_DEBUG_SET_ERROR)
-		__dprintf(B_FALSE, file, func, line, "error %lu", err);
+		__dprintf(B_FALSE, file, func, line, "error %lu", (ulong_t)err);
 }
 
 #ifdef _KERNEL
@@ -245,10 +245,8 @@ zfs_dbgmsg_print(const char *tag)
 }
 #endif /* _KERNEL */
 
-#ifdef _KERNEL
-module_param(zfs_dbgmsg_enable, int, 0644);
-MODULE_PARM_DESC(zfs_dbgmsg_enable, "Enable ZFS debug message log");
+ZFS_MODULE_PARAM(zfs, zfs_, dbgmsg_enable, INT, ZMOD_RW,
+	"Enable ZFS debug message log");
 
-module_param(zfs_dbgmsg_maxsize, int, 0644);
-MODULE_PARM_DESC(zfs_dbgmsg_maxsize, "Maximum ZFS debug log size");
-#endif
+ZFS_MODULE_PARAM(zfs, zfs_, dbgmsg_maxsize, UINT, ZMOD_RW,
+	"Maximum ZFS debug log size");

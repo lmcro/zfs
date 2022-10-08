@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -60,16 +60,20 @@ typedef struct vdev_rebuild_phys {
 /*
  * The vdev_rebuild_t describes the current state and how a top-level vdev
  * should be rebuilt.  The core elements are the top-vdev, the metaslab being
- * rebuilt, range tree containing the allocted extents and the on-disk state.
+ * rebuilt, range tree containing the allocated extents and the on-disk state.
  */
 typedef struct vdev_rebuild {
 	vdev_t		*vr_top_vdev;		/* top-level vdev to rebuild */
 	metaslab_t	*vr_scan_msp;		/* scanning disabled metaslab */
 	range_tree_t	*vr_scan_tree;		/* scan ranges (in metaslab) */
+	kmutex_t	vr_io_lock;		/* inflight IO lock */
+	kcondvar_t	vr_io_cv;		/* inflight IO cv */
 
 	/* In-core state and progress */
 	uint64_t	vr_scan_offset[TXG_SIZE];
 	uint64_t	vr_prev_scan_time_ms;	/* any previous scan time */
+	uint64_t	vr_bytes_inflight_max;	/* maximum bytes inflight */
+	uint64_t	vr_bytes_inflight;	/* current bytes inflight */
 
 	/* Per-rebuild pass statistics for calculating bandwidth */
 	uint64_t	vr_pass_start_time;

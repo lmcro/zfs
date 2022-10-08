@@ -7,7 +7,7 @@
 # You may not use this file except in compliance with the License.
 #
 # You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
-# or http://www.opensolaris.org/os/licensing.
+# or https://opensource.org/licenses/CDDL-1.0.
 # See the License for the specific language governing permissions
 # and limitations under the License.
 #
@@ -37,7 +37,7 @@
 # 	Detaching disks during I/O should pass for supported pools.
 #
 # STRATEGY:
-#	1. Create multidisk pools (stripe/mirror/raidz) and
+#	1. Create multidisk pools (stripe/mirror/raidz/draid) and
 #	   start some random I/O
 #	2. Detach a disk from the pool.
 #	3. Verify the integrity of the file system and the resilvering.
@@ -134,26 +134,20 @@ log_must zfs set mountpoint=$TESTDIR1 $TESTPOOL1/$TESTFS1
 
 detach_test $TESTDIR/$TESTFILE1.1
 
-zpool iostat -v $TESTPOOL1 | grep "$TESTFILE1.1"
-if [[ $? -eq 0 ]]; then
-	log_fail "$TESTFILE1.1 should no longer be present."
-fi
+log_mustnot eval "zpool iostat -v $TESTPOOL1 | grep \"$TESTFILE1.1\""
 
 destroy_pool $TESTPOOL1
 
 log_note "Verify 'zpool detach' fails with non-mirrors."
 
-for type in "" "raidz" "raidz1"; do
+for type in "" "raidz" "raidz1" "draid"; do
 	create_pool $TESTPOOL1 $type $specials_list
 	log_must zfs create $TESTPOOL1/$TESTFS1
 	log_must zfs set mountpoint=$TESTDIR1 $TESTPOOL1/$TESTFS1
 
 	log_mustnot zpool detach $TESTDIR/$TESTFILE1.1
 
-	zpool iostat -v $TESTPOOL1 | grep "$TESTFILE1.1"
-	if [[ $? -ne 0 ]]; then
-	        log_fail "$TESTFILE1.1 is not present."
-	fi
+	log_must eval "zpool iostat -v $TESTPOOL1 | grep \"$TESTFILE1.1\""
 
 	destroy_pool $TESTPOOL1
 done

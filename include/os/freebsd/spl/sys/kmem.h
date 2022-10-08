@@ -29,10 +29,11 @@
 #ifndef _OPENSOLARIS_SYS_KMEM_H_
 #define	_OPENSOLARIS_SYS_KMEM_H_
 
+#ifdef _KERNEL
 #include <sys/param.h>
 #include <sys/malloc.h>
 #include <sys/vmem.h>
-#include <sys/vmmeter.h>
+#include <sys/counter.h>
 
 #include <vm/uma.h>
 #include <vm/vm.h>
@@ -46,15 +47,15 @@ MALLOC_DECLARE(M_SOLARIS);
 #define	KM_SLEEP		M_WAITOK
 #define	KM_PUSHPAGE		M_WAITOK
 #define	KM_NOSLEEP		M_NOWAIT
-#define	KM_NODEBUG		M_NODUMP
 #define	KM_NORMALPRI		0
 #define	KMC_NODEBUG		UMA_ZONE_NODUMP
-#define	KMC_NOTOUCH		0
 
 typedef struct vmem vmem_t;
 
-extern char	*kmem_asprintf(const char *, ...);
-extern char *kmem_vasprintf(const char *fmt, va_list ap);
+extern char	*kmem_asprintf(const char *, ...)
+    __attribute__((format(printf, 1, 2)));
+extern char *kmem_vasprintf(const char *fmt, va_list ap)
+    __attribute__((format(printf, 1, 0)));
 
 typedef struct kmem_cache {
 	char		kc_name[32];
@@ -71,10 +72,11 @@ typedef struct kmem_cache {
 extern uint64_t spl_kmem_cache_inuse(kmem_cache_t *cache);
 extern uint64_t spl_kmem_cache_entry_size(kmem_cache_t *cache);
 
+__attribute__((alloc_size(1)))
 void *zfs_kmem_alloc(size_t size, int kmflags);
 void zfs_kmem_free(void *buf, size_t size);
 uint64_t kmem_size(void);
-kmem_cache_t *kmem_cache_create(char *name, size_t bufsize, size_t align,
+kmem_cache_t *kmem_cache_create(const char *name, size_t bufsize, size_t align,
     int (*constructor)(void *, void *, int), void (*destructor)(void *, void *),
     void (*reclaim)(void *) __unused, void *private, vmem_t *vmp, int cflags);
 void kmem_cache_destroy(kmem_cache_t *cache);
@@ -95,5 +97,14 @@ void *calloc(size_t n, size_t s);
 	zfs_kmem_alloc((size), (kmflags) | M_ZERO)
 #define	kmem_free(buf, size)		zfs_kmem_free((buf), (size))
 
+#endif	/* _KERNEL */
+
+#ifdef _STANDALONE
+/*
+ * At the moment, we just need it for the type. We redirect the alloc/free
+ * routines to the usual Free and Malloc in that environment.
+ */
+typedef int kmem_cache_t;
+#endif /* _STANDALONE */
 
 #endif	/* _OPENSOLARIS_SYS_KMEM_H_ */

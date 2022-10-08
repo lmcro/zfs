@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -40,15 +40,13 @@
 #ifndef _SYS_BYTEORDER_H
 #define	_SYS_BYTEORDER_H
 
-
-
-#include <sys/isa_defs.h>
-#include <sys/int_types.h>
-
 #if defined(__GNUC__) && defined(_ASM_INLINES) && \
 	(defined(__i386) || defined(__amd64))
 #include <asm/byteorder.h>
 #endif
+
+#include <sys/isa_defs.h>
+#include <inttypes.h>
 
 #ifdef	__cplusplus
 extern "C" {
@@ -58,7 +56,7 @@ extern "C" {
  * macros for conversion between host and (internet) network byte order
  */
 
-#if defined(_BIG_ENDIAN) && !defined(ntohl) && !defined(__lint)
+#if defined(_ZFS_BIG_ENDIAN) && !defined(ntohl) && !defined(__lint)
 /* big-endian */
 #define	ntohl(x)	(x)
 #define	ntohs(x)	(x)
@@ -92,6 +90,18 @@ extern	in_port_t ntohs(in_port_t);
 
 #if !defined(_XPG4_2) || defined(__EXTENSIONS__)
 
+#ifdef __COVERITY__
+/*
+ * Coverity's taint warnings from byteswapping are false positives for us.
+ * Suppress them by hiding byteswapping from Coverity.
+ */
+#define	BSWAP_8(x)	((x) & 0xff)
+#define	BSWAP_16(x)	((x) & 0xffff)
+#define	BSWAP_32(x)	((x) & 0xffffffff)
+#define	BSWAP_64(x)	(x)
+
+#else /* __COVERITY__ */
+
 /*
  * Macros to reverse byte order
  */
@@ -99,6 +109,8 @@ extern	in_port_t ntohs(in_port_t);
 #define	BSWAP_16(x)	((BSWAP_8(x) << 8) | BSWAP_8((x) >> 8))
 #define	BSWAP_32(x)	((BSWAP_16(x) << 16) | BSWAP_16((x) >> 16))
 #define	BSWAP_64(x)	((BSWAP_32(x) << 32) | BSWAP_32((x) >> 32))
+
+#endif /* __COVERITY__ */
 
 #define	BMASK_8(x)	((x) & 0xff)
 #define	BMASK_16(x)	((x) & 0xffff)
@@ -108,7 +120,7 @@ extern	in_port_t ntohs(in_port_t);
 /*
  * Macros to convert from a specific byte order to/from native byte order
  */
-#ifdef _BIG_ENDIAN
+#ifdef _ZFS_BIG_ENDIAN
 #define	BE_8(x)		BMASK_8(x)
 #define	BE_16(x)	BMASK_16(x)
 #define	BE_32(x)	BMASK_32(x)
@@ -128,7 +140,7 @@ extern	in_port_t ntohs(in_port_t);
 #define	BE_64(x)	BSWAP_64(x)
 #endif
 
-#ifdef _BIG_ENDIAN
+#ifdef _ZFS_BIG_ENDIAN
 static __inline__ uint64_t
 htonll(uint64_t n)
 {

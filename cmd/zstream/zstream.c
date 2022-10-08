@@ -15,6 +15,7 @@
 
 /*
  * Copyright (c) 2020 by Delphix. All rights reserved.
+ * Copyright (c) 2020 by Datto Inc. All rights reserved.
  */
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -22,7 +23,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <strings.h>
+#include <string.h>
 #include <unistd.h>
 #include <libintl.h>
 #include <stddef.h>
@@ -39,6 +40,10 @@ zstream_usage(void)
 	    "\tzstream dump [-vCd] FILE\n"
 	    "\t... | zstream dump [-vCd]\n"
 	    "\n"
+	    "\tzstream decompress [-v] [OBJECT,OFFSET[,TYPE]] ...\n"
+	    "\n"
+	    "\tzstream token resume_token\n"
+	    "\n"
 	    "\tzstream redup [-v] FILE | ...\n");
 	exit(1);
 }
@@ -46,6 +51,11 @@ zstream_usage(void)
 int
 main(int argc, char *argv[])
 {
+	char *basename = strrchr(argv[0], '/');
+	basename = basename ? (basename + 1) : argv[0];
+	if (argc >= 1 && strcmp(basename, "zstreamdump") == 0)
+		return (zstream_do_dump(argc, argv));
+
 	if (argc < 2)
 		zstream_usage();
 
@@ -53,6 +63,10 @@ main(int argc, char *argv[])
 
 	if (strcmp(subcommand, "dump") == 0) {
 		return (zstream_do_dump(argc - 1, argv + 1));
+	} else if (strcmp(subcommand, "decompress") == 0) {
+		return (zstream_do_decompress(argc - 1, argv + 1));
+	} else if (strcmp(subcommand, "token") == 0) {
+		return (zstream_do_token(argc - 1, argv + 1));
 	} else if (strcmp(subcommand, "redup") == 0) {
 		return (zstream_do_redup(argc - 1, argv + 1));
 	} else {

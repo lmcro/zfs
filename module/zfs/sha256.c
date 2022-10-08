@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -41,11 +41,11 @@ sha_incremental(void *buf, size_t size, void *arg)
 	return (0);
 }
 
-/*ARGSUSED*/
 void
 abd_checksum_SHA256(abd_t *abd, uint64_t size,
     const void *ctx_template, zio_cksum_t *zcp)
 {
+	(void) ctx_template;
 	int ret;
 	SHA2_CTX ctx;
 	zio_cksum_t tmp;
@@ -78,11 +78,11 @@ bswap:
 	zcp->zc_word[3] = BE_64(tmp.zc_word[3]);
 }
 
-/*ARGSUSED*/
 void
 abd_checksum_SHA512_native(abd_t *abd, uint64_t size,
     const void *ctx_template, zio_cksum_t *zcp)
 {
+	(void) ctx_template;
 	SHA2_CTX	ctx;
 
 	SHA2Init(SHA512_256, &ctx);
@@ -90,7 +90,6 @@ abd_checksum_SHA512_native(abd_t *abd, uint64_t size,
 	SHA2Final(zcp, &ctx);
 }
 
-/*ARGSUSED*/
 void
 abd_checksum_SHA512_byteswap(abd_t *abd, uint64_t size,
     const void *ctx_template, zio_cksum_t *zcp)

@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -186,8 +186,8 @@ uint_t zfs_multihost_import_intervals = MMP_DEFAULT_IMPORT_INTERVALS;
  */
 uint_t zfs_multihost_fail_intervals = MMP_DEFAULT_FAIL_INTERVALS;
 
-char *mmp_tag = "mmp_write_uberblock";
-static void mmp_thread(void *arg);
+static const void *const mmp_tag = "mmp_write_uberblock";
+static __attribute__((noreturn)) void mmp_thread(void *arg);
 
 void
 mmp_init(spa_t *spa)
@@ -198,14 +198,6 @@ mmp_init(spa_t *spa)
 	cv_init(&mmp->mmp_thread_cv, NULL, CV_DEFAULT, NULL);
 	mutex_init(&mmp->mmp_io_lock, NULL, MUTEX_DEFAULT, NULL);
 	mmp->mmp_kstat_id = 1;
-
-	/*
-	 * mmp_write_done() calculates mmp_delay based on prior mmp_delay and
-	 * the elapsed time since the last write.  For the first mmp write,
-	 * there is no "last write", so we start with fake non-zero values.
-	 */
-	mmp->mmp_last_write = gethrtime();
-	mmp->mmp_delay = MSEC2NSEC(MMP_INTERVAL_OK(zfs_multihost_interval));
 }
 
 void
@@ -232,7 +224,6 @@ mmp_thread_exit(mmp_thread_t *mmp, kthread_t **mpp, callb_cpr_t *cpr)
 	*mpp = NULL;
 	cv_broadcast(&mmp->mmp_thread_cv);
 	CALLB_CPR_EXIT(cpr);		/* drops &mmp->mmp_thread_lock */
-	thread_exit();
 }
 
 void
@@ -315,8 +306,17 @@ mmp_next_leaf(spa_t *spa)
 		if (leaf == NULL)
 			leaf = list_head(&spa->spa_leaf_list);
 
-		if (!vdev_writeable(leaf)) {
+		/*
+		 * We skip unwritable, offline, detached, and dRAID spare
+		 * devices as they are either not legal targets or the write
+		 * may fail or not be seen by other hosts.  Skipped dRAID
+		 * spares can never be written so the fail mask is not set.
+		 */
+		if (!vdev_writeable(leaf) || leaf->vdev_offline ||
+		    leaf->vdev_detached) {
 			fail_mask |= MMP_FAIL_NOT_WRITABLE;
+		} else if (leaf->vdev_ops == &vdev_draid_spare_ops) {
+			continue;
 		} else if (leaf->vdev_mmp_pending != 0) {
 			fail_mask |= MMP_FAIL_WRITE_PENDING;
 		} else {
@@ -484,8 +484,9 @@ mmp_write_uberblock(spa_t *spa)
 	if (mmp->mmp_skip_error != 0) {
 		mmp->mmp_skip_error = 0;
 		zfs_dbgmsg("MMP write after skipping due to unavailable "
-		    "leaves, pool '%s' gethrtime %llu leaf %#llu",
-		    spa_name(spa), gethrtime(), vd->vdev_guid);
+		    "leaves, pool '%s' gethrtime %llu leaf %llu",
+		    spa_name(spa), (u_longlong_t)gethrtime(),
+		    (u_longlong_t)vd->vdev_guid);
 	}
 
 	if (mmp->mmp_zio_root == NULL)
@@ -522,9 +523,9 @@ mmp_write_uberblock(spa_t *spa)
 	mutex_exit(&mmp->mmp_io_lock);
 
 	offset = VDEV_UBERBLOCK_OFFSET(vd, VDEV_UBERBLOCK_COUNT(vd) -
-	    MMP_BLOCKS_PER_LABEL + spa_get_random(MMP_BLOCKS_PER_LABEL));
+	    MMP_BLOCKS_PER_LABEL + random_in_range(MMP_BLOCKS_PER_LABEL));
 
-	label = spa_get_random(VDEV_LABELS);
+	label = random_in_range(VDEV_LABELS);
 	vdev_label_write(zio, vd, label, ub_abd, offset,
 	    VDEV_UBERBLOCK_SIZE(vd), mmp_write_done, mmp,
 	    flags | ZIO_FLAG_DONT_PROPAGATE);
@@ -535,7 +536,7 @@ mmp_write_uberblock(spa_t *spa)
 	zio_nowait(zio);
 }
 
-static void
+static __attribute__((noreturn)) void
 mmp_thread(void *arg)
 {
 	spa_t *spa = (spa_t *)arg;
@@ -556,6 +557,18 @@ mmp_thread(void *arg)
 	int skip_wait = 0;
 
 	mmp_thread_enter(mmp, &cpr);
+
+	/*
+	 * There have been no MMP writes yet.  Setting mmp_last_write here gives
+	 * us one mmp_fail_ns period, which is consistent with the activity
+	 * check duration, to try to land an MMP write before MMP suspends the
+	 * pool (if so configured).
+	 */
+
+	mutex_enter(&mmp->mmp_io_lock);
+	mmp->mmp_last_write = gethrtime();
+	mmp->mmp_delay = MSEC2NSEC(MMP_INTERVAL_OK(zfs_multihost_interval));
+	mutex_exit(&mmp->mmp_io_lock);
 
 	while (!mmp->mmp_thread_exiting) {
 		hrtime_t next_time = gethrtime() +
@@ -604,10 +617,11 @@ mmp_thread(void *arg)
 			    "mmp_interval %llu last_mmp_fail_intervals %u "
 			    "mmp_fail_intervals %u mmp_fail_ns %llu "
 			    "skip_wait %d leaves %d next_time %llu",
-			    spa_name(spa), gethrtime(), last_mmp_interval,
-			    mmp_interval, last_mmp_fail_intervals,
-			    mmp_fail_intervals, mmp_fail_ns, skip_wait, leaves,
-			    next_time);
+			    spa_name(spa), (u_longlong_t)gethrtime(),
+			    (u_longlong_t)last_mmp_interval,
+			    (u_longlong_t)mmp_interval, last_mmp_fail_intervals,
+			    mmp_fail_intervals, (u_longlong_t)mmp_fail_ns,
+			    skip_wait, leaves, (u_longlong_t)next_time);
 		}
 
 		/*
@@ -620,8 +634,9 @@ mmp_thread(void *arg)
 			zfs_dbgmsg("MMP state change pool '%s': gethrtime %llu "
 			    "last_spa_multihost %u multihost %u "
 			    "last_spa_suspended %u suspended %u",
-			    spa_name(spa), last_spa_multihost, multihost,
-			    last_spa_suspended, suspended);
+			    spa_name(spa), (u_longlong_t)gethrtime(),
+			    last_spa_multihost, multihost, last_spa_suspended,
+			    suspended);
 			mutex_enter(&mmp->mmp_io_lock);
 			mmp->mmp_last_write = gethrtime();
 			mmp->mmp_delay = mmp_interval;
@@ -671,7 +686,7 @@ mmp_thread(void *arg)
 		}
 
 		CALLB_CPR_SAFE_BEGIN(&cpr);
-		(void) cv_timedwait_sig_hires(&mmp->mmp_thread_cv,
+		(void) cv_timedwait_idle_hires(&mmp->mmp_thread_cv,
 		    &mmp->mmp_thread_lock, next_time, USEC2NSEC(100),
 		    CALLOUT_FLAG_ABSOLUTE);
 		CALLB_CPR_SAFE_END(&cpr, &mmp->mmp_thread_lock);
@@ -682,6 +697,8 @@ mmp_thread(void *arg)
 
 	mmp->mmp_zio_root = NULL;
 	mmp_thread_exit(mmp, &mmp->mmp_thread, &cpr);
+
+	thread_exit();
 }
 
 /*

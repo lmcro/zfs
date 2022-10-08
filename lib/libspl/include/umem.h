@@ -7,7 +7,7 @@
  * with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -36,6 +36,7 @@
  *
  * https://labs.omniti.com/trac/portableumem
  */
+#include <sys/debug.h>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -56,10 +57,7 @@ typedef void vmem_t;
 /*
  * Flags for umem_cache_create()
  */
-#define	UMC_NOTOUCH		0x00010000
 #define	UMC_NODEBUG		0x00020000
-#define	UMC_NOMAGAZINE		0x00040000
-#define	UMC_NOHASH		0x00080000
 
 #define	UMEM_CACHE_NAMELEN	31
 
@@ -85,6 +83,7 @@ const char *_umem_debug_init(void);
 const char *_umem_options_init(void);
 const char *_umem_logging_init(void);
 
+__attribute__((alloc_size(1)))
 static inline void *
 umem_alloc(size_t size, int flags)
 {
@@ -97,6 +96,7 @@ umem_alloc(size_t size, int flags)
 	return (ptr);
 }
 
+__attribute__((alloc_size(1)))
 static inline void *
 umem_alloc_aligned(size_t size, size_t align, int flags)
 {
@@ -118,6 +118,7 @@ umem_alloc_aligned(size_t size, size_t align, int flags)
 	return (ptr);
 }
 
+__attribute__((alloc_size(1)))
 static inline void *
 umem_zalloc(size_t size, int flags)
 {
@@ -131,18 +132,18 @@ umem_zalloc(size_t size, int flags)
 }
 
 static inline void
-umem_free(void *ptr, size_t size)
+umem_free(const void *ptr, size_t size __maybe_unused)
 {
-	free(ptr);
+	free((void *)ptr);
 }
 
 static inline void
-umem_nofail_callback(umem_nofail_callback_t *cb)
+umem_nofail_callback(umem_nofail_callback_t *cb __maybe_unused)
 {}
 
 static inline umem_cache_t *
 umem_cache_create(
-    char *name, size_t bufsize, size_t align,
+    const char *name, size_t bufsize, size_t align,
     umem_constructor_t *constructor,
     umem_destructor_t *destructor,
     umem_reclaim_t *reclaim,
@@ -199,7 +200,7 @@ umem_cache_free(umem_cache_t *cp, void *ptr)
 }
 
 static inline void
-umem_cache_reap_now(umem_cache_t *cp)
+umem_cache_reap_now(umem_cache_t *cp __maybe_unused)
 {
 }
 

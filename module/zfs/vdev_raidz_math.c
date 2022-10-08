@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -43,7 +43,7 @@ static raidz_impl_ops_t vdev_raidz_fastest_impl = {
 };
 
 /* All compiled in implementations */
-const raidz_impl_ops_t *raidz_all_maths[] = {
+static const raidz_impl_ops_t *const raidz_all_maths[] = {
 	&vdev_raidz_original_impl,
 	&vdev_raidz_scalar_impl,
 #if defined(__x86_64) && defined(HAVE_SSE2)	/* only x86_64 for now */
@@ -61,11 +61,11 @@ const raidz_impl_ops_t *raidz_all_maths[] = {
 #if defined(__x86_64) && defined(HAVE_AVX512BW)	/* only x86_64 for now */
 	&vdev_raidz_avx512bw_impl,
 #endif
-#if defined(__aarch64__)
+#if defined(__aarch64__) && !defined(__FreeBSD__)
 	&vdev_raidz_aarch64_neon_impl,
 	&vdev_raidz_aarch64_neonx2_impl,
 #endif
-#if defined(__powerpc__)
+#if defined(__powerpc__) && defined(__altivec__)
 	&vdev_raidz_powerpc_altivec_impl,
 #endif
 };
@@ -149,7 +149,7 @@ vdev_raidz_math_get_ops(void)
  * Select parity generation method for raidz_map
  */
 int
-vdev_raidz_math_generate(raidz_map_t *rm)
+vdev_raidz_math_generate(raidz_map_t *rm, raidz_row_t *rr)
 {
 	raidz_gen_f gen_parity = NULL;
 
@@ -165,8 +165,8 @@ vdev_raidz_math_generate(raidz_map_t *rm)
 			break;
 		default:
 			gen_parity = NULL;
-			cmn_err(CE_PANIC, "invalid RAID-Z configuration %d",
-			    raidz_parity(rm));
+			cmn_err(CE_PANIC, "invalid RAID-Z configuration %llu",
+			    (u_longlong_t)raidz_parity(rm));
 			break;
 	}
 
@@ -174,7 +174,7 @@ vdev_raidz_math_generate(raidz_map_t *rm)
 	if (gen_parity == NULL)
 		return (RAIDZ_ORIGINAL_IMPL);
 
-	gen_parity(rm);
+	gen_parity(rr);
 
 	return (0);
 }
@@ -241,8 +241,8 @@ reconstruct_fun_pqr_sel(raidz_map_t *rm, const int *parity_valid,
  * @nbaddata     - Number of failed data columns
  */
 int
-vdev_raidz_math_reconstruct(raidz_map_t *rm, const int *parity_valid,
-    const int *dt, const int nbaddata)
+vdev_raidz_math_reconstruct(raidz_map_t *rm, raidz_row_t *rr,
+    const int *parity_valid, const int *dt, const int nbaddata)
 {
 	raidz_rec_f rec_fn = NULL;
 
@@ -257,21 +257,21 @@ vdev_raidz_math_reconstruct(raidz_map_t *rm, const int *parity_valid,
 		rec_fn = reconstruct_fun_pqr_sel(rm, parity_valid, nbaddata);
 		break;
 	default:
-		cmn_err(CE_PANIC, "invalid RAID-Z configuration %d",
-		    raidz_parity(rm));
+		cmn_err(CE_PANIC, "invalid RAID-Z configuration %llu",
+		    (u_longlong_t)raidz_parity(rm));
 		break;
 	}
 
 	if (rec_fn == NULL)
 		return (RAIDZ_ORIGINAL_IMPL);
 	else
-		return (rec_fn(rm, dt));
+		return (rec_fn(rr, dt));
 }
 
-const char *raidz_gen_name[] = {
+const char *const raidz_gen_name[] = {
 	"gen_p", "gen_pq", "gen_pqr"
 };
-const char *raidz_rec_name[] = {
+const char *const raidz_rec_name[] = {
 	"rec_p", "rec_q", "rec_r",
 	"rec_pq", "rec_pr", "rec_qr", "rec_pqr"
 };
@@ -283,18 +283,15 @@ const char *raidz_rec_name[] = {
 static int
 raidz_math_kstat_headers(char *buf, size_t size)
 {
-	int i;
-	ssize_t off;
-
 	ASSERT3U(size, >=, RAIDZ_KSTAT_LINE_LEN);
 
-	off = snprintf(buf, size, "%-17s", "implementation");
+	ssize_t off = snprintf(buf, size, "%-17s", "implementation");
 
-	for (i = 0; i < ARRAY_SIZE(raidz_gen_name); i++)
+	for (int i = 0; i < ARRAY_SIZE(raidz_gen_name); i++)
 		off += snprintf(buf + off, size - off, "%-16s",
 		    raidz_gen_name[i]);
 
-	for (i = 0; i < ARRAY_SIZE(raidz_rec_name); i++)
+	for (int i = 0; i < ARRAY_SIZE(raidz_rec_name); i++)
 		off += snprintf(buf + off, size - off, "%-16s",
 		    raidz_rec_name[i]);
 
@@ -360,7 +357,7 @@ raidz_math_kstat_addr(kstat_t *ksp, loff_t n)
 #define	BENCH_D_COLS	(8ULL)
 #define	BENCH_COLS	(BENCH_D_COLS + PARITY_PQR)
 #define	BENCH_ZIO_SIZE	(1ULL << SPA_OLD_MAXBLOCKSHIFT)	/* 128 kiB */
-#define	BENCH_NS	MSEC2NSEC(25)			/* 25ms */
+#define	BENCH_NS	MSEC2NSEC(1)			/* 1ms */
 
 typedef void (*benchmark_fn)(raidz_map_t *rm, const int fn);
 
@@ -410,7 +407,7 @@ benchmark_raidz_impl(raidz_map_t *bench_rm, const int fn, benchmark_fn bench_fn)
 		t_start = gethrtime();
 
 		do {
-			for (i = 0; i < 25; i++, run_cnt++)
+			for (i = 0; i < 5; i++, run_cnt++)
 				bench_fn(bench_rm, fn);
 
 			t_diff = gethrtime() - t_start;
@@ -465,6 +462,7 @@ benchmark_raidz(void)
 	raidz_supp_impl_cnt = c;	/* number of supported impl */
 
 #if defined(_KERNEL)
+	abd_t *pabd;
 	zio_t *bench_zio = NULL;
 	raidz_map_t *bench_rm = NULL;
 	uint64_t bench_parity;
@@ -491,6 +489,12 @@ benchmark_raidz(void)
 	/* Benchmark data reconstruction methods */
 	bench_rm = vdev_raidz_map_alloc(bench_zio, SPA_MINBLOCKSHIFT,
 	    BENCH_COLS, PARITY_PQR);
+
+	/* Ensure that fake parity blocks are initialized */
+	for (c = 0; c < bench_rm->rm_row[0]->rr_firstdatacol; c++) {
+		pabd = bench_rm->rm_row[0]->rr_col[c].rc_abd;
+		memset(abd_to_buf(pabd), 0xAA, abd_get_size(pabd));
+	}
 
 	for (int fn = 0; fn < RAIDZ_REC_NUM; fn++)
 		benchmark_raidz_impl(bench_rm, fn, benchmark_rec_impl);
@@ -559,7 +563,7 @@ vdev_raidz_math_fini(void)
 }
 
 static const struct {
-	char *name;
+	const char *name;
 	uint32_t sel;
 } math_impl_opts[] = {
 		{ "cycle",	IMPL_CYCLE },

@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -79,12 +79,8 @@
 
 #include <scsi/scsi.h>
 #include <scsi/sg.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
 #include <sys/efi_partition.h>
 #include <sys/stat.h>
-#include <sys/vtoc.h>
 #include <sys/mntent.h>
 #include <uuid/uuid.h>
 #include <blkid/blkid.h>
@@ -407,4 +403,16 @@ check_device(const char *path, boolean_t force,
 	blkid_put_cache(cache);
 
 	return (error);
+}
+
+void
+after_zpool_upgrade(zpool_handle_t *zhp)
+{
+	(void) zhp;
+}
+
+int
+check_file(const char *file, boolean_t force, boolean_t isspare)
+{
+	return (check_file_generic(file, force, isspare));
 }

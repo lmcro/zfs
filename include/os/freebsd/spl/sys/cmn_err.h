@@ -7,7 +7,7 @@
  * with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -31,8 +31,6 @@
 #ifndef _SYS_CMN_ERR_H
 #define	_SYS_CMN_ERR_H
 
-#pragma ident	"%Z%%M%	%I%	%E% SMI"
-
 #if !defined(_ASM)
 #include <sys/_stdarg.h>
 #endif
@@ -51,45 +49,29 @@ extern "C" {
 
 #ifndef _ASM
 
-/*PRINTFLIKE2*/
 extern void cmn_err(int, const char *, ...)
-    __KPRINTFLIKE(2);
-#pragma rarely_called(cmn_err)
+    __attribute__((format(printf, 2, 3)));
 
 extern void vzcmn_err(zoneid_t, int, const char *, __va_list)
-    __KVPRINTFLIKE(3);
-#pragma rarely_called(vzcmn_err)
+    __attribute__((format(printf, 3, 0)));
 
 extern void vcmn_err(int, const char *, __va_list)
-    __KVPRINTFLIKE(2);
-#pragma rarely_called(vcmn_err)
+    __attribute__((format(printf, 2, 0)));
 
-/*PRINTFLIKE3*/
 extern void zcmn_err(zoneid_t, int, const char *, ...)
-    __KPRINTFLIKE(3);
-#pragma rarely_called(zcmn_err)
+    __attribute__((format(printf, 3, 4)));
 
 extern void vzprintf(zoneid_t, const char *, __va_list)
-    __KVPRINTFLIKE(2);
-#pragma rarely_called(vzprintf)
+    __attribute__((format(printf, 2, 0)));
 
-/*PRINTFLIKE2*/
 extern void zprintf(zoneid_t, const char *, ...)
-    __KPRINTFLIKE(2);
-#pragma rarely_called(zprintf)
+    __attribute__((format(printf, 2, 3)));
 
 extern void vuprintf(const char *, __va_list)
-    __KVPRINTFLIKE(1);
-#pragma rarely_called(vuprintf)
+    __attribute__((format(printf, 1, 0)));
 
-/*PRINTFLIKE1*/
 extern void panic(const char *, ...)
-    __KPRINTFLIKE(1) __NORETURN;
-#pragma rarely_called(panic)
-
-extern void vpanic(const char *, __va_list)
-    __KVPRINTFLIKE(1) __NORETURN;
-#pragma rarely_called(vpanic)
+    __attribute__((format(printf, 1, 2), __noreturn__));
 
 #endif /* !_ASM */
 

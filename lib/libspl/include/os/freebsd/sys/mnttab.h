@@ -7,7 +7,7 @@
  * with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -43,7 +43,7 @@
 #define	MS_NOMNTTAB		0x0
 #define	MS_RDONLY		0x1
 #define	umount2(p, f)	unmount(p, f)
-#define	MNT_LINE_MAX	4096
+#define	MNT_LINE_MAX	4108
 
 #define	MNT_TOOLONG	1	/* entry exceeds MNT_LINE_MAX */
 #define	MNT_TOOMANY	2	/* too many fields in line */
@@ -79,7 +79,7 @@ extern int _sol_getmntent(FILE *fp, struct mnttab *mp);
 extern int getextmntent(const char *path, struct extmnttab *entry,
     struct stat64 *statbuf);
 extern void statfs2mnttab(struct statfs *sfs, struct mnttab *mp);
-char *hasmntopt(struct mnttab *mnt, char *opt);
-int getmntent(FILE *fp, struct mnttab *mp);
+extern char *hasmntopt(struct mnttab *mnt, const char *opt);
+extern int getmntent(FILE *fp, struct mnttab *mp);
 
 #endif

@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -22,6 +21,10 @@
  *  with the SPL.  If not, see <http://www.gnu.org/licenses/>.
  *
  *  Solaris Porting Layer (SPL) Kstat Implementation.
+ *
+ *  Links to Illumos.org for more information on kstat function:
+ *  [1] https://illumos.org/man/1M/kstat
+ *  [2] https://illumos.org/man/9f/kstat_create
  */
 
 #include <linux/seq_file.h>
@@ -46,72 +49,6 @@ kstat_resize_raw(kstat_t *ksp)
 
 	return (0);
 }
-
-void
-kstat_waitq_enter(kstat_io_t *kiop)
-{
-	hrtime_t new, delta;
-	ulong_t wcnt;
-
-	new = gethrtime();
-	delta = new - kiop->wlastupdate;
-	kiop->wlastupdate = new;
-	wcnt = kiop->wcnt++;
-	if (wcnt != 0) {
-		kiop->wlentime += delta * wcnt;
-		kiop->wtime += delta;
-	}
-}
-EXPORT_SYMBOL(kstat_waitq_enter);
-
-void
-kstat_waitq_exit(kstat_io_t *kiop)
-{
-	hrtime_t new, delta;
-	ulong_t wcnt;
-
-	new = gethrtime();
-	delta = new - kiop->wlastupdate;
-	kiop->wlastupdate = new;
-	wcnt = kiop->wcnt--;
-	ASSERT((int)wcnt > 0);
-	kiop->wlentime += delta * wcnt;
-	kiop->wtime += delta;
-}
-EXPORT_SYMBOL(kstat_waitq_exit);
-
-void
-kstat_runq_enter(kstat_io_t *kiop)
-{
-	hrtime_t new, delta;
-	ulong_t rcnt;
-
-	new = gethrtime();
-	delta = new - kiop->rlastupdate;
-	kiop->rlastupdate = new;
-	rcnt = kiop->rcnt++;
-	if (rcnt != 0) {
-		kiop->rlentime += delta * rcnt;
-		kiop->rtime += delta;
-	}
-}
-EXPORT_SYMBOL(kstat_runq_enter);
-
-void
-kstat_runq_exit(kstat_io_t *kiop)
-{
-	hrtime_t new, delta;
-	ulong_t rcnt;
-
-	new = gethrtime();
-	delta = new - kiop->rlastupdate;
-	kiop->rlastupdate = new;
-	rcnt = kiop->rcnt--;
-	ASSERT((int)rcnt > 0);
-	kiop->rlentime += delta * rcnt;
-	kiop->rtime += delta;
-}
-EXPORT_SYMBOL(kstat_runq_exit);
 
 static int
 kstat_seq_show_headers(struct seq_file *f)
@@ -421,7 +358,7 @@ kstat_seq_stop(struct seq_file *f, void *v)
 	mutex_exit(ksp->ks_lock);
 }
 
-static struct seq_operations kstat_seq_ops = {
+static const struct seq_operations kstat_seq_ops = {
 	.show  = kstat_seq_show,
 	.start = kstat_seq_start,
 	.next  = kstat_seq_next,
@@ -453,7 +390,7 @@ kstat_create_module(char *name)
 
 	module = kmem_alloc(sizeof (kstat_module_t), KM_SLEEP);
 	module->ksm_proc = pde;
-	strlcpy(module->ksm_name, name, KSTAT_STRLEN+1);
+	strlcpy(module->ksm_name, name, KSTAT_STRLEN);
 	INIT_LIST_HEAD(&module->ksm_kstat_list);
 	list_add_tail(&module->ksm_module_list, &kstat_module_list);
 
@@ -481,9 +418,9 @@ proc_kstat_open(struct inode *inode, struct file *filp)
 		return (rc);
 
 	f = filp->private_data;
-	f->private = PDE_DATA(inode);
+	f->private = SPL_PDE_DATA(inode);
 
-	return (rc);
+	return (0);
 }
 
 static ssize_t
@@ -542,8 +479,8 @@ kstat_proc_entry_init(kstat_proc_entry_t *kpep, const char *module,
 	kpep->kpe_owner = NULL;
 	kpep->kpe_proc = NULL;
 	INIT_LIST_HEAD(&kpep->kpe_list);
-	strncpy(kpep->kpe_module, module, KSTAT_STRLEN);
-	strncpy(kpep->kpe_name, name, KSTAT_STRLEN);
+	strlcpy(kpep->kpe_module, module, sizeof (kpep->kpe_module));
+	strlcpy(kpep->kpe_name, name, sizeof (kpep->kpe_name));
 }
 EXPORT_SYMBOL(kstat_proc_entry_init);
 
@@ -577,7 +514,7 @@ __kstat_create(const char *ks_module, int ks_instance, const char *ks_name,
 	ksp->ks_crtime = gethrtime();
 	ksp->ks_snaptime = ksp->ks_crtime;
 	ksp->ks_instance = ks_instance;
-	strncpy(ksp->ks_class, ks_class, KSTAT_STRLEN);
+	strlcpy(ksp->ks_class, ks_class, sizeof (ksp->ks_class));
 	ksp->ks_type = ks_type;
 	ksp->ks_flags = ks_flags;
 	ksp->ks_update = kstat_default_update;

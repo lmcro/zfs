@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -21,8 +21,9 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2020 by Delphix. All rights reserved.
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
+ * Copyright 2020 Oxide Computer Company
  */
 
 #include <sys/zfs_context.h>
@@ -58,7 +59,7 @@ dnode_increase_indirection(dnode_t *dn, dmu_tx_t *tx)
 
 	dn->dn_phys->dn_nlevels = new_level;
 	dprintf("os=%p obj=%llu, increase to %d\n", dn->dn_objset,
-	    dn->dn_object, dn->dn_phys->dn_nlevels);
+	    (u_longlong_t)dn->dn_object, dn->dn_phys->dn_nlevels);
 
 	/*
 	 * Lock ordering requires that we hold the children's db_mutexes (by
@@ -81,7 +82,7 @@ dnode_increase_indirection(dnode_t *dn, dmu_tx_t *tx)
 	ASSERT(db->db.db_data);
 	ASSERT(arc_released(db->db_buf));
 	ASSERT3U(sizeof (blkptr_t) * nblkptr, <=, db->db.db_size);
-	bcopy(dn->dn_phys->dn_blkptr, db->db.db_data,
+	memcpy(db->db.db_data, dn->dn_phys->dn_blkptr,
 	    sizeof (blkptr_t) * nblkptr);
 	arc_buf_freeze(db->db_buf);
 
@@ -91,7 +92,7 @@ dnode_increase_indirection(dnode_t *dn, dmu_tx_t *tx)
 
 		if (child == NULL)
 			continue;
-#ifdef	DEBUG
+#ifdef	ZFS_DEBUG
 		DB_DNODE_ENTER(child);
 		ASSERT3P(DB_DNODE(child), ==, dn);
 		DB_DNODE_EXIT(child);
@@ -118,7 +119,7 @@ dnode_increase_indirection(dnode_t *dn, dmu_tx_t *tx)
 		mutex_exit(&child->db_mtx);
 	}
 
-	bzero(dn->dn_phys->dn_blkptr, sizeof (blkptr_t) * nblkptr);
+	memset(dn->dn_phys->dn_blkptr, 0, sizeof (blkptr_t) * nblkptr);
 
 	rw_exit(&db->db_rwlock);
 	if (dn->dn_dbuf != NULL)
@@ -135,7 +136,8 @@ free_blocks(dnode_t *dn, blkptr_t *bp, int num, dmu_tx_t *tx)
 	dsl_dataset_t *ds = dn->dn_objset->os_dsl_dataset;
 	uint64_t bytesfreed = 0;
 
-	dprintf("ds=%p obj=%llx num=%d\n", ds, dn->dn_object, num);
+	dprintf("ds=%p obj=%llx num=%d\n", ds, (u_longlong_t)dn->dn_object,
+	    num);
 
 	for (int i = 0; i < num; i++, bp++) {
 		if (BP_IS_HOLE(bp))
@@ -156,7 +158,7 @@ free_blocks(dnode_t *dn, blkptr_t *bp, int num, dmu_tx_t *tx)
 		dmu_object_type_t type = BP_GET_TYPE(bp);
 		uint64_t lvl = BP_GET_LEVEL(bp);
 
-		bzero(bp, sizeof (blkptr_t));
+		memset(bp, 0, sizeof (blkptr_t));
 
 		if (spa_feature_is_active(dn->dn_objset->os_spa,
 		    SPA_FEATURE_HOLE_BIRTH)) {
@@ -345,7 +347,7 @@ free_children(dmu_buf_impl_t *db, uint64_t blkid, uint64_t nblks,
 		rw_enter(&db->db_rwlock, RW_WRITER);
 		for (i = 0, bp = db->db.db_data; i < 1 << epbs; i++, bp++)
 			ASSERT(BP_IS_HOLE(bp));
-		bzero(db->db.db_data, db->db.db_size);
+		memset(db->db.db_data, 0, db->db.db_size);
 		free_blocks(dn, db->db_blkptr, 1, tx);
 		rw_exit(&db->db_rwlock);
 	}
@@ -462,7 +464,7 @@ dnode_evict_dbufs(dnode_t *dn)
 	mutex_enter(&dn->dn_dbufs_mtx);
 	for (db = avl_first(&dn->dn_dbufs); db != NULL; db = db_next) {
 
-#ifdef	DEBUG
+#ifdef	ZFS_DEBUG
 		DB_DNODE_ENTER(db);
 		ASSERT3P(DB_DNODE(db), ==, dn);
 		DB_DNODE_EXIT(db);
@@ -595,7 +597,7 @@ dnode_sync_free(dnode_t *dn, dmu_tx_t *tx)
 	ASSERT(dn->dn_free_txg > 0);
 	if (dn->dn_allocated_txg != dn->dn_free_txg)
 		dmu_buf_will_dirty(&dn->dn_dbuf->db, tx);
-	bzero(dn->dn_phys, sizeof (dnode_phys_t) * dn->dn_num_slots);
+	memset(dn->dn_phys, 0, sizeof (dnode_phys_t) * dn->dn_num_slots);
 	dnode_free_interior_slots(dn);
 
 	mutex_enter(&dn->dn_mtx);
@@ -632,7 +634,7 @@ dnode_sync(dnode_t *dn, dmu_tx_t *tx)
 	ASSERT(dmu_tx_is_syncing(tx));
 	ASSERT(dnp->dn_type != DMU_OT_NONE || dn->dn_allocated_txg);
 	ASSERT(dnp->dn_type != DMU_OT_NONE ||
-	    bcmp(dnp, &zerodn, DNODE_MIN_SIZE) == 0);
+	    memcmp(dnp, &zerodn, DNODE_MIN_SIZE) == 0);
 	DNODE_VERIFY(dn);
 
 	ASSERT(dn->dn_dbuf == NULL || arc_released(dn->dn_dbuf->db_buf));
@@ -653,8 +655,13 @@ dnode_sync(dnode_t *dn, dmu_tx_t *tx)
 			    DNODE_FLAG_USEROBJUSED_ACCOUNTED;
 		mutex_exit(&dn->dn_mtx);
 		dmu_objset_userquota_get_ids(dn, B_FALSE, tx);
-	} else {
-		/* Once we account for it, we should always account for it */
+	} else if (!(os->os_encrypted && dmu_objset_is_receiving(os))) {
+		/*
+		 * Once we account for it, we should always account for it,
+		 * except for the case of a raw receive. We will not be able
+		 * to account for it until the receiving dataset has been
+		 * mounted.
+		 */
 		ASSERT(!(dn->dn_phys->dn_flags &
 		    DNODE_FLAG_USERUSED_ACCOUNTED));
 		ASSERT(!(dn->dn_phys->dn_flags &
@@ -762,13 +769,22 @@ dnode_sync(dnode_t *dn, dmu_tx_t *tx)
 		dsfra.dsfra_dnode = dn;
 		dsfra.dsfra_tx = tx;
 		dsfra.dsfra_free_indirects = freeing_dnode;
+		mutex_enter(&dn->dn_mtx);
 		if (freeing_dnode) {
 			ASSERT(range_tree_contains(dn->dn_free_ranges[txgoff],
 			    0, dn->dn_maxblkid + 1));
 		}
-		mutex_enter(&dn->dn_mtx);
-		range_tree_vacate(dn->dn_free_ranges[txgoff],
+		/*
+		 * Because dnode_sync_free_range() must drop dn_mtx during its
+		 * processing, using it as a callback to range_tree_vacate() is
+		 * not safe.  No other operations (besides destroy) are allowed
+		 * once range_tree_vacate() has begun, and dropping dn_mtx
+		 * would leave a window open for another thread to observe that
+		 * invalid (and unsafe) state.
+		 */
+		range_tree_walk(dn->dn_free_ranges[txgoff],
 		    dnode_sync_free_range, &dsfra);
+		range_tree_vacate(dn->dn_free_ranges[txgoff], NULL, NULL);
 		range_tree_destroy(dn->dn_free_ranges[txgoff]);
 		dn->dn_free_ranges[txgoff] = NULL;
 		mutex_exit(&dn->dn_mtx);
@@ -811,7 +827,7 @@ dnode_sync(dnode_t *dn, dmu_tx_t *tx)
 		ASSERT(dn->dn_allocated_txg == tx->tx_txg);
 		if (dn->dn_next_nblkptr[txgoff] > dnp->dn_nblkptr) {
 			/* zero the new blkptrs we are gaining */
-			bzero(dnp->dn_blkptr + dnp->dn_nblkptr,
+			memset(dnp->dn_blkptr + dnp->dn_nblkptr, 0,
 			    sizeof (blkptr_t) *
 			    (dn->dn_next_nblkptr[txgoff] - dnp->dn_nblkptr));
 #ifdef ZFS_DEBUG
@@ -838,9 +854,13 @@ dnode_sync(dnode_t *dn, dmu_tx_t *tx)
 		dnode_rele(dn, (void *)(uintptr_t)tx->tx_txg);
 	}
 
+	ASSERT3U(dnp->dn_bonuslen, <=, DN_MAX_BONUS_LEN(dnp));
+
 	/*
 	 * Although we have dropped our reference to the dnode, it
 	 * can't be evicted until its written, and we haven't yet
-	 * initiated the IO for the dnode's dbuf.
+	 * initiated the IO for the dnode's dbuf.  Additionally, the caller
+	 * has already added a reference to the dnode because it's on the
+	 * os_synced_dnodes list.
 	 */
 }

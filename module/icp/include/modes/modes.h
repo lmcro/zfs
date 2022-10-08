@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -207,10 +207,6 @@ typedef struct ccm_ctx {
  *
  * gcm_len_a_len_c:	64-bit representations of the bit lengths of
  *			AAD and ciphertext.
- *
- * gcm_kmflag:		Current value of kmflag. Used for allocating
- *			the plaintext buffer during decryption and a
- *			gcm_avx_chunk_size'd buffer for avx enabled encryption.
  */
 typedef struct gcm_ctx {
 	struct common_ctx gcm_common;
@@ -219,19 +215,18 @@ typedef struct gcm_ctx {
 	size_t gcm_pt_buf_len;
 	uint32_t gcm_tmp[4];
 	/*
-	 * The relative positions of gcm_ghash, gcm_H and pre-computed
-	 * gcm_Htable are hard coded in aesni-gcm-x86_64.S and ghash-x86_64.S,
-	 * so please don't change (or adjust accordingly).
+	 * The offset of gcm_Htable relative to gcm_ghash, (32), is hard coded
+	 * in aesni-gcm-x86_64.S, so please don't change (or adjust there).
 	 */
 	uint64_t gcm_ghash[2];
 	uint64_t gcm_H[2];
 #ifdef CAN_USE_GCM_ASM
-	uint64_t gcm_Htable[12][2];
+	uint64_t *gcm_Htable;
+	size_t gcm_htab_len;
 #endif
 	uint64_t gcm_J0[2];
 	uint64_t gcm_len_a_len_c[2];
 	uint8_t *gcm_pt_buf;
-	int gcm_kmflag;
 #ifdef CAN_USE_GCM_ASM
 	boolean_t gcm_use_avx;
 #endif
@@ -402,7 +397,6 @@ extern void *ccm_alloc_ctx(int);
 extern void *gcm_alloc_ctx(int);
 extern void *gmac_alloc_ctx(int);
 extern void crypto_free_mode_ctx(void *);
-extern void gcm_set_kmflag(gcm_ctx_t *, int);
 
 #ifdef	__cplusplus
 }

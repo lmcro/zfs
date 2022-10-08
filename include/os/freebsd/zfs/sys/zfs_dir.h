@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -52,11 +52,7 @@ extern int zfs_dirent_lookup(znode_t *, const char *, znode_t **, int);
 extern int zfs_link_create(znode_t *, const char *, znode_t *, dmu_tx_t *, int);
 extern int zfs_link_destroy(znode_t *, const char *, znode_t *, dmu_tx_t *, int,
     boolean_t *);
-#if 0
-extern int zfs_dirlook(vnode_t *, const char *, vnode_t **, int);
-#else
 extern int zfs_dirlook(znode_t *, const char *name, znode_t **);
-#endif
 extern void zfs_mknode(znode_t *, vattr_t *, dmu_tx_t *, cred_t *,
     uint_t, znode_t **, zfs_acl_ids_t *);
 extern void zfs_rmnode(znode_t *);

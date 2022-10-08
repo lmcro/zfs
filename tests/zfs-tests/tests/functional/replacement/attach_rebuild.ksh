@@ -7,7 +7,7 @@
 # You may not use this file except in compliance with the License.
 #
 # You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
-# or http://www.opensolaris.org/os/licensing.
+# or https://opensource.org/licenses/CDDL-1.0.
 # See the License for the specific language governing permissions
 # and limitations under the License.
 #
@@ -38,7 +38,7 @@
 # 	Attaching disks during I/O should pass for supported pools.
 #
 # STRATEGY:
-#	1. Create multidisk pools (stripe/mirror/raidz) and
+#	1. Create multidisk pools (stripe/mirror/raidz/draid) and
 #	   start some random I/O
 #	2. Attach a disk to the pool.
 #	3. Verify the integrity of the file system and the resilvering.
@@ -142,17 +142,14 @@ for op in "" "-f"; do
 
 	attach_test "$opt" $TESTDIR/$TESTFILE1.1 $TESTDIR/$REPLACEFILE
 
-	zpool iostat -v $TESTPOOL1 | grep "$REPLACEFILE"
-	if [[ $? -ne 0 ]]; then
-		log_fail "$REPLACEFILE is not present."
-	fi
+	log_must eval "zpool iostat -v $TESTPOOL1 | grep \"$REPLACEFILE\""
 
 	destroy_pool $TESTPOOL1
 done
 
 log_note "Verify 'zpool attach' fails with non-mirrors."
 
-for type in "" "raidz" "raidz1"; do
+for type in "" "raidz" "raidz1" "draid" "draid1"; do
 	for op in "" "-f"; do
 		create_pool $TESTPOOL1 $type $specials_list
 		log_must zfs create $TESTPOOL1/$TESTFS1
@@ -161,10 +158,7 @@ for type in "" "raidz" "raidz1"; do
 		log_mustnot zpool attach -s "$opt" $TESTDIR/$TESTFILE1.1 \
 		    $TESTDIR/$REPLACEFILE
 
-		zpool iostat -v $TESTPOOL1 | grep "$REPLACEFILE"
-		if [[ $? -eq 0 ]]; then
-			log_fail "$REPLACEFILE should not be present."
-		fi
+		log_mustnot eval "zpool iostat -v $TESTPOOL1 | grep \"$REPLACEFILE\""
 
 		destroy_pool $TESTPOOL1
 	done

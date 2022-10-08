@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -33,6 +33,7 @@
 #include <sys/zio.h>
 #include <sys/dmu.h>
 #include <sys/space_map.h>
+#include <sys/metaslab.h>
 #include <sys/fs/zfs.h>
 
 #ifdef	__cplusplus
@@ -49,10 +50,14 @@ typedef enum vdev_dtl_type {
 
 extern int zfs_nocacheflush;
 
-extern void vdev_dbgmsg(vdev_t *vd, const char *fmt, ...);
+typedef boolean_t vdev_open_children_func_t(vdev_t *vd);
+
+extern void vdev_dbgmsg(vdev_t *vd, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
 extern void vdev_dbgmsg_print_tree(vdev_t *, int);
 extern int vdev_open(vdev_t *);
 extern void vdev_open_children(vdev_t *);
+extern void vdev_open_children_subset(vdev_t *, vdev_open_children_func_t *);
 extern int vdev_validate(vdev_t *);
 extern int vdev_copy_path_strict(vdev_t *, vdev_t *);
 extern void vdev_copy_path_relaxed(vdev_t *, vdev_t *);
@@ -71,7 +76,10 @@ extern void vdev_dtl_dirty(vdev_t *vd, vdev_dtl_type_t d,
 extern boolean_t vdev_dtl_contains(vdev_t *vd, vdev_dtl_type_t d,
     uint64_t txg, uint64_t size);
 extern boolean_t vdev_dtl_empty(vdev_t *vd, vdev_dtl_type_t d);
-extern boolean_t vdev_dtl_need_resilver(vdev_t *vd, uint64_t off, size_t size);
+extern boolean_t vdev_default_need_resilver(vdev_t *vd, const dva_t *dva,
+    size_t psize, uint64_t phys_birth);
+extern boolean_t vdev_dtl_need_resilver(vdev_t *vd, const dva_t *dva,
+    size_t psize, uint64_t phys_birth);
 extern void vdev_dtl_reassess(vdev_t *vd, uint64_t txg, uint64_t scrub_txg,
     boolean_t scrub_done, boolean_t rebuild_done);
 extern boolean_t vdev_dtl_required(vdev_t *vd);
@@ -96,11 +104,20 @@ extern void vdev_metaslab_fini(vdev_t *vd);
 extern void vdev_metaslab_set_size(vdev_t *);
 extern void vdev_expand(vdev_t *vd, uint64_t txg);
 extern void vdev_split(vdev_t *vd);
-extern void vdev_deadman(vdev_t *vd, char *tag);
+extern void vdev_deadman(vdev_t *vd, const char *tag);
+
+typedef void vdev_xlate_func_t(void *arg, range_seg64_t *physical_rs);
+
+extern boolean_t vdev_xlate_is_empty(range_seg64_t *rs);
 extern void vdev_xlate(vdev_t *vd, const range_seg64_t *logical_rs,
-    range_seg64_t *physical_rs);
+    range_seg64_t *physical_rs, range_seg64_t *remain_rs);
+extern void vdev_xlate_walk(vdev_t *vd, const range_seg64_t *logical_rs,
+    vdev_xlate_func_t *func, void *arg);
 
 extern void vdev_get_stats_ex(vdev_t *vd, vdev_stat_t *vs, vdev_stat_ex_t *vsx);
+
+extern metaslab_group_t *vdev_get_mg(vdev_t *vd, metaslab_class_t *mc);
+
 extern void vdev_get_stats(vdev_t *vd, vdev_stat_t *vs);
 extern void vdev_clear_stats(vdev_t *vd);
 extern void vdev_stat_update(zio_t *zio, uint64_t psize);
@@ -117,11 +134,21 @@ extern int64_t vdev_deflated_space(vdev_t *vd, int64_t space);
 
 extern uint64_t vdev_psize_to_asize(vdev_t *vd, uint64_t psize);
 
+/*
+ * Return the amount of space allocated for a gang block header.
+ */
+static inline uint64_t
+vdev_gang_header_asize(vdev_t *vd)
+{
+	return (vdev_psize_to_asize(vd, SPA_GANGBLOCKSIZE));
+}
+
 extern int vdev_fault(spa_t *spa, uint64_t guid, vdev_aux_t aux);
 extern int vdev_degrade(spa_t *spa, uint64_t guid, vdev_aux_t aux);
 extern int vdev_online(spa_t *spa, uint64_t guid, uint64_t flags,
     vdev_state_t *);
 extern int vdev_offline(spa_t *spa, uint64_t guid, uint64_t flags);
+extern int vdev_remove_wanted(spa_t *spa, uint64_t guid);
 extern void vdev_clear(spa_t *spa, vdev_t *vd);
 
 extern boolean_t vdev_is_dead(vdev_t *vd);
@@ -164,6 +191,8 @@ typedef enum vdev_config_flag {
 	VDEV_CONFIG_MISSING = 1 << 4
 } vdev_config_flag_t;
 
+extern void vdev_post_kobj_evt(vdev_t *vd);
+extern void vdev_clear_kobj_evt(vdev_t *vd);
 extern void vdev_top_config_generate(spa_t *spa, nvlist_t *config);
 extern nvlist_t *vdev_config_generate(spa_t *spa, vdev_t *vd,
     boolean_t getstats, vdev_config_flag_t flags);
@@ -180,7 +209,7 @@ extern void vdev_config_generate_stats(vdev_t *vd, nvlist_t *nv);
 extern void vdev_label_write(zio_t *zio, vdev_t *vd, int l, abd_t *buf, uint64_t
     offset, uint64_t size, zio_done_func_t *done, void *priv, int flags);
 extern int vdev_label_read_bootenv(vdev_t *, nvlist_t *);
-extern int vdev_label_write_bootenv(vdev_t *, char *);
+extern int vdev_label_write_bootenv(vdev_t *, nvlist_t *);
 
 typedef enum {
 	VDEV_LABEL_CREATE,	/* create/add a new device */
@@ -192,6 +221,9 @@ typedef enum {
 } vdev_labeltype_t;
 
 extern int vdev_label_init(vdev_t *vd, uint64_t txg, vdev_labeltype_t reason);
+
+extern int vdev_prop_set(vdev_t *vd, nvlist_t *innvl, nvlist_t *outnvl);
+extern int vdev_prop_get(vdev_t *vd, nvlist_t *nvprops, nvlist_t *outnvl);
 
 #ifdef	__cplusplus
 }

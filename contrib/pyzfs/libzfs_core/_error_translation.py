@@ -59,6 +59,8 @@ def lzc_create_translate_error(ret, name, ds_type, props):
         raise lzc_exc.ParentNotFound(name)
     if ret == ZFS_ERR_WRONG_PARENT:
         raise lzc_exc.WrongParent(_fs_name(name))
+    if ret == zfs_errno.ZFS_ERR_BADPROP:
+        raise lzc_exc.PropertyInvalid(name)
     raise _generic_exception(ret, name, "Failed to create filesystem")
 
 
@@ -420,6 +422,8 @@ def lzc_receive_translate_errors(
             def _map(ret, name):
                 if ret == errno.EINVAL:
                     return lzc_exc.PropertyInvalid(name)
+                if ret == zfs_errno.ZFS_ERR_BADPROP:
+                    return lzc_exc.PropertyInvalid(name)
                 return _generic_exception(ret, name, "Failed to set property")
             _handle_err_list(
                 errno.EINVAL, properrs, [snapname],
@@ -465,12 +469,16 @@ def lzc_receive_translate_errors(
         raise lzc_exc.ReadOnlyPool(_pool_name(snapname))
     if ret == errno.EAGAIN:
         raise lzc_exc.SuspendedPool(_pool_name(snapname))
+    if ret == errno.EACCES:
+        raise lzc_exc.EncryptionKeyNotLoaded()
     if ret == ECKSUM:
         raise lzc_exc.BadStream()
     if ret == ZFS_ERR_WRONG_PARENT:
         raise lzc_exc.WrongParent(_fs_name(snapname))
     if ret == zfs_errno.ZFS_ERR_STREAM_TRUNCATED:
         raise lzc_exc.StreamTruncated()
+    if ret == zfs_errno.ZFS_ERR_BADPROP:
+        raise lzc_exc.PropertyInvalid(snapname)
 
     raise lzc_exc.StreamIOError(ret)
 

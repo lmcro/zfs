@@ -1,4 +1,3 @@
-/* BEGIN CSTYLED */
 /*
 ** $Id: llimits.h,v 1.103.1.1 2013/04/12 18:48:47 roberto Exp $
 ** Limits, basic types, and some other `installation-dependent' definitions
@@ -121,6 +120,12 @@ typedef LUAI_UACNUMBER l_uacNumber;
 #if !defined(LUAI_MAXCCALLS)
 #define LUAI_MAXCCALLS		20
 #endif
+
+/*
+ * Minimum amount of available stack space (in bytes) to make a C call.  With
+ * gsub() recursion, the stack space between each luaD_call() is 1256 bytes.
+ */
+#define LUAI_MINCSTACK		4096
 
 /*
 ** maximum number of upvalues in a closure (both C and Lua). (Value
@@ -305,4 +310,3 @@ union luai_Cast { double l_d; LUA_INT32 l_p[2]; };
 #endif
 
 #endif
-/* END CSTYLED */

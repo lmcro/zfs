@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -60,22 +60,22 @@ extern boolean_t zfsctl_is_snapdir(struct inode *ip);
 extern int zfsctl_fid(struct inode *ip, fid_t *fidp);
 
 /* zfsctl '.zfs' functions */
-extern int zfsctl_root_lookup(struct inode *dip, char *name,
+extern int zfsctl_root_lookup(struct inode *dip, const char *name,
     struct inode **ipp, int flags, cred_t *cr, int *direntflags,
     pathname_t *realpnp);
 
 /* zfsctl '.zfs/snapshot' functions */
-extern int zfsctl_snapdir_lookup(struct inode *dip, char *name,
+extern int zfsctl_snapdir_lookup(struct inode *dip, const char *name,
     struct inode **ipp, int flags, cred_t *cr, int *direntflags,
     pathname_t *realpnp);
-extern int zfsctl_snapdir_rename(struct inode *sdip, char *sname,
-    struct inode *tdip, char *tname, cred_t *cr, int flags);
-extern int zfsctl_snapdir_remove(struct inode *dip, char *name, cred_t *cr,
-    int flags);
-extern int zfsctl_snapdir_mkdir(struct inode *dip, char *dirname, vattr_t *vap,
-    struct inode **ipp, cred_t *cr, int flags);
+extern int zfsctl_snapdir_rename(struct inode *sdip, const char *sname,
+    struct inode *tdip, const char *tname, cred_t *cr, int flags);
+extern int zfsctl_snapdir_remove(struct inode *dip, const char *name,
+    cred_t *cr, int flags);
+extern int zfsctl_snapdir_mkdir(struct inode *dip, const char *dirname,
+    vattr_t *vap, struct inode **ipp, cred_t *cr, int flags);
 extern int zfsctl_snapshot_mount(struct path *path, int flags);
-extern int zfsctl_snapshot_unmount(char *snapname, int flags);
+extern int zfsctl_snapshot_unmount(const char *snapname, int flags);
 extern int zfsctl_snapshot_unmount_delay(spa_t *spa, uint64_t objsetid,
     int delay);
 extern int zfsctl_snapdir_vget(struct super_block *sb, uint64_t objsetid,

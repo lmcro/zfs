@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -107,30 +107,33 @@ zfs_onexit_destroy(zfs_onexit_t *zo)
  * of this function must call zfs_onexit_fd_rele() when they're finished
  * using the minor number.
  */
-int
+zfs_file_t *
 zfs_onexit_fd_hold(int fd, minor_t *minorp)
 {
 	zfs_onexit_t *zo = NULL;
-	int error;
 
-	error = zfsdev_getminor(fd, minorp);
+	zfs_file_t *fp = zfs_file_get(fd);
+	if (fp == NULL)
+		return (NULL);
+
+	int error = zfsdev_getminor(fp, minorp);
 	if (error) {
-		zfs_onexit_fd_rele(fd);
-		return (error);
+		zfs_onexit_fd_rele(fp);
+		return (NULL);
 	}
 
 	zo = zfsdev_get_state(*minorp, ZST_ONEXIT);
 	if (zo == NULL) {
-		zfs_onexit_fd_rele(fd);
-		return (SET_ERROR(EBADF));
+		zfs_onexit_fd_rele(fp);
+		return (NULL);
 	}
-	return (0);
+	return (fp);
 }
 
 void
-zfs_onexit_fd_rele(int fd)
+zfs_onexit_fd_rele(zfs_file_t *fp)
 {
-	zfs_file_put(fd);
+	zfs_file_put(fp);
 }
 
 static int

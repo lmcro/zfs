@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -26,6 +25,7 @@
 #define	_SPL_MUTEX_H
 
 #include <sys/types.h>
+#include <linux/sched.h>
 #include <linux/mutex.h>
 #include <linux/lockdep.h>
 #include <linux/compiler_compat.h>
@@ -113,8 +113,8 @@ spl_mutex_lockdep_on_maybe(kmutex_t *mp)			\
 	VERIFY3P(mutex_owner(mp), ==, NULL);			\
 }
 
-/* BEGIN CSTYLED */
 #define	mutex_tryenter(mp)					\
+/* CSTYLED */								\
 ({								\
 	int _rc_;						\
 								\
@@ -125,7 +125,6 @@ spl_mutex_lockdep_on_maybe(kmutex_t *mp)			\
 								\
 	_rc_;							\
 })
-/* END CSTYLED */
 
 #define	NESTED_SINGLE 1
 

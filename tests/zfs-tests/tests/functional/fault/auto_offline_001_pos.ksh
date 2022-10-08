@@ -24,23 +24,28 @@
 
 #
 # DESCRIPTION:
-# Testing Fault Management Agent ZED Logic - Physically removed device is
-# offlined and onlined when reattached
+# Testing Fault Management Agent ZED Logic - Physically detached device is
+# made removed and onlined when reattached
 #
 # STRATEGY:
 # 1. Create a pool
 # 2. Simulate physical removal of one device
-# 3. Verify the device is offlined
+# 3. Verify the device is removed when detached
 # 4. Reattach the device
 # 5. Verify the device is onlined
-# 6. Repeat the same tests with a spare device: zed will use the spare to handle
-#    the removed data device
-# 7. Repeat the same tests again with a faulted spare device: zed should offline
-#    the removed data device if no spare is available
+# 6. Repeat the same tests with a spare device:
+#    zed will use the spare to handle the removed data device
+# 7. Repeat the same tests again with a faulted spare device:
+#    the removed data device should be removed
 #
 # NOTE: the use of 'block_device_wait' throughout the test helps avoid race
 # conditions caused by mixing creation/removal events from partitioning the
 # disk (zpool create) and events from physically removing it (remove_disk).
+#
+# NOTE: the test relies on ZED to transit state to removed on device removed
+# event.  The ZED does receive a removal notification but only relies on it to
+# activate a hot spare.  Additional work is planned to extend an existing ioctl
+# interface to allow the ZED to transition the vdev in to a removed state.
 #
 verify_runnable "both"
 
@@ -48,7 +53,7 @@ if is_linux; then
 	# Add one 512b scsi_debug device (4Kn would generate IO errors)
 	# NOTE: must be larger than other "file" vdevs and minimum SPA devsize:
 	# add 32m of fudge
-	load_scsi_debug $(($SPA_MINDEVSIZE/1024/1024+32)) 1 1 1 '512b'
+	load_scsi_debug $(($MINVDEVSIZE/1024/1024+32)) 1 1 1 '512b'
 else
 	log_unsupported "scsi debug module unsupported"
 fi
@@ -76,14 +81,13 @@ removedev=$(get_debug_device)
 typeset poolconfs=(
     "mirror $filedev1 $removedev"
     "raidz3 $filedev1 $filedev2 $filedev3 $removedev"
-    "$filedev1 cache $removedev"
     "mirror $filedev1 $filedev2 special mirror $filedev3 $removedev"
 )
 
-log_must truncate -s $SPA_MINDEVSIZE $filedev1
-log_must truncate -s $SPA_MINDEVSIZE $filedev2
-log_must truncate -s $SPA_MINDEVSIZE $filedev3
-log_must truncate -s $SPA_MINDEVSIZE $sparedev
+log_must truncate -s $MINVDEVSIZE $filedev1
+log_must truncate -s $MINVDEVSIZE $filedev2
+log_must truncate -s $MINVDEVSIZE $filedev3
+log_must truncate -s $MINVDEVSIZE $sparedev
 
 for conf in "${poolconfs[@]}"
 do
@@ -91,11 +95,15 @@ do
 	log_must zpool create -f $TESTPOOL $conf
 	block_device_wait ${DEV_DSKDIR}/${removedev}
 
+	mntpnt=$(get_prop mountpoint /$TESTPOOL)
+
 	# 2. Simulate physical removal of one device
 	remove_disk $removedev
+	log_must mkfile 1m $mntpnt/file
+	sync_pool $TESTPOOL
 
-	# 3. Verify the device is offlined
-	log_must wait_vdev_state $TESTPOOL $removedev "OFFLINE"
+	# 3. Verify the device is removed.
+	log_must wait_vdev_state $TESTPOOL $removedev "REMOVED"
 
 	# 4. Reattach the device
 	insert_disk $removedev
@@ -118,21 +126,21 @@ do
 	block_device_wait ${DEV_DSKDIR}/${removedev}
 	log_must zpool add $TESTPOOL spare $sparedev
 
-	# 3. Simulate physical removal of one device
+	mntpnt=$(get_prop mountpoint /$TESTPOOL)
+
+	# 2. Simulate physical removal of one device
 	remove_disk $removedev
+	log_must mkfile 1m $mntpnt/file
+	sync_pool $TESTPOOL
 
-	# 4. Verify the device is handled by the spare unless is a l2arc disk
-	# which can only be offlined
-	if [[ $(echo "$conf" | grep -c 'cache') -eq 0 ]]; then
-		log_must wait_hotspare_state $TESTPOOL $sparedev "INUSE"
-	else
-		log_must wait_vdev_state $TESTPOOL $removedev "OFFLINE"
-	fi
+	# 3. Verify the device is handled by the spare.
+	log_must wait_hotspare_state $TESTPOOL $sparedev "INUSE"
+	log_must wait_vdev_state $TESTPOOL $removedev "REMOVED"
 
-	# 5. Reattach the device
+	# 4. Reattach the device
 	insert_disk $removedev
 
-	# 6. Verify the device is onlined
+	# 5. Verify the device is onlined
 	log_must wait_vdev_state $TESTPOOL $removedev "ONLINE"
 
 	# cleanup
@@ -150,15 +158,19 @@ do
 	block_device_wait ${DEV_DSKDIR}/${removedev}
 	log_must zpool add $TESTPOOL spare $sparedev
 
+	mntpnt=$(get_prop mountpoint /$TESTPOOL)
+
 	# 2. Fault the spare device making it unavailable
 	log_must zpool offline -f $TESTPOOL $sparedev
 	log_must wait_hotspare_state $TESTPOOL $sparedev "FAULTED"
 
 	# 3. Simulate physical removal of one device
 	remove_disk $removedev
+	log_must mkfile 1m $mntpnt/file
+	sync_pool $TESTPOOL
 
-	# 4. Verify the device is offlined
-	log_must wait_vdev_state $TESTPOOL $removedev "OFFLINE"
+	# 4. Verify the device is removed
+	log_must wait_vdev_state $TESTPOOL $removedev "REMOVED"
 
 	# 5. Reattach the device
 	insert_disk $removedev

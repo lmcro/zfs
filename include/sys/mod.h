@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -31,11 +30,6 @@
  * Exported symbols
  */
 #define	EXPORT_SYMBOL(x)
-
-#define	ZFS_MODULE_DESCRIPTION(s)
-#define	ZFS_MODULE_AUTHOR(s)
-#define	ZFS_MODULE_LICENSE(s)
-#define	ZFS_MODULE_VERSION(s)
 #endif
 
 #endif /* SYS_MOD_H */

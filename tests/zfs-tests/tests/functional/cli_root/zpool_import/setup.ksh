@@ -7,7 +7,7 @@
 # You may not use this file except in compliance with the License.
 #
 # You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
-# or http://www.opensolaris.org/os/licensing.
+# or https://opensource.org/licenses/CDDL-1.0.
 # See the License for the specific language governing permissions
 # and limitations under the License.
 #
@@ -49,7 +49,7 @@ log_must zfs set mountpoint=$TESTDIR $TESTPOOL/$TESTFS
 
 i=0
 while (( i < $MAX_NUM )); do
-	log_must mkfile $FILE_SIZE ${DEVICE_DIR}/${DEVICE_FILE}$i
+	log_must truncate -s $FILE_SIZE ${DEVICE_DIR}/${DEVICE_FILE}$i
 	(( i = i + 1 ))
 done
 

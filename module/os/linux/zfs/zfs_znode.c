@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -54,7 +54,7 @@
 #include <sys/dmu.h>
 #include <sys/dmu_objset.h>
 #include <sys/dmu_tx.h>
-#include <sys/refcount.h>
+#include <sys/zfs_refcount.h>
 #include <sys/stat.h>
 #include <sys/zap.h>
 #include <sys/zfs_znode.h>
@@ -80,7 +80,7 @@ unsigned int zfs_object_mutex_size = ZFS_OBJ_MTX_SZ;
  * This is used by the test suite so that it can delay znodes from being
  * freed in order to inspect the unlinked set.
  */
-int zfs_unlink_suspend_progress = 0;
+static int zfs_unlink_suspend_progress = 0;
 
 /*
  * This callback is invoked when acquiring a RL_WRITER or RL_APPEND lock on
@@ -113,10 +113,10 @@ zfs_rangelock_cb(zfs_locked_range_t *new, void *arg)
 	}
 }
 
-/*ARGSUSED*/
 static int
 zfs_znode_cache_constructor(void *buf, void *arg, int kmflags)
 {
+	(void) arg, (void) kmflags;
 	znode_t *zp = buf;
 
 	inode_init_once(ZTOI(zp));
@@ -134,14 +134,16 @@ zfs_znode_cache_constructor(void *buf, void *arg, int kmflags)
 	zp->z_acl_cached = NULL;
 	zp->z_xattr_cached = NULL;
 	zp->z_xattr_parent = 0;
-	zp->z_moved = B_FALSE;
+	zp->z_sync_writes_cnt = 0;
+	zp->z_async_writes_cnt = 0;
+
 	return (0);
 }
 
-/*ARGSUSED*/
 static void
 zfs_znode_cache_destructor(void *buf, void *arg)
 {
+	(void) arg;
 	znode_t *zp = buf;
 
 	ASSERT(!list_link_active(&zp->z_link_node));
@@ -152,14 +154,18 @@ zfs_znode_cache_destructor(void *buf, void *arg)
 	rw_destroy(&zp->z_xattr_lock);
 	zfs_rangelock_fini(&zp->z_rangelock);
 
-	ASSERT(zp->z_dirlocks == NULL);
-	ASSERT(zp->z_acl_cached == NULL);
-	ASSERT(zp->z_xattr_cached == NULL);
+	ASSERT3P(zp->z_dirlocks, ==, NULL);
+	ASSERT3P(zp->z_acl_cached, ==, NULL);
+	ASSERT3P(zp->z_xattr_cached, ==, NULL);
+
+	ASSERT0(atomic_load_32(&zp->z_sync_writes_cnt));
+	ASSERT0(atomic_load_32(&zp->z_async_writes_cnt));
 }
 
 static int
 zfs_znode_hold_cache_constructor(void *buf, void *arg, int kmflags)
 {
+	(void) arg, (void) kmflags;
 	znode_hold_t *zh = buf;
 
 	mutex_init(&zh->zh_lock, NULL, MUTEX_DEFAULT, NULL);
@@ -172,6 +178,7 @@ zfs_znode_hold_cache_constructor(void *buf, void *arg, int kmflags)
 static void
 zfs_znode_hold_cache_destructor(void *buf, void *arg)
 {
+	(void) arg;
 	znode_hold_t *zh = buf;
 
 	mutex_destroy(&zh->zh_lock);
@@ -218,7 +225,7 @@ zfs_znode_fini(void)
  * created or destroyed.  This kind of locking would normally reside in the
  * znode itself but in this case that's impossible because the znode and SA
  * buffer may not yet exist.  Therefore the locking is handled externally
- * with an array of mutexs and AVLs trees which contain per-object locks.
+ * with an array of mutexes and AVLs trees which contain per-object locks.
  *
  * In zfs_znode_hold_enter() a per-object lock is created as needed, inserted
  * in to the correct AVL tree and finally the per-object lock is held.  In
@@ -431,7 +438,7 @@ zfs_inode_set_ops(zfsvfs_t *zfsvfs, struct inode *ip)
 	case S_IFBLK:
 		(void) sa_lookup(ITOZ(ip)->z_sa_hdl, SA_ZPL_RDEV(zfsvfs), &rdev,
 		    sizeof (rdev));
-		/*FALLTHROUGH*/
+		zfs_fallthrough;
 	case S_IFIFO:
 	case S_IFSOCK:
 		init_special_inode(ip, ip->i_mode, rdev);
@@ -480,14 +487,10 @@ zfs_set_inode_flags(znode_t *zp, struct inode *ip)
 }
 
 /*
- * Update the embedded inode given the znode.  We should work toward
- * eliminating this function as soon as possible by removing values
- * which are duplicated between the znode and inode.  If the generic
- * inode has the correct field it should be used, and the ZFS code
- * updated to access the inode.  This can be done incrementally.
+ * Update the embedded inode given the znode.
  */
 void
-zfs_inode_update(znode_t *zp)
+zfs_znode_update_vfs(znode_t *zp)
 {
 	zfsvfs_t	*zfsvfs;
 	struct inode	*ip;
@@ -505,6 +508,7 @@ zfs_inode_update(znode_t *zp)
 	dmu_object_size_from_db(sa_get_db(zp->z_sa_hdl), &blksize, &i_blocks);
 
 	spin_lock(&ip->i_lock);
+	ip->i_mode = zp->z_mode;
 	ip->i_blocks = i_blocks;
 	i_size_write(ip, zp->z_size);
 	spin_unlock(&ip->i_lock);
@@ -529,9 +533,9 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 	uint64_t tmp_gen;
 	uint64_t links;
 	uint64_t z_uid, z_gid;
-	uint64_t atime[2], mtime[2], ctime[2];
+	uint64_t atime[2], mtime[2], ctime[2], btime[2];
 	uint64_t projid = ZFS_DEFAULT_PROJID;
-	sa_bulk_attr_t bulk[11];
+	sa_bulk_attr_t bulk[12];
 	int count = 0;
 
 	ASSERT(zfsvfs != NULL);
@@ -546,7 +550,6 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 	ASSERT3P(zp->z_xattr_cached, ==, NULL);
 	zp->z_unlinked = B_FALSE;
 	zp->z_atime_dirty = B_FALSE;
-	zp->z_moved = B_FALSE;
 	zp->z_is_mapped = B_FALSE;
 	zp->z_is_ctldir = B_FALSE;
 	zp->z_is_stale = B_FALSE;
@@ -557,6 +560,8 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 	zp->z_blksz = blksz;
 	zp->z_seq = 0x7A4653;
 	zp->z_sync_cnt = 0;
+	zp->z_sync_writes_cnt = 0;
+	zp->z_async_writes_cnt = 0;
 
 	zfs_znode_sa_init(zfsvfs, zp, db, obj_type, hdl);
 
@@ -574,6 +579,7 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_ATIME(zfsvfs), NULL, &atime, 16);
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_MTIME(zfsvfs), NULL, &mtime, 16);
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CTIME(zfsvfs), NULL, &ctime, 16);
+	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CRTIME(zfsvfs), NULL, &btime, 16);
 
 	if (sa_bulk_lookup(zp->z_sa_hdl, bulk, count) != 0 || tmp_gen == 0 ||
 	    (dmu_objset_projectquota_enabled(zfsvfs->z_os) &&
@@ -601,9 +607,10 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 	ZFS_TIME_DECODE(&ip->i_atime, atime);
 	ZFS_TIME_DECODE(&ip->i_mtime, mtime);
 	ZFS_TIME_DECODE(&ip->i_ctime, ctime);
+	ZFS_TIME_DECODE(&zp->z_btime, btime);
 
 	ip->i_ino = zp->z_id;
-	zfs_inode_update(zp);
+	zfs_znode_update_vfs(zp);
 	zfs_inode_set_ops(zfsvfs, ip);
 
 	/*
@@ -611,18 +618,24 @@ zfs_znode_alloc(zfsvfs_t *zfsvfs, dmu_buf_t *db, int blksz,
 	 * number is already hashed for this super block.  This can never
 	 * happen because the inode numbers map 1:1 with the object numbers.
 	 *
-	 * The one exception is rolling back a mounted file system, but in
-	 * this case all the active inode are unhashed during the rollback.
+	 * Exceptions include rolling back a mounted file system, either
+	 * from the zfs rollback or zfs recv command.
+	 *
+	 * Active inodes are unhashed during the rollback, but since zrele
+	 * can happen asynchronously, we can't guarantee they've been
+	 * unhashed.  This can cause hash collisions in unlinked drain
+	 * processing so do not hash unlinked znodes.
 	 */
-	VERIFY3S(insert_inode_locked(ip), ==, 0);
+	if (links > 0)
+		VERIFY3S(insert_inode_locked(ip), ==, 0);
 
 	mutex_enter(&zfsvfs->z_znodes_lock);
 	list_insert_tail(&zfsvfs->z_all_znodes, zp);
 	zfsvfs->z_nr_znodes++;
-	membar_producer();
 	mutex_exit(&zfsvfs->z_znodes_lock);
 
-	unlock_new_inode(ip);
+	if (links > 0)
+		unlock_new_inode(ip);
 	return (zp);
 
 error:
@@ -1168,12 +1181,12 @@ zfs_rezget(znode_t *zp)
 	uint64_t obj_num = zp->z_id;
 	uint64_t mode;
 	uint64_t links;
-	sa_bulk_attr_t bulk[10];
+	sa_bulk_attr_t bulk[11];
 	int err;
 	int count = 0;
 	uint64_t gen;
 	uint64_t z_uid, z_gid;
-	uint64_t atime[2], mtime[2], ctime[2];
+	uint64_t atime[2], mtime[2], ctime[2], btime[2];
 	uint64_t projid = ZFS_DEFAULT_PROJID;
 	znode_hold_t *zh;
 
@@ -1243,6 +1256,7 @@ zfs_rezget(znode_t *zp)
 	    &mtime, 16);
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CTIME(zfsvfs), NULL,
 	    &ctime, 16);
+	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CRTIME(zfsvfs), NULL, &btime, 16);
 
 	if (sa_bulk_lookup(zp->z_sa_hdl, bulk, count)) {
 		zfs_znode_dmu_fini(zp);
@@ -1268,6 +1282,7 @@ zfs_rezget(znode_t *zp)
 	ZFS_TIME_DECODE(&ZTOI(zp)->i_atime, atime);
 	ZFS_TIME_DECODE(&ZTOI(zp)->i_mtime, mtime);
 	ZFS_TIME_DECODE(&ZTOI(zp)->i_ctime, ctime);
+	ZFS_TIME_DECODE(&zp->z_btime, btime);
 
 	if ((uint32_t)gen != ZTOI(zp)->i_generation) {
 		zfs_znode_dmu_fini(zp);
@@ -1280,7 +1295,7 @@ zfs_rezget(znode_t *zp)
 
 	zp->z_blksz = doi.doi_data_block_size;
 	zp->z_atime_dirty = B_FALSE;
-	zfs_inode_update(zp);
+	zfs_znode_update_vfs(zp);
 
 	/*
 	 * If the file has zero links, then it has been unlinked on the send
@@ -1574,7 +1589,7 @@ zfs_zero_partial_page(znode_t *zp, uint64_t start, uint64_t len)
 			flush_dcache_page(pp);
 
 		pb = kmap(pp);
-		bzero(pb + off, len);
+		memset(pb + off, 0, len);
 		kunmap(pp);
 
 		if (mapping_writably_mapped(mp))
@@ -1798,7 +1813,7 @@ log:
 
 	dmu_tx_commit(tx);
 
-	zfs_inode_update(zp);
+	zfs_znode_update_vfs(zp);
 	error = 0;
 
 out:
@@ -1901,7 +1916,6 @@ zfs_create_fs(objset_t *os, cred_t *cr, nvlist_t *zplprops, dmu_tx_t *tx)
 	rootzp = kmem_cache_alloc(znode_cache, KM_SLEEP);
 	rootzp->z_unlinked = B_FALSE;
 	rootzp->z_atime_dirty = B_FALSE;
-	rootzp->z_moved = B_FALSE;
 	rootzp->z_is_sa = USE_SA(version, os);
 	rootzp->z_pflags = 0;
 
@@ -1987,7 +2001,7 @@ zfs_sa_setup(objset_t *osp, sa_attr_type_t **sa_table)
 
 static int
 zfs_grab_sa_handle(objset_t *osp, uint64_t obj, sa_handle_t **hdlp,
-    dmu_buf_t **db, void *tag)
+    dmu_buf_t **db, const void *tag)
 {
 	dmu_object_info_t doi;
 	int error;
@@ -2014,7 +2028,7 @@ zfs_grab_sa_handle(objset_t *osp, uint64_t obj, sa_handle_t **hdlp,
 }
 
 static void
-zfs_release_sa_handle(sa_handle_t *hdl, dmu_buf_t *db, void *tag)
+zfs_release_sa_handle(sa_handle_t *hdl, dmu_buf_t *db, const void *tag)
 {
 	sa_handle_destroy(hdl);
 	sa_buf_rele(db, tag);
@@ -2130,8 +2144,10 @@ zfs_obj_to_path_impl(objset_t *osp, uint64_t obj, sa_handle_t *hdl,
 		size_t complen;
 		int is_xattrdir = 0;
 
-		if (prevdb)
+		if (prevdb) {
+			ASSERT(prevhdl != NULL);
 			zfs_release_sa_handle(prevhdl, prevdb, FTAG);
+		}
 
 		if ((error = zfs_obj_to_pobj(osp, sa_hdl, sa_table, &pobj,
 		    &is_xattrdir)) != 0)
@@ -2145,7 +2161,7 @@ zfs_obj_to_path_impl(objset_t *osp, uint64_t obj, sa_handle_t *hdl,
 
 		component[0] = '/';
 		if (is_xattrdir) {
-			(void) sprintf(component + 1, "<xattrdir>");
+			strcpy(component + 1, "<xattrdir>");
 		} else {
 			error = zap_value_search(osp, pobj, obj,
 			    ZFS_DIRENT_OBJ(-1ULL), component + 1);
@@ -2156,7 +2172,7 @@ zfs_obj_to_path_impl(objset_t *osp, uint64_t obj, sa_handle_t *hdl,
 		complen = strlen(component);
 		path -= complen;
 		ASSERT(path >= buf);
-		bcopy(component, path, complen);
+		memcpy(path, component, complen);
 		obj = pobj;
 
 		if (sa_hdl != hdl) {

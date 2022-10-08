@@ -7,7 +7,7 @@
 # You may not use this file except in compliance with the License.
 #
 # You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
-# or http://www.opensolaris.org/os/licensing.
+# or https://opensource.org/licenses/CDDL-1.0.
 # See the License for the specific language governing permissions
 # and limitations under the License.
 #
@@ -62,6 +62,7 @@ log_assert "Create and read back files with using different checksum algorithms"
 log_onexit cleanup
 
 WRITESZ=1048576
+NWRITES=5
 
 # Get a list of vdevs in our pool
 set -A array $(get_disklist_fullpath)
@@ -75,7 +76,7 @@ while [[ $i -lt ${#CHECKSUM_TYPES[*]} ]]; do
 	type=${CHECKSUM_TYPES[i]}
 	log_must zfs set checksum=$type $TESTPOOL
 	log_must file_write -o overwrite -f $TESTDIR/test_$type \
-	    -b $WRITESZ -c 5 -d R
+	    -b $WRITESZ -c $NWRITES -d R
 	(( i = i + 1 ))
 done
 
@@ -84,7 +85,7 @@ log_must zpool import $TESTPOOL
 log_must zpool scrub $TESTPOOL
 log_must wait_scrubbed $TESTPOOL
 
-cksum=$(zpool status -P -v $TESTPOOL | grep "$firstvdev" | awk '{print $5}')
+cksum=$(zpool status -P -v $TESTPOOL | awk -v v="$firstvdev" '$0 ~ v {print $5}')
 log_assert "Normal file write test saw $cksum checksum errors"
 log_must [ $cksum -eq 0 ]
 
@@ -96,7 +97,7 @@ while [[ $j -lt ${#CHECKSUM_TYPES[*]} ]]; do
 	type=${CHECKSUM_TYPES[$j]}
 	log_must zfs set checksum=$type $TESTPOOL
 	log_must file_write -o overwrite -f $TESTDIR/test_$type \
-	    -b $WRITESZ -c 5 -d R
+	    -b $WRITESZ -c $NWRITES -d R
 
 	# Corrupt the level 0 blocks of this file
 	corrupt_blocks_at_level $TESTDIR/test_$type
@@ -104,8 +105,7 @@ while [[ $j -lt ${#CHECKSUM_TYPES[*]} ]]; do
 	log_must zpool scrub $TESTPOOL
 	log_must wait_scrubbed $TESTPOOL
 
-	cksum=$(zpool status -P -v $TESTPOOL | grep "$firstvdev" | \
-	    awk '{print $5}')
+	cksum=$(zpool status -P -v $TESTPOOL | awk -v v="$firstvdev" '$0 ~ v {print $5}')
 
 	log_assert "Checksum '$type' caught $cksum checksum errors"
 	log_must [ $cksum -ne 0 ]

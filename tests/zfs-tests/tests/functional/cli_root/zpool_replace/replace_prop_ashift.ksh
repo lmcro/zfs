@@ -7,7 +7,7 @@
 # You may not use this file except in compliance with the License.
 #
 # You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
-# or http://www.opensolaris.org/os/licensing.
+# or https://opensource.org/licenses/CDDL-1.0.
 # See the License for the specific language governing permissions
 # and limitations under the License.
 #
@@ -22,6 +22,7 @@
 
 #
 # Copyright 2017, loli10K. All rights reserved.
+# Copyright (c) 2020 by Delphix. All rights reserved.
 #
 
 . $STF_SUITE/include/libtest.shlib
@@ -43,6 +44,7 @@ verify_runnable "global"
 
 function cleanup
 {
+	log_must set_tunable64 VDEV_FILE_PHYSICAL_ASHIFT $orig_ashift
 	poolexists $TESTPOOL1 && destroy_pool $TESTPOOL1
 	rm -f $disk1 $disk2
 }
@@ -54,6 +56,14 @@ disk1=$TEST_BASE_DIR/disk1
 disk2=$TEST_BASE_DIR/disk2
 log_must truncate -s $SIZE $disk1
 log_must truncate -s $SIZE $disk2
+
+orig_ashift=$(get_tunable VDEV_FILE_PHYSICAL_ASHIFT)
+#
+# Set the file vdev's ashift to the max. Overriding
+# the ashift using the -o ashift property should still
+# be honored.
+#
+log_must set_tunable64 VDEV_FILE_PHYSICAL_ASHIFT 16
 
 typeset ashifts=("9" "10" "11" "12" "13" "14" "15" "16")
 for ashift in ${ashifts[@]}
@@ -67,12 +77,7 @@ do
 		then
 			log_must zpool replace $TESTPOOL1 $disk1 $disk2
 			wait_replacing $TESTPOOL1
-			verify_ashift $disk2 $ashift
-			if [[ $? -ne 0 ]]
-			then
-				log_fail "Device was replaced without " \
-				    "setting ashift value to $ashift"
-			fi
+			log_must verify_ashift $disk2 $ashift
 		else
 			# cannot replace if pool prop ashift > vdev ashift
 			log_mustnot zpool replace $TESTPOOL1 $disk1 $disk2
@@ -80,12 +85,7 @@ do
 			log_must zpool replace -o ashift=$ashift $TESTPOOL1 \
 			    $disk1 $disk2
 			wait_replacing $TESTPOOL1
-			verify_ashift $disk2 $ashift
-			if [[ $? -ne 0 ]]
-			then
-				log_fail "Device was replaced without " \
-				    "setting ashift value to $ashift"
-			fi
+			log_must verify_ashift $disk2 $ashift
 		fi
 		# clean things for the next run
 		log_must zpool destroy $TESTPOOL1

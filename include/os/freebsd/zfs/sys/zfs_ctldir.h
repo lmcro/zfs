@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -48,7 +48,7 @@ int zfsctl_root(zfsvfs_t *, int, vnode_t **);
 void zfsctl_init(void);
 void zfsctl_fini(void);
 boolean_t zfsctl_is_node(vnode_t *);
-int zfsctl_snapshot_unmount(char *snapname, int flags);
+int zfsctl_snapshot_unmount(const char *snapname, int flags);
 int zfsctl_rename_snapshot(const char *from, const char *to);
 int zfsctl_destroy_snapshot(const char *snapname, int force);
 int zfsctl_umount_snapshots(vfs_t *, int, cred_t *);

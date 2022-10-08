@@ -154,8 +154,8 @@ def os_open(name, mode):
 
 @contextlib.contextmanager
 def dev_null():
-    with os_open('/dev/null', os.O_WRONLY) as fd:
-        yield fd
+    with tempfile.TemporaryFile(suffix='.zstream') as fd:
+        yield fd.fileno()
 
 
 @contextlib.contextmanager
@@ -252,9 +252,9 @@ def skipUnlessBookmarksSupported(f):
 
 
 def snap_always_unmounted_before_destruction():
-    # Apparently ZoL automatically unmounts the snapshot
+    # Apparently OpenZFS automatically unmounts the snapshot
     # only if it is mounted at its default .zfs/snapshot
-    # mountpoint.
+    # mountpoint under Linux.
     return (
         platform.system() != 'Linux', 'snapshot is not auto-unmounted')
 
@@ -1062,7 +1062,7 @@ class ZFSTest(unittest.TestCase):
         lzc.lzc_bookmark({})
 
     @skipUnlessBookmarksSupported
-    def test_bookmarks_foregin_source(self):
+    def test_bookmarks_foreign_source(self):
         snaps = [ZFSTest.pool.makeName(b'fs1@snap1')]
         bmarks = [ZFSTest.pool.makeName(b'fs2#bmark1')]
         bmark_dict = {x: y for x, y in zip(bmarks, snaps)}
@@ -1903,6 +1903,8 @@ class ZFSTest(unittest.TestCase):
             with self.assertRaises(lzc_exc.StreamIOError) as ctx:
                 lzc.lzc_send(snap, None, fd)
             os.close(fd)
+            os.unlink(output.name)
+
         self.assertEqual(ctx.exception.errno, errno.EBADF)
 
     def test_recv_full(self):
@@ -2906,6 +2908,27 @@ class ZFSTest(unittest.TestCase):
                 tosnap, stream.fileno(), c_header, props=props,
                 cmdprops=cmdprops)
             self.assertExists(tosnap)
+            self.assertEqual(fs.getProperty("compression"), b"on")
+            self.assertEqual(fs.getProperty("ns:prop"), b"val")
+
+    def test_recv_with_heal(self):
+        snap = ZFSTest.pool.makeName(b"fs1@snap1")
+        fs = ZFSTest.pool.getFilesystem(b"fs1")
+        props = {}
+        cmdprops = {
+            b"compression": 0x01,
+            b"ns:prop": b"val"
+        }
+
+        lzc.lzc_snapshot([snap])
+        with tempfile.TemporaryFile(suffix='.zstream') as stream:
+            lzc.lzc_send(snap, None, stream.fileno())
+            stream.seek(0)
+            (header, c_header) = lzc.receive_header(stream.fileno())
+            lzc.lzc_receive_with_heal(
+                snap, stream.fileno(), c_header, props=props,
+                cmdprops=cmdprops)
+            self.assertExists(snap)
             self.assertEqual(fs.getProperty("compression"), b"on")
             self.assertEqual(fs.getProperty("ns:prop"), b"val")
 
@@ -4132,7 +4155,8 @@ class _TempPool(object):
             cachefile = 'none'
         self._zpool_create = [
             'zpool', 'create', '-o', 'cachefile=' + cachefile,
-            '-O', 'mountpoint=legacy', self._pool_name, self._pool_file_path]
+            '-O', 'mountpoint=legacy', '-O', 'compression=off',
+            self._pool_name, self._pool_file_path]
         try:
             os.ftruncate(fd, size)
             os.close(fd)

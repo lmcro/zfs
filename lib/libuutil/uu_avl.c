@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -128,6 +128,7 @@ uu_avl_pool_destroy(uu_avl_pool_t *pp)
 	pp->uap_next->uap_prev = pp->uap_prev;
 	pp->uap_prev->uap_next = pp->uap_next;
 	(void) pthread_mutex_unlock(&uu_apool_list_lock);
+	(void) pthread_mutex_destroy(&pp->uap_lock);
 	pp->uap_prev = NULL;
 	pp->uap_next = NULL;
 	uu_free(pp);

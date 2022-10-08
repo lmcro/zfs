@@ -37,7 +37,7 @@
 
 static int
 dsl_bookmark_hold_ds(dsl_pool_t *dp, const char *fullname,
-    dsl_dataset_t **dsp, void *tag, char **shortnamep)
+    dsl_dataset_t **dsp, const void *tag, char **shortnamep)
 {
 	char buf[ZFS_MAX_DATASET_NAME_LEN];
 	char *hashp;
@@ -82,7 +82,7 @@ dsl_bookmark_lookup_impl(dsl_dataset_t *ds, const char *shortname,
 	 * Zero out the bookmark in case the one stored on disk
 	 * is in an older, shorter format.
 	 */
-	bzero(bmark_phys, sizeof (*bmark_phys));
+	memset(bmark_phys, 0, sizeof (*bmark_phys));
 
 	err = zap_lookup_norm(mos, bmark_zapobj, shortname, sizeof (uint64_t),
 	    sizeof (*bmark_phys) / sizeof (uint64_t), bmark_phys, mt, NULL, 0,
@@ -160,10 +160,9 @@ dsl_bookmark_create_nvl_validate_pair(const char *bmark, const char *source)
 int
 dsl_bookmark_create_nvl_validate(nvlist_t *bmarks)
 {
-	char *first;
-	size_t first_len;
+	char *first = NULL;
+	size_t first_len = 0;
 
-	first = NULL;
 	for (nvpair_t *pair = nvlist_next_nvpair(bmarks, NULL);
 	    pair != NULL; pair = nvlist_next_nvpair(bmarks, pair)) {
 
@@ -236,7 +235,7 @@ dsl_bookmark_create_check_impl(dsl_pool_t *dp,
 		error = SET_ERROR(EEXIST);
 		goto eholdnewbmds;
 	default:
-		/* dsl_bookmark_lookup_impl already did SET_ERRROR */
+		/* dsl_bookmark_lookup_impl already did SET_ERROR */
 		goto eholdnewbmds;
 	}
 
@@ -271,7 +270,7 @@ dsl_bookmark_create_check_impl(dsl_pool_t *dp,
 			error = SET_ERROR(ZFS_ERR_BOOKMARK_SOURCE_NOT_ANCESTOR);
 			break;
 		default:
-			/* dsl_bookmark_lookup already did SET_ERRROR */
+			/* dsl_bookmark_lookup already did SET_ERROR */
 			break;
 		}
 	} else {
@@ -347,6 +346,8 @@ dsl_bookmark_set_phys(zfs_bookmark_phys_t *zbm, dsl_dataset_t *snap)
 	spa_t *spa = dsl_dataset_get_spa(snap);
 	objset_t *mos = spa_get_dsl(spa)->dp_meta_objset;
 	dsl_dataset_phys_t *dsp = dsl_dataset_phys(snap);
+
+	memset(zbm, 0, sizeof (zfs_bookmark_phys_t));
 	zbm->zbm_guid = dsp->ds_guid;
 	zbm->zbm_creation_txg = dsp->ds_creation_txg;
 	zbm->zbm_creation_time = dsp->ds_creation_time;
@@ -380,10 +381,6 @@ dsl_bookmark_set_phys(zfs_bookmark_phys_t *zbm, dsl_dataset_t *snap)
 		    &zbm->zbm_compressed_freed_before_next_snap,
 		    &zbm->zbm_uncompressed_freed_before_next_snap);
 		dsl_dataset_rele(nextds, FTAG);
-	} else {
-		bzero(&zbm->zbm_flags,
-		    sizeof (zfs_bookmark_phys_t) -
-		    offsetof(zfs_bookmark_phys_t, zbm_flags));
 	}
 }
 
@@ -426,8 +423,8 @@ dsl_bookmark_node_add(dsl_dataset_t *hds, dsl_bookmark_node_t *dbn,
 		spa_feature_incr(dp->dp_spa, SPA_FEATURE_BOOKMARK_V2, tx);
 	}
 
-	__attribute__((unused)) zfs_bookmark_phys_t zero_phys = { 0 };
-	ASSERT0(bcmp(((char *)&dbn->dbn_phys) + bookmark_phys_size,
+	zfs_bookmark_phys_t zero_phys = { 0 };
+	ASSERT0(memcmp(((char *)&dbn->dbn_phys) + bookmark_phys_size,
 	    &zero_phys, sizeof (zfs_bookmark_phys_t) - bookmark_phys_size));
 
 	VERIFY0(zap_add(mos, hds->ds_bookmarks_obj, dbn->dbn_name,
@@ -441,8 +438,8 @@ dsl_bookmark_node_add(dsl_dataset_t *hds, dsl_bookmark_node_t *dbn,
  */
 static void
 dsl_bookmark_create_sync_impl_snap(const char *bookmark, const char *snapshot,
-    dmu_tx_t *tx, uint64_t num_redact_snaps, uint64_t *redact_snaps, void *tag,
-    redaction_list_t **redaction_list)
+    dmu_tx_t *tx, uint64_t num_redact_snaps, uint64_t *redact_snaps,
+    const void *tag, redaction_list_t **redaction_list)
 {
 	dsl_pool_t *dp = dmu_tx_pool(tx);
 	objset_t *mos = dp->dp_meta_objset;
@@ -482,7 +479,7 @@ dsl_bookmark_create_sync_impl_snap(const char *bookmark, const char *snapshot,
 		    sizeof (redaction_list_phys_t) + num_redact_snaps *
 		    sizeof (uint64_t));
 		dmu_buf_will_dirty(local_rl->rl_dbuf, tx);
-		bcopy(redact_snaps, local_rl->rl_phys->rlp_snaps,
+		memcpy(local_rl->rl_phys->rlp_snaps, redact_snaps,
 		    sizeof (uint64_t) * num_redact_snaps);
 		local_rl->rl_phys->rlp_num_snaps = num_redact_snaps;
 		if (bookmark_redacted) {
@@ -536,7 +533,7 @@ dsl_bookmark_create_sync_impl_book(
 	 * Reasoning:
 	 * - The zbm_redaction_obj would be referred to by both source and new
 	 *   bookmark, but would be destroyed once either source or new is
-	 *   destroyed, resulting in use-after-free of the referrred object.
+	 *   destroyed, resulting in use-after-free of the referred object.
 	 * - User expectation when issuing the `zfs bookmark` command is that
 	 *   a normal bookmark of the source is created
 	 *
@@ -667,7 +664,8 @@ dsl_bookmark_create_redacted_sync(void *arg, dmu_tx_t *tx)
 
 int
 dsl_bookmark_create_redacted(const char *bookmark, const char *snapshot,
-    uint64_t numsnaps, uint64_t *snapguids, void *tag, redaction_list_t **rl)
+    uint64_t numsnaps, uint64_t *snapguids, const void *tag,
+    redaction_list_t **rl)
 {
 	dsl_bookmark_create_redacted_arg_t dbcra;
 
@@ -1191,19 +1189,19 @@ dsl_redaction_list_long_held(redaction_list_t *rl)
 }
 
 void
-dsl_redaction_list_long_hold(dsl_pool_t *dp, redaction_list_t *rl, void *tag)
+dsl_redaction_list_long_hold(dsl_pool_t *dp, redaction_list_t *rl,
+    const void *tag)
 {
 	ASSERT(dsl_pool_config_held(dp));
 	(void) zfs_refcount_add(&rl->rl_longholds, tag);
 }
 
 void
-dsl_redaction_list_long_rele(redaction_list_t *rl, void *tag)
+dsl_redaction_list_long_rele(redaction_list_t *rl, const void *tag)
 {
 	(void) zfs_refcount_remove(&rl->rl_longholds, tag);
 }
 
-/* ARGSUSED */
 static void
 redaction_list_evict_sync(void *rlu)
 {
@@ -1214,13 +1212,13 @@ redaction_list_evict_sync(void *rlu)
 }
 
 void
-dsl_redaction_list_rele(redaction_list_t *rl, void *tag)
+dsl_redaction_list_rele(redaction_list_t *rl, const void *tag)
 {
 	dmu_buf_rele(rl->rl_dbuf, tag);
 }
 
 int
-dsl_redaction_list_hold_obj(dsl_pool_t *dp, uint64_t rlobj, void *tag,
+dsl_redaction_list_hold_obj(dsl_pool_t *dp, uint64_t rlobj, const void *tag,
     redaction_list_t **rlp)
 {
 	objset_t *mos = dp->dp_meta_objset;
@@ -1295,7 +1293,7 @@ dsl_bookmark_ds_destroyed(dsl_dataset_t *ds, dmu_tx_t *tx)
 	 * The empty-string name can't be in the AVL, and it compares
 	 * before any entries with this TXG.
 	 */
-	search.dbn_name = "";
+	search.dbn_name = (char *)"";
 	VERIFY3P(avl_find(&head->ds_bookmarks, &search, &idx), ==, NULL);
 	dsl_bookmark_node_t *dbn =
 	    avl_nearest(&head->ds_bookmarks, idx, AVL_AFTER);
@@ -1422,7 +1420,7 @@ dsl_bookmark_next_changed(dsl_dataset_t *head, dsl_dataset_t *origin,
 	 * The empty-string name can't be in the AVL, and it compares
 	 * before any entries with this TXG.
 	 */
-	search.dbn_name = "";
+	search.dbn_name = (char *)"";
 	VERIFY3P(avl_find(&head->ds_bookmarks, &search, &idx), ==, NULL);
 	dsl_bookmark_node_t *dbn =
 	    avl_nearest(&head->ds_bookmarks, idx, AVL_AFTER);
@@ -1470,10 +1468,11 @@ dsl_bookmark_next_changed(dsl_dataset_t *head, dsl_dataset_t *origin,
  * Adjust the FBN of any bookmarks that reference this block, whose "next"
  * is the head dataset.
  */
-/* ARGSUSED */
 void
 dsl_bookmark_block_killed(dsl_dataset_t *ds, const blkptr_t *bp, dmu_tx_t *tx)
 {
+	(void) tx;
+
 	/*
 	 * Iterate over bookmarks whose "next" is the head dataset.
 	 */
@@ -1561,33 +1560,6 @@ dsl_bookmark_latest_txg(dsl_dataset_t *ds)
 	return (dbn->dbn_phys.zbm_creation_txg);
 }
 
-static inline unsigned int
-redact_block_buf_num_entries(unsigned int size)
-{
-	return (size / sizeof (redact_block_phys_t));
-}
-
-/*
- * This function calculates the offset of the last entry in the array of
- * redact_block_phys_t.  If we're reading the redaction list into buffers of
- * size bufsize, then for all but the last buffer, the last valid entry in the
- * array will be the last entry in the array.  However, for the last buffer, any
- * amount of it may be filled.  Thus, we check to see if we're looking at the
- * last buffer in the redaction list, and if so, we return the total number of
- * entries modulo the number of entries per buffer.  Otherwise, we return the
- * number of entries per buffer minus one.
- */
-static inline unsigned int
-last_entry(redaction_list_t *rl, unsigned int bufsize, uint64_t bufid)
-{
-	if (bufid == (rl->rl_phys->rlp_num_entries - 1) /
-	    redact_block_buf_num_entries(bufsize)) {
-		return ((rl->rl_phys->rlp_num_entries - 1) %
-		    redact_block_buf_num_entries(bufsize));
-	}
-	return (redact_block_buf_num_entries(bufsize) - 1);
-}
-
 /*
  * Compare the redact_block_phys_t to the bookmark. If the last block in the
  * redact_block_phys_t is before the bookmark, return -1.  If the first block in
@@ -1633,8 +1605,6 @@ dsl_redaction_list_traverse(redaction_list_t *rl, zbookmark_phys_t *resume,
     rl_traverse_callback_t cb, void *arg)
 {
 	objset_t *mos = rl->rl_mos;
-	redact_block_phys_t *buf;
-	unsigned int bufsize = SPA_OLD_MAXBLOCKSIZE;
 	int err = 0;
 
 	if (rl->rl_phys->rlp_last_object != UINT64_MAX ||
@@ -1651,42 +1621,48 @@ dsl_redaction_list_traverse(redaction_list_t *rl, zbookmark_phys_t *resume,
 	}
 
 	/*
-	 * Binary search for the point to resume from.  The goal is to minimize
-	 * the number of disk reads we have to perform.
+	 * This allows us to skip the binary search and resume checking logic
+	 * below, if we're not resuming a redacted send.
 	 */
-	buf = zio_data_buf_alloc(bufsize);
-	uint64_t maxbufid = (rl->rl_phys->rlp_num_entries - 1) /
-	    redact_block_buf_num_entries(bufsize);
-	uint64_t minbufid = 0;
-	while (resume != NULL && maxbufid - minbufid >= 1) {
-		ASSERT3U(maxbufid, >, minbufid);
-		uint64_t midbufid = minbufid + ((maxbufid - minbufid) / 2);
-		err = dmu_read(mos, rl->rl_object, midbufid * bufsize, bufsize,
-		    buf, DMU_READ_NO_PREFETCH);
+	if (ZB_IS_ZERO(resume))
+		resume = NULL;
+
+	/*
+	 * Binary search for the point to resume from.
+	 */
+	uint64_t maxidx = rl->rl_phys->rlp_num_entries - 1;
+	uint64_t minidx = 0;
+	while (resume != NULL && maxidx > minidx) {
+		redact_block_phys_t rbp = { 0 };
+		ASSERT3U(maxidx, >, minidx);
+		uint64_t mididx = minidx + ((maxidx - minidx) / 2);
+		err = dmu_read(mos, rl->rl_object, mididx * sizeof (rbp),
+		    sizeof (rbp), &rbp, DMU_READ_NO_PREFETCH);
 		if (err != 0)
 			break;
 
-		int cmp0 = redact_block_zb_compare(&buf[0], resume);
-		int cmpn = redact_block_zb_compare(
-		    &buf[last_entry(rl, bufsize, maxbufid)], resume);
+		int cmp = redact_block_zb_compare(&rbp, resume);
 
-		/*
-		 * If the first block is before or equal to the resume point,
-		 * and the last one is equal or after, then the resume point is
-		 * in this buf, and we should start here.
-		 */
-		if (cmp0 <= 0 && cmpn >= 0)
+		if (cmp == 0) {
+			minidx = mididx;
 			break;
-
-		if (cmp0 > 0)
-			maxbufid = midbufid - 1;
-		else if (cmpn < 0)
-			minbufid = midbufid + 1;
-		else
-			panic("No progress in binary search for resume point");
+		} else if (cmp > 0) {
+			maxidx =
+			    (mididx == minidx ? minidx : mididx - 1);
+		} else {
+			minidx = mididx + 1;
+		}
 	}
 
-	for (uint64_t curidx = minbufid * redact_block_buf_num_entries(bufsize);
+	unsigned int bufsize = SPA_OLD_MAXBLOCKSIZE;
+	redact_block_phys_t *buf = zio_data_buf_alloc(bufsize);
+
+	unsigned int entries_per_buf = bufsize / sizeof (redact_block_phys_t);
+	uint64_t start_block = minidx / entries_per_buf;
+	err = dmu_read(mos, rl->rl_object, start_block * bufsize, bufsize, buf,
+	    DMU_READ_PREFETCH);
+
+	for (uint64_t curidx = minidx;
 	    err == 0 && curidx < rl->rl_phys->rlp_num_entries;
 	    curidx++) {
 		/*
@@ -1696,22 +1672,35 @@ dsl_redaction_list_traverse(redaction_list_t *rl, zbookmark_phys_t *resume,
 		 * prefetching, and this code shouldn't be the bottleneck, so we
 		 * don't need to do manual prefetching.
 		 */
-		if (curidx % redact_block_buf_num_entries(bufsize) == 0) {
+		if (curidx % entries_per_buf == 0) {
 			err = dmu_read(mos, rl->rl_object, curidx *
 			    sizeof (*buf), bufsize, buf,
 			    DMU_READ_PREFETCH);
 			if (err != 0)
 				break;
 		}
-		redact_block_phys_t *rb = &buf[curidx %
-		    redact_block_buf_num_entries(bufsize)];
+		redact_block_phys_t *rb = &buf[curidx % entries_per_buf];
 		/*
 		 * If resume is non-null, we should either not send the data, or
 		 * null out resume so we don't have to keep doing these
 		 * comparisons.
 		 */
 		if (resume != NULL) {
+			/*
+			 * It is possible that after the binary search we got
+			 * a record before the resume point. There's two cases
+			 * where this can occur. If the record is the last
+			 * redaction record, and the resume point is after the
+			 * end of the redacted data, curidx will be the last
+			 * redaction record. In that case, the loop will end
+			 * after this iteration. The second case is if the
+			 * resume point is between two redaction records, the
+			 * binary search can return either the record before
+			 * or after the resume point. In that case, the next
+			 * iteration will be greater than the resume point.
+			 */
 			if (redact_block_zb_compare(rb, resume) < 0) {
+				ASSERT3U(curidx, ==, minidx);
 				continue;
 			} else {
 				/*
@@ -1733,8 +1722,10 @@ dsl_redaction_list_traverse(redaction_list_t *rl, zbookmark_phys_t *resume,
 			}
 		}
 
-		if (cb(rb, arg) != 0)
+		if (cb(rb, arg) != 0) {
+			err = EINTR;
 			break;
+		}
 	}
 
 	zio_data_buf_free(buf, bufsize);

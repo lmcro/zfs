@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -21,6 +21,8 @@
 
 #ifndef	_SYS_ZFS_FILE_H
 #define	_SYS_ZFS_FILE_H
+
+#include <sys/zfs_context.h>
 
 #ifndef _KERNEL
 typedef struct zfs_file {
@@ -55,8 +57,8 @@ int zfs_file_fallocate(zfs_file_t *fp, int mode, loff_t offset, loff_t len);
 loff_t zfs_file_off(zfs_file_t *fp);
 int zfs_file_unlink(const char *);
 
-int zfs_file_get(int fd, zfs_file_t **fp);
-void zfs_file_put(int fd);
+zfs_file_t *zfs_file_get(int fd);
+void zfs_file_put(zfs_file_t *fp);
 void *zfs_file_private(zfs_file_t *fp);
 
 #endif /* _SYS_ZFS_FILE_H */

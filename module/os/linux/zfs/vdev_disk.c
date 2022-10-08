@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -34,8 +34,12 @@
 #include <sys/abd.h>
 #include <sys/fs/zfs.h>
 #include <sys/zio.h>
+#include <linux/blkpg.h>
 #include <linux/msdos_fs.h>
 #include <linux/vfs_compat.h>
+#ifdef HAVE_LINUX_BLK_CGROUP_HEADER
+#include <linux/blk-cgroup.h>
+#endif
 
 typedef struct vdev_disk {
 	struct block_device		*vd_bdev;
@@ -93,6 +97,24 @@ bdev_capacity(struct block_device *bdev)
 	return (i_size_read(bdev->bd_inode));
 }
 
+#if !defined(HAVE_BDEV_WHOLE)
+static inline struct block_device *
+bdev_whole(struct block_device *bdev)
+{
+	return (bdev->bd_contains);
+}
+#endif
+
+#if defined(HAVE_BDEVNAME)
+#define	vdev_bdevname(bdev, name)	bdevname(bdev, name)
+#else
+static inline void
+vdev_bdevname(struct block_device *bdev, char *name)
+{
+	snprintf(name, BDEVNAME_SIZE, "%pg", bdev);
+}
+#endif
+
 /*
  * Returns the maximum expansion capacity of the block device (in bytes).
  *
@@ -117,7 +139,7 @@ bdev_max_capacity(struct block_device *bdev, uint64_t wholedisk)
 	uint64_t psize;
 	int64_t available;
 
-	if (wholedisk && bdev->bd_part != NULL && bdev != bdev->bd_contains) {
+	if (wholedisk && bdev != bdev_whole(bdev)) {
 		/*
 		 * When reporting maximum expansion capacity for a wholedisk
 		 * deduct any capacity which is expected to be lost due to
@@ -131,7 +153,7 @@ bdev_max_capacity(struct block_device *bdev, uint64_t wholedisk)
 		 * "reserved" EFI partition: in such cases return the device
 		 * usable capacity.
 		 */
-		available = i_size_read(bdev->bd_contains->bd_inode) -
+		available = i_size_read(bdev_whole(bdev)->bd_inode) -
 		    ((EFI_MIN_RESV_SIZE + NEW_START_BLOCK +
 		    PARTITION_END_ALIGNMENT) << SECTOR_BITS);
 		psize = MAX(available, bdev_capacity(bdev));
@@ -157,9 +179,21 @@ vdev_disk_error(zio_t *zio)
 	    zio->io_flags);
 }
 
+static void
+vdev_disk_kobj_evt_post(vdev_t *v)
+{
+	vdev_disk_t *vd = v->vdev_tsd;
+	if (vd && vd->vd_bdev) {
+		spl_signal_kobj_evt(vd->vd_bdev);
+	} else {
+		vdev_dbgmsg(v, "vdev_disk_t is NULL for VDEV:%s\n",
+		    v->vdev_path);
+	}
+}
+
 static int
 vdev_disk_open(vdev_t *v, uint64_t *psize, uint64_t *max_psize,
-    uint64_t *ashift)
+    uint64_t *logical_ashift, uint64_t *physical_ashift)
 {
 	struct block_device *bdev;
 	fmode_t mode = vdev_bdev_mode(spa_mode(v->vdev_spa));
@@ -175,7 +209,8 @@ vdev_disk_open(vdev_t *v, uint64_t *psize, uint64_t *max_psize,
 
 	/*
 	 * Reopen the device if it is currently open.  When expanding a
-	 * partition force re-scanning the partition table while closed
+	 * partition force re-scanning the partition table if userland
+	 * did not take care of this already. We need to do this while closed
 	 * in order to get an accurate updated block device size.  Then
 	 * since udev may need to recreate the device links increase the
 	 * open retry timeout before reporting the device as unavailable.
@@ -190,9 +225,25 @@ vdev_disk_open(vdev_t *v, uint64_t *psize, uint64_t *max_psize,
 		vd->vd_bdev = NULL;
 
 		if (bdev) {
-			if (v->vdev_expanding && bdev != bdev->bd_contains) {
-				bdevname(bdev->bd_contains, disk_name + 5);
-				reread_part = B_TRUE;
+			if (v->vdev_expanding && bdev != bdev_whole(bdev)) {
+				vdev_bdevname(bdev_whole(bdev), disk_name + 5);
+				/*
+				 * If userland has BLKPG_RESIZE_PARTITION,
+				 * then it should have updated the partition
+				 * table already. We can detect this by
+				 * comparing our current physical size
+				 * with that of the device. If they are
+				 * the same, then we must not have
+				 * BLKPG_RESIZE_PARTITION or it failed to
+				 * update the partition table online. We
+				 * fallback to rescanning the partition
+				 * table from the kernel below. However,
+				 * if the capacity already reflects the
+				 * updated partition, then we skip
+				 * rescanning the partition table here.
+				 */
+				if (v->vdev_psize == bdev_capacity(bdev))
+					reread_part = B_TRUE;
 			}
 
 			blkdev_put(bdev, mode | FMODE_EXCL);
@@ -239,6 +290,11 @@ vdev_disk_open(vdev_t *v, uint64_t *psize, uint64_t *max_psize,
 	 * a ENOENT failure at this point is highly likely to be transient
 	 * and it is reasonable to sleep and retry before giving up.  In
 	 * practice delays have been observed to be on the order of 100ms.
+	 *
+	 * When ERESTARTSYS is returned it indicates the block device is
+	 * a zvol which could not be opened due to the deadlock detection
+	 * logic in zvol_open().  Extend the timeout and retry the open
+	 * subsequent attempts are expected to eventually succeed.
 	 */
 	hrtime_t start = gethrtime();
 	bdev = ERR_PTR(-ENXIO);
@@ -246,7 +302,17 @@ vdev_disk_open(vdev_t *v, uint64_t *psize, uint64_t *max_psize,
 		bdev = blkdev_get_by_path(v->vdev_path, mode | FMODE_EXCL,
 		    zfs_vdev_holder);
 		if (unlikely(PTR_ERR(bdev) == -ENOENT)) {
+			/*
+			 * There is no point of waiting since device is removed
+			 * explicitly
+			 */
+			if (v->vdev_removed)
+				break;
+
 			schedule_timeout(MSEC_TO_TICK(10));
+		} else if (unlikely(PTR_ERR(bdev) == -ERESTARTSYS)) {
+			timeout = MSEC2NSEC(zfs_vdev_open_timeout_ms * 10);
+			continue;
 		} else if (IS_ERR(bdev)) {
 			break;
 		}
@@ -267,22 +333,23 @@ vdev_disk_open(vdev_t *v, uint64_t *psize, uint64_t *max_psize,
 		rw_exit(&vd->vd_lock);
 	}
 
-	struct request_queue *q = bdev_get_queue(vd->vd_bdev);
-
 	/*  Determine the physical block size */
-	int block_size = bdev_physical_block_size(vd->vd_bdev);
+	int physical_block_size = bdev_physical_block_size(vd->vd_bdev);
+
+	/*  Determine the logical block size */
+	int logical_block_size = bdev_logical_block_size(vd->vd_bdev);
 
 	/* Clear the nowritecache bit, causes vdev_reopen() to try again. */
 	v->vdev_nowritecache = B_FALSE;
 
 	/* Set when device reports it supports TRIM. */
-	v->vdev_has_trim = !!blk_queue_discard(q);
+	v->vdev_has_trim = bdev_discard_supported(vd->vd_bdev);
 
 	/* Set when device reports it supports secure TRIM. */
-	v->vdev_has_securetrim = !!blk_queue_discard_secure(q);
+	v->vdev_has_securetrim = bdev_secure_discard_supported(vd->vd_bdev);
 
 	/* Inform the ZIO pipeline that we are non-rotational */
-	v->vdev_nonrot = blk_queue_nonrot(q);
+	v->vdev_nonrot = blk_queue_nonrot(bdev_get_queue(vd->vd_bdev));
 
 	/* Physical volume size in bytes for the partition */
 	*psize = bdev_capacity(vd->vd_bdev);
@@ -291,7 +358,11 @@ vdev_disk_open(vdev_t *v, uint64_t *psize, uint64_t *max_psize,
 	*max_psize = bdev_max_capacity(vd->vd_bdev, v->vdev_wholedisk);
 
 	/* Based on the minimum sector size set the block size */
-	*ashift = highbit64(MAX(block_size, SPA_MINBLOCKSIZE)) - 1;
+	*physical_ashift = highbit64(MAX(physical_block_size,
+	    SPA_MINBLOCKSIZE)) - 1;
+
+	*logical_ashift = highbit64(MAX(logical_block_size,
+	    SPA_MINBLOCKSIZE)) - 1;
 
 	return (0);
 }
@@ -317,19 +388,14 @@ vdev_disk_close(vdev_t *v)
 static dio_request_t *
 vdev_disk_dio_alloc(int bio_count)
 {
-	dio_request_t *dr;
-	int i;
-
-	dr = kmem_zalloc(sizeof (dio_request_t) +
+	dio_request_t *dr = kmem_zalloc(sizeof (dio_request_t) +
 	    sizeof (struct bio *) * bio_count, KM_SLEEP);
-	if (dr) {
-		atomic_set(&dr->dr_ref, 0);
-		dr->dr_bio_count = bio_count;
-		dr->dr_error = 0;
+	atomic_set(&dr->dr_ref, 0);
+	dr->dr_bio_count = bio_count;
+	dr->dr_error = 0;
 
-		for (i = 0; i < dr->dr_bio_count; i++)
-			dr->dr_bio[i] = NULL;
-	}
+	for (int i = 0; i < dr->dr_bio_count; i++)
+		dr->dr_bio[i] = NULL;
 
 	return (dr);
 }
@@ -405,11 +471,28 @@ static inline void
 vdev_submit_bio_impl(struct bio *bio)
 {
 #ifdef HAVE_1ARG_SUBMIT_BIO
-	submit_bio(bio);
+	(void) submit_bio(bio);
 #else
-	submit_bio(0, bio);
+	(void) submit_bio(bio_data_dir(bio), bio);
 #endif
 }
+
+/*
+ * preempt_schedule_notrace is GPL-only which breaks the ZFS build, so
+ * replace it with preempt_schedule under the following condition:
+ */
+#if defined(CONFIG_ARM64) && \
+    defined(CONFIG_PREEMPTION) && \
+    defined(CONFIG_BLK_CGROUP)
+#define	preempt_schedule_notrace(x) preempt_schedule(x)
+#endif
+
+/*
+ * As for the Linux 5.18 kernel bio_alloc() expects a block_device struct
+ * as an argument removing the need to set it with bio_set_dev().  This
+ * removes the need for all of the following compatibility code.
+ */
+#if !defined(HAVE_BIO_ALLOC_4ARG)
 
 #ifdef HAVE_BIO_SET_DEV
 #if defined(CONFIG_BLK_CGROUP) && defined(HAVE_BIO_SET_DEV_GPL_ONLY)
@@ -418,8 +501,11 @@ vdev_submit_bio_impl(struct bio *bio)
  * blkg_tryget() to use rcu_read_lock() instead of rcu_read_lock_sched().
  * As a side effect the function was converted to GPL-only.  Define our
  * own version when needed which uses rcu_read_lock_sched().
+ *
+ * The Linux 5.17 kernel split linux/blk-cgroup.h into a private and a public
+ * part, moving blkg_tryget into the private one. Define our own version.
  */
-#if defined(HAVE_BLKG_TRYGET_GPL_ONLY)
+#if defined(HAVE_BLKG_TRYGET_GPL_ONLY) || !defined(HAVE_BLKG_TRYGET)
 static inline bool
 vdev_blkg_tryget(struct blkcg_gq *blkg)
 {
@@ -433,16 +519,21 @@ vdev_blkg_tryget(struct blkcg_gq *blkg)
 		this_cpu_inc(*count);
 		rc = true;
 	} else {
+#ifdef ZFS_PERCPU_REF_COUNT_IN_DATA
+		rc = atomic_long_inc_not_zero(&ref->data->count);
+#else
 		rc = atomic_long_inc_not_zero(&ref->count);
+#endif
 	}
 
 	rcu_read_unlock_sched();
 
 	return (rc);
 }
-#elif defined(HAVE_BLKG_TRYGET)
+#else
 #define	vdev_blkg_tryget(bg)	blkg_tryget(bg)
 #endif
+#ifdef HAVE_BIO_SET_DEV_MACRO
 /*
  * The Linux 5.0 kernel updated the bio_set_dev() macro so it calls the
  * GPL-only bio_associate_blkg() symbol thus inadvertently converting
@@ -452,7 +543,11 @@ vdev_blkg_tryget(struct blkcg_gq *blkg)
 static inline void
 vdev_bio_associate_blkg(struct bio *bio)
 {
+#if defined(HAVE_BIO_BDEV_DISK)
+	struct request_queue *q = bio->bi_bdev->bd_disk->queue;
+#else
 	struct request_queue *q = bio->bi_disk->queue;
+#endif
 
 	ASSERT3P(q, !=, NULL);
 	ASSERT3P(bio->bi_blkg, ==, NULL);
@@ -460,7 +555,30 @@ vdev_bio_associate_blkg(struct bio *bio)
 	if (q->root_blkg && vdev_blkg_tryget(q->root_blkg))
 		bio->bi_blkg = q->root_blkg;
 }
+
 #define	bio_associate_blkg vdev_bio_associate_blkg
+#else
+static inline void
+vdev_bio_set_dev(struct bio *bio, struct block_device *bdev)
+{
+#if defined(HAVE_BIO_BDEV_DISK)
+	struct request_queue *q = bdev->bd_disk->queue;
+#else
+	struct request_queue *q = bio->bi_disk->queue;
+#endif
+	bio_clear_flag(bio, BIO_REMAPPED);
+	if (bio->bi_bdev != bdev)
+		bio_clear_flag(bio, BIO_THROTTLED);
+	bio->bi_bdev = bdev;
+
+	ASSERT3P(q, !=, NULL);
+	ASSERT3P(bio->bi_blkg, ==, NULL);
+
+	if (q->root_blkg && vdev_blkg_tryget(q->root_blkg))
+		bio->bi_blkg = q->root_blkg;
+}
+#define	bio_set_dev		vdev_bio_set_dev
+#endif
 #endif
 #else
 /*
@@ -472,6 +590,7 @@ bio_set_dev(struct bio *bio, struct block_device *bdev)
 	bio->bi_bdev = bdev;
 }
 #endif /* HAVE_BIO_SET_DEV */
+#endif /* !HAVE_BIO_ALLOC_4ARG */
 
 static inline void
 vdev_submit_bio(struct bio *bio)
@@ -482,6 +601,36 @@ vdev_submit_bio(struct bio *bio)
 	current->bio_list = bio_list;
 }
 
+static inline struct bio *
+vdev_bio_alloc(struct block_device *bdev, gfp_t gfp_mask,
+    unsigned short nr_vecs)
+{
+	struct bio *bio;
+
+#ifdef HAVE_BIO_ALLOC_4ARG
+	bio = bio_alloc(bdev, nr_vecs, 0, gfp_mask);
+#else
+	bio = bio_alloc(gfp_mask, nr_vecs);
+	if (likely(bio != NULL))
+		bio_set_dev(bio, bdev);
+#endif
+
+	return (bio);
+}
+
+static inline unsigned int
+vdev_bio_max_segs(zio_t *zio, int bio_size, uint64_t abd_offset)
+{
+	unsigned long nr_segs = abd_nr_pages_off(zio->io_abd,
+	    bio_size, abd_offset);
+
+#ifdef HAVE_BIO_MAX_SEGS
+	return (bio_max_segs(nr_segs));
+#else
+	return (MIN(nr_segs, BIO_MAX_PAGES));
+#endif
+}
+
 static int
 __vdev_disk_physio(struct block_device *bdev, zio_t *zio,
     size_t io_size, uint64_t io_offset, int rw, int flags)
@@ -489,9 +638,11 @@ __vdev_disk_physio(struct block_device *bdev, zio_t *zio,
 	dio_request_t *dr;
 	uint64_t abd_offset;
 	uint64_t bio_offset;
-	int bio_size, bio_count = 16;
-	int i = 0, error = 0;
+	int bio_size;
+	int bio_count = 16;
+	int error = 0;
 	struct blk_plug plug;
+	unsigned short nr_vecs;
 
 	/*
 	 * Accessing outside the block device is never allowed.
@@ -499,14 +650,14 @@ __vdev_disk_physio(struct block_device *bdev, zio_t *zio,
 	if (io_offset + io_size > bdev->bd_inode->i_size) {
 		vdev_dbgmsg(zio->io_vd,
 		    "Illegal access %llu size %llu, device size %llu",
-		    io_offset, io_size, i_size_read(bdev->bd_inode));
+		    (u_longlong_t)io_offset,
+		    (u_longlong_t)io_size,
+		    (u_longlong_t)i_size_read(bdev->bd_inode));
 		return (SET_ERROR(EIO));
 	}
 
 retry:
 	dr = vdev_disk_dio_alloc(bio_count);
-	if (dr == NULL)
-		return (SET_ERROR(ENOMEM));
 
 	if (zio && !(zio->io_flags & (ZIO_FLAG_IO_RETRY | ZIO_FLAG_TRYHARD)))
 		bio_set_flags_failfast(bdev, &flags);
@@ -514,26 +665,28 @@ retry:
 	dr->dr_zio = zio;
 
 	/*
-	 * When the IO size exceeds the maximum bio size for the request
-	 * queue we are forced to break the IO in multiple bio's and wait
-	 * for them all to complete.  Ideally, all pool users will set
-	 * their volume block size to match the maximum request size and
-	 * the common case will be one bio per vdev IO request.
+	 * Since bio's can have up to BIO_MAX_PAGES=256 iovec's, each of which
+	 * is at least 512 bytes and at most PAGESIZE (typically 4K), one bio
+	 * can cover at least 128KB and at most 1MB.  When the required number
+	 * of iovec's exceeds this, we are forced to break the IO in multiple
+	 * bio's and wait for them all to complete.  This is likely if the
+	 * recordsize property is increased beyond 1MB.  The default
+	 * bio_count=16 should typically accommodate the maximum-size zio of
+	 * 16MB.
 	 */
 
 	abd_offset = 0;
 	bio_offset = io_offset;
-	bio_size   = io_size;
-	for (i = 0; i <= dr->dr_bio_count; i++) {
+	bio_size = io_size;
+	for (int i = 0; i <= dr->dr_bio_count; i++) {
 
 		/* Finished constructing bio's for given buffer */
 		if (bio_size <= 0)
 			break;
 
 		/*
-		 * By default only 'bio_count' bio's per dio are allowed.
-		 * However, if we find ourselves in a situation where more
-		 * are needed we allocate a larger dio and warn the user.
+		 * If additional bio's are required, we have to retry, but
+		 * this should be rare - see the comment above.
 		 */
 		if (dr->dr_bio_count == i) {
 			vdev_disk_dio_free(dr);
@@ -541,10 +694,8 @@ retry:
 			goto retry;
 		}
 
-		/* bio_alloc() with __GFP_WAIT never returns NULL */
-		dr->dr_bio[i] = bio_alloc(GFP_NOIO,
-		    MIN(abd_nr_pages_off(zio->io_abd, bio_size, abd_offset),
-		    BIO_MAX_PAGES));
+		nr_vecs = vdev_bio_max_segs(zio, bio_size, abd_offset);
+		dr->dr_bio[i] = vdev_bio_alloc(bdev, GFP_NOIO, nr_vecs);
 		if (unlikely(dr->dr_bio[i] == NULL)) {
 			vdev_disk_dio_free(dr);
 			return (SET_ERROR(ENOMEM));
@@ -553,7 +704,6 @@ retry:
 		/* Matching put called by vdev_disk_physio_completion */
 		vdev_disk_dio_get(dr);
 
-		bio_set_dev(dr->dr_bio[i], bdev);
 		BIO_BI_SECTOR(dr->dr_bio[i]) = bio_offset >> 9;
 		dr->dr_bio[i]->bi_end_io = vdev_disk_physio_completion;
 		dr->dr_bio[i]->bi_private = dr;
@@ -575,9 +725,10 @@ retry:
 		blk_start_plug(&plug);
 
 	/* Submit all bio's associated with this dio */
-	for (i = 0; i < dr->dr_bio_count; i++)
+	for (int i = 0; i < dr->dr_bio_count; i++) {
 		if (dr->dr_bio[i])
 			vdev_submit_bio(dr->dr_bio[i]);
+	}
 
 	if (dr->dr_bio_count > 1)
 		blk_finish_plug(&plug);
@@ -616,14 +767,12 @@ vdev_disk_io_flush(struct block_device *bdev, zio_t *zio)
 	if (!q)
 		return (SET_ERROR(ENXIO));
 
-	bio = bio_alloc(GFP_NOIO, 0);
-	/* bio_alloc() with __GFP_WAIT never returns NULL */
+	bio = vdev_bio_alloc(bdev, GFP_NOIO, 0);
 	if (unlikely(bio == NULL))
 		return (SET_ERROR(ENOMEM));
 
 	bio->bi_end_io = vdev_disk_io_flush_completion;
 	bio->bi_private = zio;
-	bio_set_dev(bio, bdev);
 	bio_set_flush(bio);
 	vdev_submit_bio(bio);
 	invalidate_bdev(bdev);
@@ -631,12 +780,38 @@ vdev_disk_io_flush(struct block_device *bdev, zio_t *zio)
 	return (0);
 }
 
+static int
+vdev_disk_io_trim(zio_t *zio)
+{
+	vdev_t *v = zio->io_vd;
+	vdev_disk_t *vd = v->vdev_tsd;
+
+#if defined(HAVE_BLKDEV_ISSUE_SECURE_ERASE)
+	if (zio->io_trim_flags & ZIO_TRIM_SECURE) {
+		return (-blkdev_issue_secure_erase(vd->vd_bdev,
+		    zio->io_offset >> 9, zio->io_size >> 9, GFP_NOFS));
+	} else {
+		return (-blkdev_issue_discard(vd->vd_bdev,
+		    zio->io_offset >> 9, zio->io_size >> 9, GFP_NOFS));
+	}
+#elif defined(HAVE_BLKDEV_ISSUE_DISCARD)
+	unsigned long trim_flags = 0;
+#if defined(BLKDEV_DISCARD_SECURE)
+	if (zio->io_trim_flags & ZIO_TRIM_SECURE)
+		trim_flags |= BLKDEV_DISCARD_SECURE;
+#endif
+	return (-blkdev_issue_discard(vd->vd_bdev,
+	    zio->io_offset >> 9, zio->io_size >> 9, GFP_NOFS, trim_flags));
+#else
+#error "Unsupported kernel"
+#endif
+}
+
 static void
 vdev_disk_io_start(zio_t *zio)
 {
 	vdev_t *v = zio->io_vd;
 	vdev_disk_t *vd = v->vdev_tsd;
-	unsigned long trim_flags = 0;
 	int rw, error;
 
 	/*
@@ -709,14 +884,7 @@ vdev_disk_io_start(zio_t *zio)
 		break;
 
 	case ZIO_TYPE_TRIM:
-#if defined(BLKDEV_DISCARD_SECURE)
-		if (zio->io_trim_flags & ZIO_TRIM_SECURE)
-			trim_flags |= BLKDEV_DISCARD_SECURE;
-#endif
-		zio->io_error = -blkdev_issue_discard(vd->vd_bdev,
-		    zio->io_offset >> 9, zio->io_size >> 9, GFP_NOFS,
-		    trim_flags);
-
+		zio->io_error = vdev_disk_io_trim(zio);
 		rw_exit(&vd->vd_lock);
 		zio_interrupt(zio);
 		return;
@@ -752,7 +920,7 @@ vdev_disk_io_done(zio_t *zio)
 		vdev_t *v = zio->io_vd;
 		vdev_disk_t *vd = v->vdev_tsd;
 
-		if (check_disk_change(vd->vd_bdev)) {
+		if (!zfs_check_disk_status(vd->vd_bdev)) {
 			invalidate_bdev(vd->vd_bdev);
 			v->vdev_remove_wanted = B_TRUE;
 			spa_async_request(zio->io_spa, SPA_ASYNC_REMOVE);
@@ -787,9 +955,13 @@ vdev_disk_rele(vdev_t *vd)
 }
 
 vdev_ops_t vdev_disk_ops = {
+	.vdev_op_init = NULL,
+	.vdev_op_fini = NULL,
 	.vdev_op_open = vdev_disk_open,
 	.vdev_op_close = vdev_disk_close,
 	.vdev_op_asize = vdev_default_asize,
+	.vdev_op_min_asize = vdev_default_min_asize,
+	.vdev_op_min_alloc = NULL,
 	.vdev_op_io_start = vdev_disk_io_start,
 	.vdev_op_io_done = vdev_disk_io_done,
 	.vdev_op_state_change = NULL,
@@ -798,8 +970,14 @@ vdev_ops_t vdev_disk_ops = {
 	.vdev_op_rele = vdev_disk_rele,
 	.vdev_op_remap = NULL,
 	.vdev_op_xlate = vdev_default_xlate,
+	.vdev_op_rebuild_asize = NULL,
+	.vdev_op_metaslab_init = NULL,
+	.vdev_op_config_generate = NULL,
+	.vdev_op_nparity = NULL,
+	.vdev_op_ndisks = NULL,
 	.vdev_op_type = VDEV_TYPE_DISK,		/* name of this vdev type */
-	.vdev_op_leaf = B_TRUE			/* leaf vdev */
+	.vdev_op_leaf = B_TRUE,			/* leaf vdev */
+	.vdev_op_kobj_evt_post = vdev_disk_kobj_evt_post
 };
 
 /*
@@ -820,7 +998,47 @@ param_set_vdev_scheduler(const char *val, zfs_kernel_param_t *kp)
 	return (error);
 }
 
-char *zfs_vdev_scheduler = "unused";
+static const char *zfs_vdev_scheduler = "unused";
 module_param_call(zfs_vdev_scheduler, param_set_vdev_scheduler,
     param_get_charp, &zfs_vdev_scheduler, 0644);
 MODULE_PARM_DESC(zfs_vdev_scheduler, "I/O scheduler");
+
+int
+param_set_min_auto_ashift(const char *buf, zfs_kernel_param_t *kp)
+{
+	uint64_t val;
+	int error;
+
+	error = kstrtoull(buf, 0, &val);
+	if (error < 0)
+		return (SET_ERROR(error));
+
+	if (val < ASHIFT_MIN || val > zfs_vdev_max_auto_ashift)
+		return (SET_ERROR(-EINVAL));
+
+	error = param_set_ulong(buf, kp);
+	if (error < 0)
+		return (SET_ERROR(error));
+
+	return (0);
+}
+
+int
+param_set_max_auto_ashift(const char *buf, zfs_kernel_param_t *kp)
+{
+	uint64_t val;
+	int error;
+
+	error = kstrtoull(buf, 0, &val);
+	if (error < 0)
+		return (SET_ERROR(error));
+
+	if (val > ASHIFT_MAX || val < zfs_vdev_min_auto_ashift)
+		return (SET_ERROR(-EINVAL));
+
+	error = param_set_ulong(buf, kp);
+	if (error < 0)
+		return (SET_ERROR(error));
+
+	return (0);
+}

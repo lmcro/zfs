@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -56,7 +56,6 @@
 #include <sys/sunddi.h>
 #include <sys/dmu_objset.h>
 #include <sys/dsl_dir.h>
-#include <sys/spa_boot.h>
 #include <sys/objlist.h>
 #include <sys/zpl.h>
 #include <linux/vfs_compat.h>
@@ -256,10 +255,10 @@ zfs_is_readonly(zfsvfs_t *zfsvfs)
 	return (!!(zfsvfs->z_sb->s_flags & SB_RDONLY));
 }
 
-/*ARGSUSED*/
 int
 zfs_sync(struct super_block *sb, int wait, cred_t *cr)
 {
+	(void) cr;
 	zfsvfs_t *zfsvfs = sb->s_fs_info;
 
 	/*
@@ -274,8 +273,10 @@ zfs_sync(struct super_block *sb, int wait, cred_t *cr)
 		 * Sync a specific filesystem.
 		 */
 		dsl_pool_t *dp;
+		int error;
 
-		ZFS_ENTER(zfsvfs);
+		if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
+			return (error);
 		dp = dmu_objset_pool(zfsvfs->z_os);
 
 		/*
@@ -283,18 +284,18 @@ zfs_sync(struct super_block *sb, int wait, cred_t *cr)
 		 * filesystems which may exist on a suspended pool.
 		 */
 		if (spa_suspended(dp->dp_spa)) {
-			ZFS_EXIT(zfsvfs);
+			zfs_exit(zfsvfs, FTAG);
 			return (0);
 		}
 
 		if (zfsvfs->z_log != NULL)
 			zil_commit(zfsvfs->z_log, 0);
 
-		ZFS_EXIT(zfsvfs);
+		zfs_exit(zfsvfs, FTAG);
 	} else {
 		/*
 		 * Sync all ZFS filesystems.  This is what happens when you
-		 * run sync(1M).  Unlike other filesystems, ZFS honors the
+		 * run sync(1).  Unlike other filesystems, ZFS honors the
 		 * request by waiting for all pools to commit all dirty data.
 		 */
 		spa_sync_allpools();
@@ -352,13 +353,14 @@ acltype_changed_cb(void *arg, uint64_t newval)
 	zfsvfs_t *zfsvfs = arg;
 
 	switch (newval) {
+	case ZFS_ACLTYPE_NFSV4:
 	case ZFS_ACLTYPE_OFF:
 		zfsvfs->z_acl_type = ZFS_ACLTYPE_OFF;
 		zfsvfs->z_sb->s_flags &= ~SB_POSIXACL;
 		break;
-	case ZFS_ACLTYPE_POSIXACL:
+	case ZFS_ACLTYPE_POSIX:
 #ifdef CONFIG_FS_POSIX_ACL
-		zfsvfs->z_acl_type = ZFS_ACLTYPE_POSIXACL;
+		zfsvfs->z_acl_type = ZFS_ACLTYPE_POSIX;
 		zfsvfs->z_sb->s_flags |= SB_POSIXACL;
 #else
 		zfsvfs->z_acl_type = ZFS_ACLTYPE_OFF;
@@ -433,12 +435,6 @@ snapdir_changed_cb(void *arg, uint64_t newval)
 }
 
 static void
-vscan_changed_cb(void *arg, uint64_t newval)
-{
-	((zfsvfs_t *)arg)->z_vscan = newval;
-}
-
-static void
 acl_mode_changed_cb(void *arg, uint64_t newval)
 {
 	zfsvfs_t *zfsvfs = arg;
@@ -510,8 +506,6 @@ zfs_register_callbacks(vfs_t *vfsp)
 	error = error ? error : dsl_prop_register(ds,
 	    zfs_prop_to_name(ZFS_PROP_ACLINHERIT), acl_inherit_changed_cb,
 	    zfsvfs);
-	error = error ? error : dsl_prop_register(ds,
-	    zfs_prop_to_name(ZFS_PROP_VSCAN), vscan_changed_cb, zfsvfs);
 	error = error ? error : dsl_prop_register(ds,
 	    zfs_prop_to_name(ZFS_PROP_NBMAND), nbmand_changed_cb, zfsvfs);
 	dsl_pool_config_exit(dmu_objset_pool(os), FTAG);
@@ -790,9 +784,7 @@ zfsvfs_create(const char *osname, boolean_t readonly, zfsvfs_t **zfvp)
 	}
 
 	error = zfsvfs_create_impl(zfvp, zfsvfs, os);
-	if (error != 0) {
-		dmu_objset_disown(os, B_TRUE, zfsvfs);
-	}
+
 	return (error);
 }
 
@@ -814,7 +806,7 @@ zfsvfs_create_impl(zfsvfs_t **zfvp, zfsvfs_t *zfsvfs, objset_t *os)
 	mutex_init(&zfsvfs->z_lock, NULL, MUTEX_DEFAULT, NULL);
 	list_create(&zfsvfs->z_all_znodes, sizeof (znode_t),
 	    offsetof(znode_t, z_link_node));
-	rrm_init(&zfsvfs->z_teardown_lock, B_FALSE);
+	ZFS_TEARDOWN_INIT(zfsvfs);
 	rw_init(&zfsvfs->z_teardown_inactive_lock, NULL, RW_DEFAULT, NULL);
 	rw_init(&zfsvfs->z_fuid_lock, NULL, RW_DEFAULT, NULL);
 
@@ -832,6 +824,7 @@ zfsvfs_create_impl(zfsvfs_t **zfvp, zfsvfs_t *zfsvfs, objset_t *os)
 
 	error = zfsvfs_init(zfsvfs, os);
 	if (error != 0) {
+		dmu_objset_disown(os, B_TRUE, zfsvfs);
 		*zfvp = NULL;
 		zfsvfs_free(zfsvfs);
 		return (error);
@@ -855,8 +848,6 @@ zfsvfs_setup(zfsvfs_t *zfsvfs, boolean_t mounting)
 	if (error)
 		return (error);
 
-	zfsvfs->z_log = zil_open(zfsvfs->z_os, zfs_get_data);
-
 	/*
 	 * If we are not mounting (ie: online recv), then we don't
 	 * have to worry about replaying the log as we blocked all
@@ -864,7 +855,11 @@ zfsvfs_setup(zfsvfs_t *zfsvfs, boolean_t mounting)
 	 */
 	if (mounting) {
 		ASSERT3P(zfsvfs->z_kstat.dk_kstats, ==, NULL);
-		dataset_kstats_create(&zfsvfs->z_kstat, zfsvfs->z_os);
+		error = dataset_kstats_create(&zfsvfs->z_kstat, zfsvfs->z_os);
+		if (error)
+			return (error);
+		zfsvfs->z_log = zil_open(zfsvfs->z_os, zfs_get_data,
+		    &zfsvfs->z_kstat.dk_zil_sums);
 
 		/*
 		 * During replay we remove the read only flag to
@@ -928,6 +923,10 @@ zfsvfs_setup(zfsvfs_t *zfsvfs, boolean_t mounting)
 		/* restore readonly bit */
 		if (readonly != 0)
 			readonly_changed_cb(zfsvfs, B_TRUE);
+	} else {
+		ASSERT3P(zfsvfs->z_kstat.dk_kstats, !=, NULL);
+		zfsvfs->z_log = zil_open(zfsvfs->z_os, zfs_get_data,
+		    &zfsvfs->z_kstat.dk_zil_sums);
 	}
 
 	/*
@@ -950,7 +949,7 @@ zfsvfs_free(zfsvfs_t *zfsvfs)
 	mutex_destroy(&zfsvfs->z_znodes_lock);
 	mutex_destroy(&zfsvfs->z_lock);
 	list_destroy(&zfsvfs->z_all_znodes);
-	rrm_destroy(&zfsvfs->z_teardown_lock);
+	ZFS_TEARDOWN_DESTROY(zfsvfs);
 	rw_destroy(&zfsvfs->z_teardown_inactive_lock);
 	rw_destroy(&zfsvfs->z_fuid_lock);
 	for (i = 0; i != size; i++) {
@@ -1094,7 +1093,8 @@ zfs_statvfs(struct inode *ip, struct kstatfs *statp)
 	uint64_t refdbytes, availbytes, usedobjs, availobjs;
 	int err = 0;
 
-	ZFS_ENTER(zfsvfs);
+	if ((err = zfs_enter(zfsvfs, FTAG)) != 0)
+		return (err);
 
 	dmu_objset_space(zfsvfs->z_os,
 	    &refdbytes, &availbytes, &usedobjs, &availobjs);
@@ -1144,7 +1144,7 @@ zfs_statvfs(struct inode *ip, struct kstatfs *statp)
 	 * We have all of 40 characters to stuff a string here.
 	 * Is there anything useful we could/should provide?
 	 */
-	bzero(statp->f_spare, sizeof (statp->f_spare));
+	memset(statp->f_spare, 0, sizeof (statp->f_spare));
 
 	if (dmu_objset_projectquota_enabled(zfsvfs->z_os) &&
 	    dmu_objset_projectquota_present(zfsvfs->z_os)) {
@@ -1155,7 +1155,7 @@ zfs_statvfs(struct inode *ip, struct kstatfs *statp)
 			err = zfs_statfs_project(zfsvfs, zp, statp, bshift);
 	}
 
-	ZFS_EXIT(zfsvfs);
+	zfs_exit(zfsvfs, FTAG);
 	return (err);
 }
 
@@ -1165,13 +1165,14 @@ zfs_root(zfsvfs_t *zfsvfs, struct inode **ipp)
 	znode_t *rootzp;
 	int error;
 
-	ZFS_ENTER(zfsvfs);
+	if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
+		return (error);
 
 	error = zfs_zget(zfsvfs, zfsvfs->z_root, &rootzp);
 	if (error == 0)
 		*ipp = ZTOI(rootzp);
 
-	ZFS_EXIT(zfsvfs);
+	zfs_exit(zfsvfs, FTAG);
 	return (error);
 }
 
@@ -1249,7 +1250,8 @@ zfs_prune(struct super_block *sb, unsigned long nr_to_scan, int *objects)
 		.gfp_mask = GFP_KERNEL,
 	};
 
-	ZFS_ENTER(zfsvfs);
+	if ((error = zfs_enter(zfsvfs, FTAG)) != 0)
+		return (error);
 
 #if defined(HAVE_SPLIT_SHRINKER_CALLBACK) && \
 	defined(SHRINK_CONTROL_HAS_NID) && \
@@ -1258,6 +1260,11 @@ zfs_prune(struct super_block *sb, unsigned long nr_to_scan, int *objects)
 		*objects = 0;
 		for_each_online_node(sc.nid) {
 			*objects += (*shrinker->scan_objects)(shrinker, &sc);
+			/*
+			 * reset sc.nr_to_scan, modified by
+			 * scan_objects == super_cache_scan
+			 */
+			sc.nr_to_scan = nr_to_scan;
 		}
 	} else {
 			*objects = (*shrinker->scan_objects)(shrinker, &sc);
@@ -1285,7 +1292,7 @@ zfs_prune(struct super_block *sb, unsigned long nr_to_scan, int *objects)
 		*objects = zfs_prune_aliases(zfsvfs, nr_to_scan);
 #endif
 
-	ZFS_EXIT(zfsvfs);
+	zfs_exit(zfsvfs, FTAG);
 
 	dprintf_ds(zfsvfs->z_os->os_dsl_dataset,
 	    "pruning, nr_to_scan=%lu objects=%d error=%d\n",
@@ -1335,7 +1342,7 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 		}
 	}
 
-	rrm_enter(&zfsvfs->z_teardown_lock, RW_WRITER, FTAG);
+	ZFS_TEARDOWN_ENTER_WRITE(zfsvfs, FTAG);
 
 	if (!unmounting) {
 		/*
@@ -1366,7 +1373,7 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 	 */
 	if (!unmounting && (zfsvfs->z_unmounted || zfsvfs->z_os == NULL)) {
 		rw_exit(&zfsvfs->z_teardown_inactive_lock);
-		rrm_exit(&zfsvfs->z_teardown_lock, FTAG);
+		ZFS_TEARDOWN_EXIT(zfsvfs, FTAG);
 		return (SET_ERROR(EIO));
 	}
 
@@ -1403,7 +1410,7 @@ zfsvfs_teardown(zfsvfs_t *zfsvfs, boolean_t unmounting)
 	if (unmounting) {
 		zfsvfs->z_unmounted = B_TRUE;
 		rw_exit(&zfsvfs->z_teardown_inactive_lock);
-		rrm_exit(&zfsvfs->z_teardown_lock, FTAG);
+		ZFS_TEARDOWN_EXIT(zfsvfs, FTAG);
 	}
 
 	/*
@@ -1450,18 +1457,38 @@ int
 zfs_domount(struct super_block *sb, zfs_mnt_t *zm, int silent)
 {
 	const char *osname = zm->mnt_osname;
-	struct inode *root_inode;
+	struct inode *root_inode = NULL;
 	uint64_t recordsize;
 	int error = 0;
 	zfsvfs_t *zfsvfs = NULL;
 	vfs_t *vfs = NULL;
+	int canwrite;
+	int dataset_visible_zone;
 
 	ASSERT(zm);
 	ASSERT(osname);
 
+	dataset_visible_zone = zone_dataset_visible(osname, &canwrite);
+
+	/*
+	 * Refuse to mount a filesystem if we are in a namespace and the
+	 * dataset is not visible or writable in that namespace.
+	 */
+	if (!INGLOBALZONE(curproc) &&
+	    (!dataset_visible_zone || !canwrite)) {
+		return (SET_ERROR(EPERM));
+	}
+
 	error = zfsvfs_parse_options(zm->mnt_data, &vfs);
 	if (error)
 		return (error);
+
+	/*
+	 * If a non-writable filesystem is being mounted without the
+	 * read-only flag, pretend it was set, as done for snapshots.
+	 */
+	if (!canwrite)
+		vfs->vfs_readonly = true;
 
 	error = zfsvfs_create(osname, vfs->vfs_readonly, &zfsvfs);
 	if (error) {
@@ -1602,7 +1629,6 @@ zfs_preumount(struct super_block *sb)
  * Called once all other unmount released tear down has occurred.
  * It is our responsibility to release any remaining infrastructure.
  */
-/*ARGSUSED*/
 int
 zfs_umount(struct super_block *sb)
 {
@@ -1723,7 +1749,8 @@ zfs_vget(struct super_block *sb, struct inode **ipp, fid_t *fidp)
 		return (zfsctl_snapdir_vget(sb, objsetid, fid_gen, ipp));
 	}
 
-	ZFS_ENTER(zfsvfs);
+	if ((err = zfs_enter(zfsvfs, FTAG)) != 0)
+		return (err);
 	/* A zero fid_gen means we are in the .zfs control directories */
 	if (fid_gen == 0 &&
 	    (object == ZFSCTL_INO_ROOT || object == ZFSCTL_INO_SNAPDIR)) {
@@ -1733,9 +1760,13 @@ zfs_vget(struct super_block *sb, struct inode **ipp, fid_t *fidp)
 			VERIFY(zfsctl_root_lookup(*ipp, "snapshot", ipp,
 			    0, kcred, NULL, NULL) == 0);
 		} else {
-			igrab(*ipp);
+			/*
+			 * Must have an existing ref, so igrab()
+			 * cannot return NULL
+			 */
+			VERIFY3P(igrab(*ipp), !=, NULL);
 		}
-		ZFS_EXIT(zfsvfs);
+		zfs_exit(zfsvfs, FTAG);
 		return (0);
 	}
 
@@ -1743,14 +1774,14 @@ zfs_vget(struct super_block *sb, struct inode **ipp, fid_t *fidp)
 
 	dprintf("getting %llu [%llu mask %llx]\n", object, fid_gen, gen_mask);
 	if ((err = zfs_zget(zfsvfs, object, &zp))) {
-		ZFS_EXIT(zfsvfs);
+		zfs_exit(zfsvfs, FTAG);
 		return (err);
 	}
 
 	/* Don't export xattr stuff */
 	if (zp->z_pflags & ZFS_XATTR) {
 		zrele(zp);
-		ZFS_EXIT(zfsvfs);
+		zfs_exit(zfsvfs, FTAG);
 		return (SET_ERROR(ENOENT));
 	}
 
@@ -1765,15 +1796,15 @@ zfs_vget(struct super_block *sb, struct inode **ipp, fid_t *fidp)
 		dprintf("znode gen (%llu) != fid gen (%llu)\n", zp_gen,
 		    fid_gen);
 		zrele(zp);
-		ZFS_EXIT(zfsvfs);
+		zfs_exit(zfsvfs, FTAG);
 		return (SET_ERROR(ENOENT));
 	}
 
 	*ipp = ZTOI(zp);
 	if (*ipp)
-		zfs_inode_update(ITOZ(*ipp));
+		zfs_znode_update_vfs(ITOZ(*ipp));
 
-	ZFS_EXIT(zfsvfs);
+	zfs_exit(zfsvfs, FTAG);
 	return (0);
 }
 
@@ -1809,7 +1840,7 @@ zfs_resume_fs(zfsvfs_t *zfsvfs, dsl_dataset_t *ds)
 	int err, err2;
 	znode_t *zp;
 
-	ASSERT(RRM_WRITE_HELD(&zfsvfs->z_teardown_lock));
+	ASSERT(ZFS_TEARDOWN_WRITE_HELD(zfsvfs));
 	ASSERT(RW_WRITE_HELD(&zfsvfs->z_teardown_inactive_lock));
 
 	/*
@@ -1885,7 +1916,7 @@ bail:
 
 	/* release the VFS ops */
 	rw_exit(&zfsvfs->z_teardown_inactive_lock);
-	rrm_exit(&zfsvfs->z_teardown_lock, FTAG);
+	ZFS_TEARDOWN_EXIT(zfsvfs, FTAG);
 
 	if (err != 0) {
 		/*
@@ -1904,7 +1935,7 @@ bail:
 int
 zfs_end_fs(zfsvfs_t *zfsvfs, dsl_dataset_t *ds)
 {
-	ASSERT(RRM_WRITE_HELD(&zfsvfs->z_teardown_lock));
+	ASSERT(ZFS_TEARDOWN_WRITE_HELD(zfsvfs));
 	ASSERT(RW_WRITE_HELD(&zfsvfs->z_teardown_inactive_lock));
 
 	/*
@@ -1922,7 +1953,7 @@ zfs_end_fs(zfsvfs_t *zfsvfs, dsl_dataset_t *ds)
 
 	/* release the VOPs */
 	rw_exit(&zfsvfs->z_teardown_inactive_lock);
-	rrm_exit(&zfsvfs->z_teardown_lock, FTAG);
+	ZFS_TEARDOWN_EXIT(zfsvfs, FTAG);
 
 	/*
 	 * Try to force unmount this file system.
@@ -2124,6 +2155,16 @@ zfs_get_vfs_flag_unmounted(objset_t *os)
 	mutex_exit(&os->os_user_ptr_lock);
 
 	return (unmounted);
+}
+
+void
+zfsvfs_update_fromname(const char *oldname, const char *newname)
+{
+	/*
+	 * We don't need to do anything here, the devname is always current by
+	 * virtue of zfsvfs->z_sb->s_op->show_devname.
+	 */
+	(void) oldname, (void) newname;
 }
 
 void

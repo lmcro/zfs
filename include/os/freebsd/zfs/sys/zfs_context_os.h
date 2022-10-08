@@ -37,14 +37,16 @@
 #include <sys/kdb.h>
 #include <sys/pathname.h>
 #include <sys/conf.h>
+#include <sys/types.h>
+#include <sys/ccompat.h>
+#include <linux/types.h>
 
-#define	cv_wait_io(cv, mp)			cv_wait(cv, mp)
-#define	cv_wait_io_sig(cv, mp)			cv_wait_sig(cv, mp)
-
-#define	cond_resched()		kern_yield(PRI_USER)
+#if KSTACK_PAGES * PAGE_SIZE >= 16384
+#define	HAVE_LARGE_STACKS	1
+#endif
 
 #define	taskq_create_sysdc(a, b, d, e, p, dc, f) \
-	    (taskq_create(a, b, maxclsyspri, d, e, f))
+	    ((void) sizeof (dc), taskq_create(a, b, maxclsyspri, d, e, f))
 
 #define	tsd_create(keyp, destructor)    do {                 \
 		*(keyp) = osd_thread_register((destructor));         \
@@ -56,7 +58,6 @@
 #define	tsd_set(key, value)	osd_thread_set(curthread, (key), (value))
 #define	fm_panic	panic
 
-#define	cond_resched()		kern_yield(PRI_USER)
 extern int zfs_debug_level;
 extern struct mtx zfs_debug_mtx;
 #define	ZFS_LOG(lvl, ...) do {   \
@@ -72,7 +73,7 @@ extern struct mtx zfs_debug_mtx;
 	}	   \
 } while (0)
 
-#define	MSEC_TO_TICK(msec)	((msec) / (MILLISEC / hz))
+#define	MSEC_TO_TICK(msec)	(howmany((hrtime_t)(msec) * hz, MILLISEC))
 extern int hz;
 extern int tick;
 typedef int fstrans_cookie_t;
@@ -81,12 +82,7 @@ typedef int fstrans_cookie_t;
 #define	signal_pending(x) SIGPENDING(x)
 #define	current curthread
 #define	thread_join(x)
-#define	cv_wait_io(cv, mp)			cv_wait(cv, mp)
 typedef struct opensolaris_utsname	utsname_t;
 extern utsname_t *utsname(void);
-extern int spa_import_rootpool(const char *name);
-#else
-#if BYTE_ORDER != BIG_ENDIAN
-#undef _BIG_ENDIAN
-#endif
+extern int spa_import_rootpool(const char *name, bool checkpointrewind);
 #endif

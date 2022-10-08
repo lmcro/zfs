@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -29,14 +29,12 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
-#include <strings.h>
 #include <unistd.h>
 #include <uuid/uuid.h>
 #include <zlib.h>
 #include <libintl.h>
 #include <sys/types.h>
 #include <sys/dkio.h>
-#include <sys/vtoc.h>
 #include <sys/mhd.h>
 #include <sys/param.h>
 #include <sys/dktp/fdisk.h>
@@ -44,6 +42,7 @@
 #include <sys/byteorder.h>
 #include <sys/vdev_disk.h>
 #include <linux/fs.h>
+#include <linux/blkpg.h>
 
 static struct uuid_to_ptag {
 	struct uuid	uuid;
@@ -139,40 +138,6 @@ static struct uuid_to_ptag {
 	{ EFI_FREEDESKTOP_BOOT }
 };
 
-/*
- * Default vtoc information for non-SVr4 partitions
- */
-struct dk_map2  default_vtoc_map[NDKMAP] = {
-	{	V_ROOT,		0	},		/* a - 0 */
-	{	V_SWAP,		V_UNMNT	},		/* b - 1 */
-	{	V_BACKUP,	V_UNMNT	},		/* c - 2 */
-	{	V_UNASSIGNED,	0	},		/* d - 3 */
-	{	V_UNASSIGNED,	0	},		/* e - 4 */
-	{	V_UNASSIGNED,	0	},		/* f - 5 */
-	{	V_USR,		0	},		/* g - 6 */
-	{	V_UNASSIGNED,	0	},		/* h - 7 */
-
-#if defined(_SUNOS_VTOC_16)
-
-#if defined(i386) || defined(__amd64) || defined(__arm) || \
-    defined(__powerpc) || defined(__sparc) || defined(__s390__) || \
-    defined(__mips__) || defined(__rv64g__)
-	{	V_BOOT,		V_UNMNT	},		/* i - 8 */
-	{	V_ALTSCTR,	0	},		/* j - 9 */
-
-#else
-#error No VTOC format defined.
-#endif			/* defined(i386) */
-
-	{	V_UNASSIGNED,	0	},		/* k - 10 */
-	{	V_UNASSIGNED,	0	},		/* l - 11 */
-	{	V_UNASSIGNED,	0	},		/* m - 12 */
-	{	V_UNASSIGNED,	0	},		/* n - 13 */
-	{	V_UNASSIGNED,	0	},		/* o - 14 */
-	{	V_UNASSIGNED,	0	},		/* p - 15 */
-#endif			/* defined(_SUNOS_VTOC_16) */
-};
-
 int efi_debug = 0;
 
 static int efi_read(int, struct dk_gpt *);
@@ -209,18 +174,32 @@ read_disk_info(int fd, diskaddr_t *capacity, uint_t *lbsize)
 	return (0);
 }
 
+/*
+ * Return back the device name associated with the file descriptor. The
+ * caller is responsible for freeing the memory associated with the
+ * returned string.
+ */
+static char *
+efi_get_devname(int fd)
+{
+	char path[32];
+
+	/*
+	 * The libefi API only provides the open fd and not the file path.
+	 * To handle this realpath(3) is used to resolve the block device
+	 * name from /proc/self/fd/<fd>.
+	 */
+	(void) snprintf(path, sizeof (path), "/proc/self/fd/%d", fd);
+	return (realpath(path, NULL));
+}
+
 static int
 efi_get_info(int fd, struct dk_cinfo *dki_info)
 {
-	char *path;
 	char *dev_path;
 	int rval = 0;
 
 	memset(dki_info, 0, sizeof (*dki_info));
-
-	path = calloc(1, PATH_MAX);
-	if (path == NULL)
-		goto error;
 
 	/*
 	 * The simplest way to get the partition number under linux is
@@ -229,16 +208,10 @@ efi_get_info(int fd, struct dk_cinfo *dki_info)
 	 * populates /dev/ so it may be trusted.  The tricky bit here is
 	 * that the naming convention is based on the block device type.
 	 * So we need to take this in to account when parsing out the
-	 * partition information.  Another issue is that the libefi API
-	 * API only provides the open fd and not the file path.  To handle
-	 * this realpath(3) is used to resolve the block device name from
-	 * /proc/self/fd/<fd>.  Aside from the partition number we collect
+	 * partition information.  Aside from the partition number we collect
 	 * some additional device info.
 	 */
-	(void) sprintf(path, "/proc/self/fd/%d", fd);
-	dev_path = realpath(path, NULL);
-	free(path);
-
+	dev_path = efi_get_devname(fd);
 	if (dev_path == NULL)
 		goto error;
 
@@ -452,6 +425,7 @@ efi_alloc_and_read(int fd, struct dk_gpt **vtoc)
 		    (int) sizeof (struct dk_part) * (vptr->efi_nparts - 1);
 		nparts = vptr->efi_nparts;
 		if ((tmp = realloc(vptr, length)) == NULL) {
+			/* cppcheck-suppress doubleFree */
 			free(vptr);
 			*vtoc = NULL;
 			return (VT_ERROR);
@@ -881,7 +855,6 @@ efi_read(int fd, struct dk_gpt *vtoc)
 	}
 
 	for (i = 0; i < vtoc->efi_nparts; i++) {
-
 		UUID_LE_CONVERT(vtoc->efi_parts[i].p_guid,
 		    efi_parts[i].efi_gpe_PartitionTypeGUID);
 
@@ -889,7 +862,7 @@ efi_read(int fd, struct dk_gpt *vtoc)
 		    j < sizeof (conversion_array)
 		    / sizeof (struct uuid_to_ptag); j++) {
 
-			if (bcmp(&vtoc->efi_parts[i].p_guid,
+			if (memcmp(&vtoc->efi_parts[i].p_guid,
 			    &conversion_array[j].uuid,
 			    sizeof (struct uuid)) == 0) {
 				vtoc->efi_parts[i].p_tag = j;
@@ -944,18 +917,17 @@ write_pmbr(int fd, struct dk_gpt *vtoc)
 	/* LINTED -- always longlong aligned */
 	dk_ioc.dki_data = (efi_gpt_t *)buf;
 	if (efi_ioctl(fd, DKIOCGETEFI, &dk_ioc) == -1) {
-		(void) memcpy(&mb, buf, sizeof (mb));
-		bzero(&mb, sizeof (mb));
+		memset(&mb, 0, sizeof (mb));
 		mb.signature = LE_16(MBB_MAGIC);
 	} else {
 		(void) memcpy(&mb, buf, sizeof (mb));
 		if (mb.signature != LE_16(MBB_MAGIC)) {
-			bzero(&mb, sizeof (mb));
+			memset(&mb, 0, sizeof (mb));
 			mb.signature = LE_16(MBB_MAGIC);
 		}
 	}
 
-	bzero(&mb.parts, sizeof (mb.parts));
+	memset(&mb.parts, 0, sizeof (mb.parts));
 	cp = (uchar_t *)&mb.parts[0];
 	/* bootable or not */
 	*cp++ = 0;
@@ -1108,20 +1080,49 @@ check_input(struct dk_gpt *vtoc)
 	return (0);
 }
 
+static int
+call_blkpg_ioctl(int fd, int command, diskaddr_t start,
+    diskaddr_t size, uint_t pno)
+{
+	struct blkpg_ioctl_arg ioctl_arg;
+	struct blkpg_partition  linux_part;
+	memset(&linux_part, 0, sizeof (linux_part));
+
+	char *path = efi_get_devname(fd);
+	if (path == NULL) {
+		(void) fprintf(stderr, "failed to retrieve device name\n");
+		return (VT_EINVAL);
+	}
+
+	linux_part.start = start;
+	linux_part.length = size;
+	linux_part.pno = pno;
+	snprintf(linux_part.devname, BLKPG_DEVNAMELTH - 1, "%s%u", path, pno);
+	linux_part.devname[BLKPG_DEVNAMELTH - 1] = '\0';
+	free(path);
+
+	ioctl_arg.op = command;
+	ioctl_arg.flags = 0;
+	ioctl_arg.datalen = sizeof (struct blkpg_partition);
+	ioctl_arg.data = &linux_part;
+
+	return (ioctl(fd, BLKPG, &ioctl_arg));
+}
+
 /*
  * add all the unallocated space to the current label
  */
 int
 efi_use_whole_disk(int fd)
 {
-	struct dk_gpt		*efi_label = NULL;
-	int			rval;
-	int			i;
-	uint_t			resv_index = 0, data_index = 0;
-	diskaddr_t		resv_start = 0, data_start = 0;
-	diskaddr_t		data_size, limit, difference;
-	boolean_t		sync_needed = B_FALSE;
-	uint_t			nblocks;
+	struct dk_gpt *efi_label = NULL;
+	int rval;
+	int i;
+	uint_t resv_index = 0, data_index = 0;
+	diskaddr_t resv_start = 0, data_start = 0;
+	diskaddr_t data_size, limit, difference;
+	boolean_t sync_needed = B_FALSE;
+	uint_t nblocks;
 
 	rval = efi_alloc_and_read(fd, &efi_label);
 	if (rval < 0) {
@@ -1255,19 +1256,73 @@ efi_use_whole_disk(int fd)
 	efi_label->efi_parts[resv_index].p_start += difference;
 	efi_label->efi_last_u_lba = efi_label->efi_last_lba - nblocks;
 
-	rval = efi_write(fd, efi_label);
-	if (rval < 0) {
-		if (efi_debug) {
-			(void) fprintf(stderr,
-			    "efi_use_whole_disk:fail to write label, rval=%d\n",
-			    rval);
-		}
-		efi_free(efi_label);
-		return (rval);
+	/*
+	 * Rescanning the partition table in the kernel can result
+	 * in the device links to be removed (see comment in vdev_disk_open).
+	 * If BLKPG_RESIZE_PARTITION is available, then we can resize
+	 * the partition table online and avoid having to remove the device
+	 * links used by the pool. This provides a very deterministic
+	 * approach to resizing devices and does not require any
+	 * loops waiting for devices to reappear.
+	 */
+#ifdef BLKPG_RESIZE_PARTITION
+	/*
+	 * Delete the reserved partition since we're about to expand
+	 * the data partition and it would overlap with the reserved
+	 * partition.
+	 * NOTE: The starting index for the ioctl is 1 while for the
+	 * EFI partitions it's 0. For that reason we have to add one
+	 * whenever we make an ioctl call.
+	 */
+	rval = call_blkpg_ioctl(fd, BLKPG_DEL_PARTITION, 0, 0, resv_index + 1);
+	if (rval != 0)
+		goto out;
+
+	/*
+	 * Expand the data partition
+	 */
+	rval = call_blkpg_ioctl(fd, BLKPG_RESIZE_PARTITION,
+	    efi_label->efi_parts[data_index].p_start * efi_label->efi_lbasize,
+	    efi_label->efi_parts[data_index].p_size * efi_label->efi_lbasize,
+	    data_index + 1);
+	if (rval != 0) {
+		(void) fprintf(stderr, "Unable to resize data "
+		    "partition:  %d\n", rval);
+		/*
+		 * Since we failed to resize, we need to reset the start
+		 * of the reserve partition and re-create it.
+		 */
+		efi_label->efi_parts[resv_index].p_start -= difference;
 	}
 
+	/*
+	 * Re-add the reserved partition. If we've expanded the data partition
+	 * then we'll move the reserve partition to the end of the data
+	 * partition. Otherwise, we'll recreate the partition in its original
+	 * location. Note that we do this as best-effort and ignore any
+	 * errors that may arise here. This will ensure that we finish writing
+	 * the EFI label.
+	 */
+	(void) call_blkpg_ioctl(fd, BLKPG_ADD_PARTITION,
+	    efi_label->efi_parts[resv_index].p_start * efi_label->efi_lbasize,
+	    efi_label->efi_parts[resv_index].p_size * efi_label->efi_lbasize,
+	    resv_index + 1);
+#endif
+
+	/*
+	 * We're now ready to write the EFI label.
+	 */
+	if (rval == 0) {
+		rval = efi_write(fd, efi_label);
+		if (rval < 0 && efi_debug) {
+			(void) fprintf(stderr, "efi_use_whole_disk:fail "
+			    "to write label, rval=%d\n", rval);
+		}
+	}
+
+out:
 	efi_free(efi_label);
-	return (0);
+	return (rval);
 }
 
 /*
@@ -1396,8 +1451,8 @@ efi_write(int fd, struct dk_gpt *vtoc)
 			(void) uuid_generate((uchar_t *)
 			    &vtoc->efi_parts[i].p_uguid);
 		}
-		bcopy(&vtoc->efi_parts[i].p_uguid,
-		    &efi_parts[i].efi_gpe_UniquePartitionGUID,
+		memcpy(&efi_parts[i].efi_gpe_UniquePartitionGUID,
+		    &vtoc->efi_parts[i].p_uguid,
 		    sizeof (uuid_t));
 	}
 	efi->efi_gpt_PartitionEntryArrayCRC32 =
@@ -1480,33 +1535,6 @@ void
 efi_free(struct dk_gpt *ptr)
 {
 	free(ptr);
-}
-
-/*
- * Input: File descriptor
- * Output: 1 if disk has an EFI label, or > 2TB with no VTOC or legacy MBR.
- * Otherwise 0.
- */
-int
-efi_type(int fd)
-{
-#if 0
-	struct vtoc vtoc;
-	struct extvtoc extvtoc;
-
-	if (ioctl(fd, DKIOCGEXTVTOC, &extvtoc) == -1) {
-		if (errno == ENOTSUP)
-			return (1);
-		else if (errno == ENOTTY) {
-			if (ioctl(fd, DKIOCGVTOC, &vtoc) == -1)
-				if (errno == ENOTSUP)
-					return (1);
-		}
-	}
-	return (0);
-#else
-	return (ENOSYS);
-#endif
 }
 
 void
@@ -1598,58 +1626,4 @@ efi_err_check(struct dk_gpt *vtoc)
 		(void) fprintf(stderr,
 		    "no reserved partition found\n");
 	}
-}
-
-/*
- * We need to get information necessary to construct a *new* efi
- * label type
- */
-int
-efi_auto_sense(int fd, struct dk_gpt **vtoc)
-{
-
-	int	i;
-
-	/*
-	 * Now build the default partition table
-	 */
-	if (efi_alloc_and_init(fd, EFI_NUMPAR, vtoc) != 0) {
-		if (efi_debug) {
-			(void) fprintf(stderr, "efi_alloc_and_init failed.\n");
-		}
-		return (-1);
-	}
-
-	for (i = 0; i < MIN((*vtoc)->efi_nparts, V_NUMPAR); i++) {
-		(*vtoc)->efi_parts[i].p_tag = default_vtoc_map[i].p_tag;
-		(*vtoc)->efi_parts[i].p_flag = default_vtoc_map[i].p_flag;
-		(*vtoc)->efi_parts[i].p_start = 0;
-		(*vtoc)->efi_parts[i].p_size = 0;
-	}
-	/*
-	 * Make constants first
-	 * and variable partitions later
-	 */
-
-	/* root partition - s0 128 MB */
-	(*vtoc)->efi_parts[0].p_start = 34;
-	(*vtoc)->efi_parts[0].p_size = 262144;
-
-	/* partition - s1  128 MB */
-	(*vtoc)->efi_parts[1].p_start = 262178;
-	(*vtoc)->efi_parts[1].p_size = 262144;
-
-	/* partition -s2 is NOT the Backup disk */
-	(*vtoc)->efi_parts[2].p_tag = V_UNASSIGNED;
-
-	/* partition -s6 /usr partition - HOG */
-	(*vtoc)->efi_parts[6].p_start = 524322;
-	(*vtoc)->efi_parts[6].p_size = (*vtoc)->efi_last_u_lba - 524322
-	    - (1024 * 16);
-
-	/* efi reserved partition - s9 16K */
-	(*vtoc)->efi_parts[8].p_start = (*vtoc)->efi_last_u_lba - (1024 * 16);
-	(*vtoc)->efi_parts[8].p_size = (1024 * 16);
-	(*vtoc)->efi_parts[8].p_tag = V_RESERVED;
-	return (0);
 }

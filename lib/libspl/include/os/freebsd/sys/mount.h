@@ -7,7 +7,7 @@
  * with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -35,12 +35,8 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Some old glibc headers don't define BLKGETSIZE64
- * and we don't want to require the kernel headers
- */
 #if !defined(BLKGETSIZE64)
-#define	BLKGETSIZE64		_IOR(0x12, 114, size_t)
+#define	BLKGETSIZE64		DIOCGMEDIASIZE
 #endif
 
 /*

@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -22,8 +22,9 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright 2011 Nexenta Systems, Inc. All rights reserved.
- * Copyright (c) 2011, 2018 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2020 by Delphix. All rights reserved.
  * Copyright 2017 Joyent, Inc.
+ * Copyright (c) 2021, Colm Buckley <colm@tuatha.org>
  */
 
 #include <sys/spa.h>
@@ -31,7 +32,6 @@
 #include <sys/fm/fs/zfs.h>
 #include <sys/spa_impl.h>
 #include <sys/nvpair.h>
-#include <sys/uio.h>
 #include <sys/fs/zfs.h>
 #include <sys/vdev_impl.h>
 #include <sys/zfs_ioctl.h>
@@ -39,6 +39,7 @@
 #include <sys/sunddi.h>
 #include <sys/zfeature.h>
 #include <sys/zfs_file.h>
+#include <sys/zfs_context.h>
 #ifdef _KERNEL
 #include <sys/zone.h>
 #endif
@@ -66,8 +67,10 @@ static uint64_t spa_config_generation = 1;
  * This can be overridden in userland to preserve an alternate namespace for
  * userland pools when doing testing.
  */
-char *spa_config_path = ZPOOL_CACHE;
-int zfs_autoimport_disable = 1;
+char *spa_config_path = (char *)ZPOOL_CACHE;
+#ifdef _KERNEL
+static int zfs_autoimport_disable = B_TRUE;
+#endif
 
 /*
  * Called when the module is first loaded, this routine loads the configuration
@@ -100,6 +103,10 @@ spa_config_load(void)
 
 	err = zfs_file_open(pathname, O_RDONLY, 0, &fp);
 
+#ifdef __FreeBSD__
+	if (err)
+		err = zfs_file_open(ZPOOL_CACHE_BOOT, O_RDONLY, 0, &fp);
+#endif
 	kmem_free(pathname, MAXPATHLEN);
 
 	if (err)
@@ -233,7 +240,8 @@ spa_config_write(spa_config_dirent_t *dp, nvlist_t *nvl)
  * would be required.
  */
 void
-spa_write_cachefile(spa_t *target, boolean_t removing, boolean_t postsysevent)
+spa_write_cachefile(spa_t *target, boolean_t removing, boolean_t postsysevent,
+    boolean_t postblkidevent)
 {
 	spa_config_dirent_t *dp, *tdp;
 	nvlist_t *nvl;
@@ -310,8 +318,9 @@ spa_write_cachefile(spa_t *target, boolean_t removing, boolean_t postsysevent)
 		 * resource issues are resolved.
 		 */
 		if (target->spa_ccw_fail_time == 0) {
-			zfs_ereport_post(FM_EREPORT_ZFS_CONFIG_CACHE_WRITE,
-			    target, NULL, NULL, NULL, 0, 0);
+			(void) zfs_ereport_post(
+			    FM_EREPORT_ZFS_CONFIG_CACHE_WRITE,
+			    target, NULL, NULL, NULL, 0);
 		}
 		target->spa_ccw_fail_time = gethrtime();
 		spa_async_request(target, SPA_ASYNC_CONFIG_UPDATE);
@@ -338,6 +347,16 @@ spa_write_cachefile(spa_t *target, boolean_t removing, boolean_t postsysevent)
 
 	if (postsysevent)
 		spa_event_notify(target, NULL, NULL, ESC_ZFS_CONFIG_SYNC);
+
+	/*
+	 * Post udev event to sync blkid information if the pool is created
+	 * or a new vdev is added to the pool.
+	 */
+	if ((target->spa_root_vdev) && postblkidevent) {
+		vdev_post_kobj_evt(target->spa_root_vdev);
+		for (int i = 0; i < target->spa_l2cache.sav_count; i++)
+			vdev_post_kobj_evt(target->spa_l2cache.sav_vdevs[i]);
+	}
 }
 
 /*
@@ -441,6 +460,9 @@ spa_config_generate(spa_t *spa, vdev_t *vd, uint64_t txg, int getstats)
 	if (spa->spa_comment != NULL)
 		fnvlist_add_string(config, ZPOOL_CONFIG_COMMENT,
 		    spa->spa_comment);
+	if (spa->spa_compatibility != NULL)
+		fnvlist_add_string(config, ZPOOL_CONFIG_COMPATIBILITY,
+		    spa->spa_compatibility);
 
 	hostid = spa_get_hostid(spa);
 	if (hostid != 0)
@@ -589,6 +611,7 @@ spa_config_update(spa_t *spa, int what)
 	 */
 	if (!spa->spa_is_root) {
 		spa_write_cachefile(spa, B_FALSE,
+		    what != SPA_CONFIG_UPDATE_POOL,
 		    what != SPA_CONFIG_UPDATE_POOL);
 	}
 
@@ -602,7 +625,6 @@ EXPORT_SYMBOL(spa_config_set);
 EXPORT_SYMBOL(spa_config_generate);
 EXPORT_SYMBOL(spa_config_update);
 
-/* BEGIN CSTYLED */
 #ifdef __linux__
 /* string sysctls require a char array on FreeBSD */
 ZFS_MODULE_PARAM(zfs_spa, spa_, config_path, STRING, ZMOD_RD,
@@ -611,4 +633,3 @@ ZFS_MODULE_PARAM(zfs_spa, spa_, config_path, STRING, ZMOD_RD,
 
 ZFS_MODULE_PARAM(zfs, zfs_, autoimport_disable, INT, ZMOD_RW,
 	"Disable pool import at module load");
-/* END CSTYLED */

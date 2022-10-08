@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -54,6 +54,7 @@ dmu_tx_stats_t dmu_tx_stats = {
 	{ "dmu_tx_dirty_delay",		KSTAT_DATA_UINT64 },
 	{ "dmu_tx_dirty_over_max",	KSTAT_DATA_UINT64 },
 	{ "dmu_tx_dirty_frees_delay",	KSTAT_DATA_UINT64 },
+	{ "dmu_tx_wrlog_delay",		KSTAT_DATA_UINT64 },
 	{ "dmu_tx_quota",		KSTAT_DATA_UINT64 },
 };
 
@@ -218,7 +219,6 @@ dmu_tx_check_ioerr(zio_t *zio, dnode_t *dn, int level, uint64_t blkid)
 	return (err);
 }
 
-/* ARGSUSED */
 static void
 dmu_tx_count_write(dmu_tx_hold_t *txh, uint64_t off, uint64_t len)
 {
@@ -229,9 +229,6 @@ dmu_tx_count_write(dmu_tx_hold_t *txh, uint64_t off, uint64_t len)
 		return;
 
 	(void) zfs_refcount_add_many(&txh->txh_space_towrite, len, FTAG);
-
-	if (zfs_refcount_count(&txh->txh_space_towrite) > 2 * DMU_MAX_ACCESS)
-		err = SET_ERROR(EFBIG);
 
 	if (dn == NULL)
 		return;
@@ -616,7 +613,8 @@ dmu_tx_dirty_buf(dmu_tx_t *tx, dmu_buf_impl_t *db)
 			/* XXX txh_arg2 better not be zero... */
 
 			dprintf("found txh type %x beginblk=%llx endblk=%llx\n",
-			    txh->txh_type, beginblk, endblk);
+			    txh->txh_type, (u_longlong_t)beginblk,
+			    (u_longlong_t)endblk);
 
 			switch (txh->txh_type) {
 			case THT_WRITE:
@@ -684,8 +682,7 @@ dmu_tx_dirty_buf(dmu_tx_t *tx, dmu_buf_impl_t *db)
  * If we can't do 10 iops, something is wrong.  Let us go ahead
  * and hit zfs_dirty_data_max.
  */
-hrtime_t zfs_delay_max_ns = 100 * MICROSEC; /* 100 milliseconds */
-int zfs_delay_resolution_ns = 100 * 1000; /* 100 microseconds */
+static const hrtime_t zfs_delay_max_ns = 100 * MICROSEC; /* 100 milliseconds */
 
 /*
  * We delay transactions when we've determined that the backend storage
@@ -782,34 +779,49 @@ static void
 dmu_tx_delay(dmu_tx_t *tx, uint64_t dirty)
 {
 	dsl_pool_t *dp = tx->tx_pool;
-	uint64_t delay_min_bytes =
-	    zfs_dirty_data_max * zfs_delay_min_dirty_percent / 100;
-	hrtime_t wakeup, min_tx_time, now;
+	uint64_t delay_min_bytes, wrlog;
+	hrtime_t wakeup, tx_time = 0, now;
 
-	if (dirty <= delay_min_bytes)
+	/* Calculate minimum transaction time for the dirty data amount. */
+	delay_min_bytes =
+	    zfs_dirty_data_max * zfs_delay_min_dirty_percent / 100;
+	if (dirty > delay_min_bytes) {
+		/*
+		 * The caller has already waited until we are under the max.
+		 * We make them pass us the amount of dirty data so we don't
+		 * have to handle the case of it being >= the max, which
+		 * could cause a divide-by-zero if it's == the max.
+		 */
+		ASSERT3U(dirty, <, zfs_dirty_data_max);
+
+		tx_time = zfs_delay_scale * (dirty - delay_min_bytes) /
+		    (zfs_dirty_data_max - dirty);
+	}
+
+	/* Calculate minimum transaction time for the TX_WRITE log size. */
+	wrlog = aggsum_upper_bound(&dp->dp_wrlog_total);
+	delay_min_bytes =
+	    zfs_wrlog_data_max * zfs_delay_min_dirty_percent / 100;
+	if (wrlog >= zfs_wrlog_data_max) {
+		tx_time = zfs_delay_max_ns;
+	} else if (wrlog > delay_min_bytes) {
+		tx_time = MAX(zfs_delay_scale * (wrlog - delay_min_bytes) /
+		    (zfs_wrlog_data_max - wrlog), tx_time);
+	}
+
+	if (tx_time == 0)
 		return;
 
-	/*
-	 * The caller has already waited until we are under the max.
-	 * We make them pass us the amount of dirty data so we don't
-	 * have to handle the case of it being >= the max, which could
-	 * cause a divide-by-zero if it's == the max.
-	 */
-	ASSERT3U(dirty, <, zfs_dirty_data_max);
-
+	tx_time = MIN(tx_time, zfs_delay_max_ns);
 	now = gethrtime();
-	min_tx_time = zfs_delay_scale *
-	    (dirty - delay_min_bytes) / (zfs_dirty_data_max - dirty);
-	min_tx_time = MIN(min_tx_time, zfs_delay_max_ns);
-	if (now > tx->tx_start + min_tx_time)
+	if (now > tx->tx_start + tx_time)
 		return;
 
 	DTRACE_PROBE3(delay__mintime, dmu_tx_t *, tx, uint64_t, dirty,
-	    uint64_t, min_tx_time);
+	    uint64_t, tx_time);
 
 	mutex_enter(&dp->dp_lock);
-	wakeup = MAX(tx->tx_start + min_tx_time,
-	    dp->dp_last_wakeup + min_tx_time);
+	wakeup = MAX(tx->tx_start + tx_time, dp->dp_last_wakeup + tx_time);
 	dp->dp_last_wakeup = wakeup;
 	mutex_exit(&dp->dp_lock);
 
@@ -883,6 +895,13 @@ dmu_tx_try_assign(dmu_tx_t *tx, uint64_t txg_how)
 		    !(txg_how & TXG_WAIT))
 			return (SET_ERROR(EIO));
 
+		return (SET_ERROR(ERESTART));
+	}
+
+	if (!tx->tx_dirty_delayed &&
+	    dsl_pool_need_wrlog_delay(tx->tx_pool)) {
+		tx->tx_wait_dirty = B_TRUE;
+		DMU_TX_STAT_BUMP(dmu_tx_wrlog_delay);
 		return (SET_ERROR(ERESTART));
 	}
 
@@ -1015,6 +1034,22 @@ dmu_tx_unassign(dmu_tx_t *tx)
  * details on the throttle). This is used by the VFS operations, after
  * they have already called dmu_tx_wait() (though most likely on a
  * different tx).
+ *
+ * It is guaranteed that subsequent successful calls to dmu_tx_assign()
+ * will assign the tx to monotonically increasing txgs. Of course this is
+ * not strong monotonicity, because the same txg can be returned multiple
+ * times in a row. This guarantee holds both for subsequent calls from
+ * one thread and for multiple threads. For example, it is impossible to
+ * observe the following sequence of events:
+ *
+ *          Thread 1                            Thread 2
+ *
+ *     dmu_tx_assign(T1, ...)
+ *     1 <- dmu_tx_get_txg(T1)
+ *                                       dmu_tx_assign(T2, ...)
+ *                                       2 <- dmu_tx_get_txg(T2)
+ *     dmu_tx_assign(T3, ...)
+ *     1 <- dmu_tx_get_txg(T3)
  */
 int
 dmu_tx_assign(dmu_tx_t *tx, uint64_t txg_how)

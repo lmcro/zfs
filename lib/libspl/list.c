@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -232,6 +232,7 @@ list_link_init(list_node_t *ln)
 int
 list_link_active(list_node_t *ln)
 {
+	EQUIV(ln->next == NULL, ln->prev == NULL);
 	return (ln->next != NULL);
 }
 

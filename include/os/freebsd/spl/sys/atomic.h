@@ -29,6 +29,8 @@
 #ifndef _OPENSOLARIS_SYS_ATOMIC_H_
 #define	_OPENSOLARIS_SYS_ATOMIC_H_
 
+#ifndef _STANDALONE
+
 #include <sys/types.h>
 #include <machine/atomic.h>
 
@@ -55,7 +57,9 @@ extern uint64_t atomic_cas_64(volatile uint64_t *target, uint64_t cmp,
     uint64_t newval);
 #endif
 
-#define	membar_producer	atomic_thread_fence_rel
+#define	membar_consumer()		atomic_thread_fence_acq()
+#define	membar_producer()		atomic_thread_fence_rel()
+#define	membar_sync()			atomic_thread_fence_seq_cst()
 
 static __inline uint32_t
 atomic_add_32_nv(volatile uint32_t *target, int32_t delta)
@@ -178,5 +182,14 @@ atomic_cas_ptr(volatile void *target, void *cmp,  void *newval)
 	    (uint32_t)cmp, (uint32_t)newval));
 }
 #endif	/* !defined(COMPAT_32BIT) && defined(__LP64__) */
+
+#else /* _STANDALONE */
+/*
+ * sometimes atomic_add_64 is defined, sometimes not, but the
+ * following is always right for the boot loader.
+ */
+#undef atomic_add_64
+#define	atomic_add_64(ptr, val) *(ptr) += val
+#endif /* !_STANDALONE */
 
 #endif	/* !_OPENSOLARIS_SYS_ATOMIC_H_ */

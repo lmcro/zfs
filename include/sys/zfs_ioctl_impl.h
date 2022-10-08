@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -24,7 +24,7 @@
 #define	_ZFS_IOCTL_IMPL_H_
 
 extern kmutex_t zfsdev_state_lock;
-extern zfsdev_state_t *zfsdev_state_list;
+extern unsigned long zfs_max_nvlist_src_size;
 
 typedef int zfs_ioc_legacy_func_t(zfs_cmd_t *);
 typedef int zfs_ioc_func_t(const char *, nvlist_t *, nvlist_t *);
@@ -80,6 +80,8 @@ void zfs_ioctl_register(const char *, zfs_ioc_t, zfs_ioc_func_t *,
     zfs_secpolicy_func_t *, zfs_ioc_namecheck_t, zfs_ioc_poolcheck_t,
     boolean_t, boolean_t, const zfs_ioc_key_t *, size_t);
 
+uint64_t zfs_max_nvlist_src_size_os(void);
+void zfs_ioctl_update_mount_cache(const char *dsname);
 void zfs_ioctl_init_os(void);
 
 boolean_t zfs_vfs_held(zfsvfs_t *);
@@ -89,6 +91,10 @@ void zfs_vfs_rele(zfsvfs_t *);
 long zfsdev_ioctl_common(uint_t, zfs_cmd_t *, int);
 int zfsdev_attach(void);
 void zfsdev_detach(void);
+void zfsdev_private_set_state(void *, zfsdev_state_t *);
+zfsdev_state_t *zfsdev_private_get_state(void *);
+int zfsdev_state_init(void *);
+void zfsdev_state_destroy(void *);
 int zfs_kmod_init(void);
 void zfs_kmod_fini(void);
 

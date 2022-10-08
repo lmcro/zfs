@@ -21,7 +21,7 @@
 #define	_SYS_ZIO_CRYPT_H
 
 #include <sys/dmu.h>
-#include <sys/refcount.h>
+#include <sys/zfs_refcount.h>
 #if defined(__FreeBSD__) && defined(_KERNEL)
 #include <sys/freebsd_crypto.h>
 #else
@@ -67,10 +67,10 @@ typedef struct zio_crypt_info {
 	size_t ci_keylen;
 
 	/* human-readable name of the encryption algorithm */
-	char *ci_name;
+	const char *ci_name;
 } zio_crypt_info_t;
 
-extern zio_crypt_info_t zio_crypt_table[ZIO_CRYPT_FUNCTIONS];
+extern const zio_crypt_info_t zio_crypt_table[ZIO_CRYPT_FUNCTIONS];
 
 /* in memory representation of an unwrapped key that is loaded into memory */
 typedef struct zio_crypt_key {

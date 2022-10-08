@@ -115,8 +115,7 @@ function histo_populate_test_pool
 			    of=/${pool}/B_${this_rs}/file_${filenum} \
 			    bs=${this_rs} count=${thiscount} \
 			    iflag=fullblock 2>&1 | \
-			    egrep -v -e "records in" -e "records out" \
-				-e "bytes.*copied"
+			    grep -ve "records in" -e "records out" -e "bytes.*copied"
 			((filenum+=1))
 		done
 	done
@@ -128,7 +127,7 @@ function histo_populate_test_pool
 	# to the device.  This 'sync' command prevents that from 
 	# happening.
 	####################
-	log_must zpool sync ${pool}
+	sync_pool ${pool}
 }
 function histo_check_test_pool
 {
@@ -146,8 +145,6 @@ function histo_check_test_pool
 	typeset -i this_rs
 	typeset -i this_ri
 	typeset -i sum_filesizes=0
-	typeset dumped
-	typeset stripped
 
 	let histo_check_pool_size=$(get_pool_prop size ${pool})
 	if [[ ! ${histo_check_pool_size} =~ ${re_number} ]]; then
@@ -158,11 +155,9 @@ function histo_check_test_pool
 		log_fail "hctp: max_pool_record_size is not numeric ${max_pool_record_size}"
 	fi
 
-	dumped="${TEST_BASE_DIR}/${pool}_dump.txt"
 	stripped="${TEST_BASE_DIR}/${pool}_stripped.txt"
 
 	zdb -Pbbb ${pool} | \
-	    tee ${dumped} | \
 	    sed -e '1,/^block[ 	][ 	]*psize[ 	][ 	]*lsize.*$/d' \
 	    -e '/^size[ 	]*Count/d' -e '/^$/,$d' \
 	    > ${stripped}
@@ -209,11 +204,11 @@ function histo_check_test_pool
 	# 4096 blocksize count for asize.   For verification we stick
 	# to just lsize counts.
 	#
-	# The max_variance is hard-coded here at 10%.  testing so far
-	# has shown this to be in the range of 2%-8% so we leave a
-	# generous allowance... This might need changes in the future
+	# The max_variance is hard-coded here at 12% to leave us some
+	# margin.  Testing has shown this normally to be in the range
+	# of 2%-8%, but it may be as large as 11%.
 	###################
-	let max_variance=10
+	let max_variance=12
 	let fail_value=0
 	let error_count=0
 	log_note "Comparisons for ${pool}"
@@ -247,6 +242,8 @@ function histo_check_test_pool
 			fi
 		fi
 	done < ${stripped}
+	rm "${stripped}"
+
 	if [ ${fail_value} -gt 0 ]; then
 		if [ ${error_count} -eq 1 ]; then
 			log_note "hctp: There was ${error_count} error"

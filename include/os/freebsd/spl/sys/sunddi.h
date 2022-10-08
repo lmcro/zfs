@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -49,7 +48,6 @@ typedef int ddi_devid_t;
 #define	ddi_prop_free(x)				(void)0
 #define	ddi_root_node()					(void)0
 
-extern int ddi_strtoul(const char *, char **, int, unsigned long *);
 extern int ddi_strtol(const char *, char **, int, long *);
 extern int ddi_strtoull(const char *, char **, int, unsigned long long *);
 extern int ddi_strtoll(const char *, char **, int, long long *);

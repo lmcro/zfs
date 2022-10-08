@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -32,8 +32,15 @@
 extern "C" {
 #endif
 
-#ifdef __KERNEL__
-#include <sys/note.h>
+/*
+ * This code compiles in three different contexts. When __KERNEL__ is defined,
+ * the code uses "unix-like" kernel interfaces. When _STANDALONE is defined, the
+ * code is running in a reduced capacity environment of the boot loader which is
+ * generally a subset of both POSIX and kernel interfaces (with a few unique
+ * interfaces too). When neither are defined, it's in a userland POSIX or
+ * similar environment.
+ */
+#if defined(__KERNEL__) || defined(_STANDALONE)
 #include <sys/types.h>
 #include <sys/atomic.h>
 #include <sys/sysmacros.h>
@@ -43,12 +50,13 @@ extern "C" {
 #include <sys/kmem.h>
 #include <sys/kmem_cache.h>
 #include <sys/vmem.h>
+#include <sys/misc.h>
 #include <sys/taskq.h>
 #include <sys/param.h>
 #include <sys/disp.h>
 #include <sys/debug.h>
 #include <sys/random.h>
-#include <sys/strings.h>
+#include <sys/string.h>
 #include <sys/byteorder.h>
 #include <sys/list.h>
 #include <sys/time.h>
@@ -64,8 +72,9 @@ extern "C" {
 #include <sys/trace.h>
 #include <sys/procfs_list.h>
 #include <sys/mod.h>
+#include <sys/uio_impl.h>
 #include <sys/zfs_context_os.h>
-#else /* _KERNEL */
+#else /* _KERNEL || _STANDALONE */
 
 #define	_SYS_MUTEX_H
 #define	_SYS_RWLOCK_H
@@ -83,7 +92,6 @@ extern "C" {
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
-#include <strings.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <assert.h>
@@ -95,7 +103,6 @@ extern "C" {
 #include <ctype.h>
 #include <signal.h>
 #include <sys/mman.h>
-#include <sys/note.h>
 #include <sys/types.h>
 #include <sys/cred.h>
 #include <sys/sysmacros.h>
@@ -144,14 +151,16 @@ extern "C" {
 
 extern void dprintf_setup(int *argc, char **argv);
 
-extern void cmn_err(int, const char *, ...);
-extern void vcmn_err(int, const char *, va_list);
-extern void panic(const char *, ...)  __NORETURN;
-extern void vpanic(const char *, va_list)  __NORETURN;
+extern void cmn_err(int, const char *, ...)
+    __attribute__((format(printf, 2, 3)));
+extern void vcmn_err(int, const char *, va_list)
+    __attribute__((format(printf, 2, 0)));
+extern void panic(const char *, ...)
+    __attribute__((format(printf, 1, 2), noreturn));
+extern void vpanic(const char *, va_list)
+    __attribute__((format(printf, 1, 0), noreturn));
 
 #define	fm_panic	panic
-
-extern int aok;
 
 /*
  * DTrace SDT probes have different signatures in userland than they do in
@@ -215,9 +224,11 @@ typedef pthread_t	kthread_t;
 #define	TS_JOINABLE	0x00000004
 
 #define	curthread	((void *)(uintptr_t)pthread_self())
-#define	kpreempt(x)	yield()
 #define	getcomm()	"unknown"
 
+#define	thread_create_named(name, stk, stksize, func, arg, len, \
+    pp, state, pri)	\
+	zk_thread_create(func, arg, stksize, state)
 #define	thread_create(stk, stksize, func, arg, len, pp, state, pri)	\
 	zk_thread_create(func, arg, stksize, state)
 #define	thread_exit()	pthread_exit(NULL)
@@ -241,9 +252,11 @@ extern kthread_t *zk_thread_create(void (*func)(void *), void *arg,
 #define	issig(why)	(FALSE)
 #define	ISSIG(thr, why)	(FALSE)
 
+#define	KPREEMPT_SYNC		(-1)
+
+#define	kpreempt(x)		sched_yield()
 #define	kpreempt_disable()	((void)0)
 #define	kpreempt_enable()	((void)0)
-#define	cond_resched()		sched_yield()
 
 /*
  * Mutexes
@@ -322,10 +335,14 @@ extern void cv_signal(kcondvar_t *cv);
 extern void cv_broadcast(kcondvar_t *cv);
 
 #define	cv_timedwait_io(cv, mp, at)		cv_timedwait(cv, mp, at)
+#define	cv_timedwait_idle(cv, mp, at)		cv_timedwait(cv, mp, at)
 #define	cv_timedwait_sig(cv, mp, at)		cv_timedwait(cv, mp, at)
 #define	cv_wait_io(cv, mp)			cv_wait(cv, mp)
+#define	cv_wait_idle(cv, mp)			cv_wait(cv, mp)
 #define	cv_wait_io_sig(cv, mp)			cv_wait_sig(cv, mp)
 #define	cv_timedwait_sig_hires(cv, mp, t, r, f) \
+	cv_timedwait_hires(cv, mp, t, r, f)
+#define	cv_timedwait_idle_hires(cv, mp, t, r, f) \
 	cv_timedwait_hires(cv, mp, t, r, f)
 
 /*
@@ -335,6 +352,9 @@ extern void cv_broadcast(kcondvar_t *cv);
 #define	tsd_set(k, v) pthread_setspecific(k, v)
 #define	tsd_create(kp, d) pthread_key_create((pthread_key_t *)kp, d)
 #define	tsd_destroy(kp) /* nothing */
+#ifdef __FreeBSD__
+typedef off_t loff_t;
+#endif
 
 /*
  * kstat creation, installation and deletion
@@ -343,12 +363,6 @@ extern kstat_t *kstat_create(const char *, int,
     const char *, const char *, uchar_t, ulong_t, uchar_t);
 extern void kstat_install(kstat_t *);
 extern void kstat_delete(kstat_t *);
-extern void kstat_waitq_enter(kstat_io_t *);
-extern void kstat_waitq_exit(kstat_io_t *);
-extern void kstat_runq_enter(kstat_io_t *);
-extern void kstat_runq_exit(kstat_io_t *);
-extern void kstat_waitq_to_runq(kstat_io_t *);
-extern void kstat_runq_back_to_waitq(kstat_io_t *);
 extern void kstat_set_raw_ops(kstat_t *ksp,
     int (*headers)(char *buf, size_t size),
     int (*data)(char *buf, size_t size, void *data),
@@ -376,6 +390,7 @@ typedef struct procfs_list_node {
 } procfs_list_node_t;
 
 void procfs_list_install(const char *module,
+    const char *submodule,
     const char *name,
     mode_t mode,
     procfs_list_t *procfs_list,
@@ -396,8 +411,6 @@ void procfs_list_add(procfs_list_t *procfs_list, void *p);
 #define	KM_NOSLEEP		UMEM_DEFAULT
 #define	KM_NORMALPRI		0	/* not needed with UMEM_DEFAULT */
 #define	KMC_NODEBUG		UMC_NODEBUG
-#define	KMC_KMEM		0x0
-#define	KMC_VMEM		0x0
 #define	KMC_KVMEM		0x0
 #define	kmem_alloc(_s, _f)	umem_alloc(_s, _f)
 #define	kmem_zalloc(_s, _f)	umem_zalloc(_s, _f)
@@ -484,7 +497,7 @@ extern taskq_t	*taskq_create(const char *, int, pri_t, int, int, uint_t);
 #define	taskq_create_proc(a, b, c, d, e, p, f) \
 	    (taskq_create(a, b, c, d, e, f))
 #define	taskq_create_sysdc(a, b, d, e, p, dc, f) \
-	    (taskq_create(a, b, maxclsyspri, d, e, f))
+	    ((void) sizeof (dc), taskq_create(a, b, maxclsyspri, d, e, f))
 extern taskqid_t taskq_dispatch(taskq_t *, task_func_t, void *, uint_t);
 extern taskqid_t taskq_dispatch_delay(taskq_t *, task_func_t, void *, uint_t,
     clock_t);
@@ -594,9 +607,9 @@ typedef struct vsecattr {
 extern void delay(clock_t ticks);
 
 #define	SEC_TO_TICK(sec)	((sec) * hz)
-#define	MSEC_TO_TICK(msec)	((msec) / (MILLISEC / hz))
-#define	USEC_TO_TICK(usec)	((usec) / (MICROSEC / hz))
-#define	NSEC_TO_TICK(usec)	((usec) / (NANOSEC / hz))
+#define	MSEC_TO_TICK(msec)	(howmany((hrtime_t)(msec) * hz, MILLISEC))
+#define	USEC_TO_TICK(usec)	(howmany((hrtime_t)(usec) * hz, MICROSEC))
+#define	NSEC_TO_TICK(nsec)	(howmany((hrtime_t)(nsec) * hz, NANOSEC))
 
 #define	max_ncpus	64
 #define	boot_ncpus	(sysconf(_SC_NPROCESSORS_ONLN))
@@ -609,6 +622,7 @@ extern void delay(clock_t ticks);
 #define	defclsyspri	0
 
 #define	CPU_SEQID	((uintptr_t)pthread_self() & (max_ncpus - 1))
+#define	CPU_SEQID_UNSTABLE	CPU_SEQID
 
 #define	kcred		NULL
 #define	CRED()		NULL
@@ -619,13 +633,28 @@ extern void delay(clock_t ticks);
 #define	NN_NUMBUF_SZ	(6)
 
 extern uint64_t physmem;
-extern char *random_path;
-extern char *urandom_path;
+extern const char *random_path;
+extern const char *urandom_path;
 
 extern int highbit64(uint64_t i);
 extern int lowbit64(uint64_t i);
 extern int random_get_bytes(uint8_t *ptr, size_t len);
 extern int random_get_pseudo_bytes(uint8_t *ptr, size_t len);
+
+static __inline__ uint32_t
+random_in_range(uint32_t range)
+{
+	uint32_t r;
+
+	ASSERT(range != 0);
+
+	if (range == 1)
+		return (0);
+
+	(void) random_get_pseudo_bytes((uint8_t *)&r, sizeof (r));
+
+	return (r % range);
+}
 
 extern void kernel_init(int mode);
 extern void kernel_fini(void);
@@ -634,7 +663,7 @@ extern void random_fini(void);
 
 struct spa;
 extern void show_pool_stats(struct spa *);
-extern int set_global_var(char *arg);
+extern int set_global_var(char const *arg);
 
 typedef struct callb_cpr {
 	kmutex_t	*cc_lockp;
@@ -669,10 +698,6 @@ extern char *kmem_asprintf(const char *fmt, ...);
 /*
  * Hostname information
  */
-extern char hw_serial[];	/* for userland-emulated hostid access */
-extern int ddi_strtoul(const char *str, char **nptr, int base,
-    unsigned long *result);
-
 extern int ddi_strtoull(const char *str, char **nptr, int base,
     u_longlong_t *result);
 
@@ -742,9 +767,14 @@ extern void spl_fstrans_unmark(fstrans_cookie_t);
 extern int __spl_pf_fstrans_check(void);
 extern int kmem_cache_reap_active(void);
 
-#define	____cacheline_aligned
 
-#endif /* _KERNEL */
+/*
+ * Kernel modules
+ */
+#define	__init
+#define	__exit
+
+#endif  /* _KERNEL || _STANDALONE */
 
 #ifdef __cplusplus
 };

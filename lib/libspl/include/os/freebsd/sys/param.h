@@ -7,7 +7,7 @@
  * with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -45,8 +45,6 @@
  */
 #define	MAXNAMELEN	256
 
-#define	UID_NOBODY	60001		/* user ID no body */
-#define	GID_NOBODY	UID_NOBODY
 #define	UID_NOACCESS	60002		/* user ID no access */
 
 #define	MAXUID		UINT32_MAX	/* max user id */

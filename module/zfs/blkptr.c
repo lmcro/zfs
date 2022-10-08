@@ -58,7 +58,7 @@ encode_embedded_bp_compressed(blkptr_t *bp, void *data,
 	ASSERT3U(comp, >=, ZIO_COMPRESS_OFF);
 	ASSERT3U(comp, <, ZIO_COMPRESS_FUNCTIONS);
 
-	bzero(bp, sizeof (*bp));
+	memset(bp, 0, sizeof (*bp));
 	BP_SET_EMBEDDED(bp, B_TRUE);
 	BP_SET_COMPRESS(bp, comp);
 	BP_SET_BYTEORDER(bp, ZFS_HOST_BYTEORDER);
@@ -143,7 +143,7 @@ decode_embedded_bp(const blkptr_t *bp, void *buf, int buflen)
 		uint8_t dstbuf[BPE_PAYLOAD_SIZE];
 		decode_embedded_bp_compressed(bp, dstbuf);
 		VERIFY0(zio_decompress_data_buf(BP_GET_COMPRESS(bp),
-		    dstbuf, buf, psize, buflen));
+		    dstbuf, buf, psize, buflen, NULL));
 	} else {
 		ASSERT3U(lsize, ==, psize);
 		decode_embedded_bp_compressed(bp, buf);

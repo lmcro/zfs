@@ -1,4 +1,3 @@
-/* BEGIN CSTYLED */
 /*
 ** $Id: luaconf.h,v 1.176.1.2 2013/11/21 17:26:16 roberto Exp $
 ** Configuration file for Lua
@@ -368,11 +367,7 @@ extern int lcompat_hashnum(int64_t);
 @@ LUAL_BUFFERSIZE is the buffer size used by the lauxlib buffer system.
 ** CHANGE it if it uses too much C-stack space.
 */
-#ifdef __linux__
 #define LUAL_BUFFERSIZE		512
-#else
-#define LUAL_BUFFERSIZE		1024
-#endif
 
 
 /*
@@ -559,4 +554,3 @@ extern int lcompat_hashnum(int64_t);
 #endif
 
 #endif
-/* END CSTYLED */

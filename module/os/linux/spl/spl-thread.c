@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -63,15 +62,6 @@ thread_generic_wrapper(void *arg)
 	return (0);
 }
 
-void
-__thread_exit(void)
-{
-	tsd_exit();
-	complete_and_exit(NULL, 0);
-	/* Unreachable */
-}
-EXPORT_SYMBOL(__thread_exit);
-
 /*
  * thread_create() may block forever if it cannot create a thread or
  * allocate memory.  This is preferable to returning a NULL which Solaris
@@ -102,7 +92,7 @@ __thread_create(caddr_t stk, size_t  stksize, thread_func_t func,
 		return (NULL);
 	}
 
-	strncpy(tp->tp_name, name, tp->tp_name_size);
+	strlcpy(tp->tp_name, name, tp->tp_name_size);
 
 	/*
 	 * Strip trailing "_thread" from passed name which will be the func
@@ -159,3 +149,59 @@ spl_kthread_create(int (*func)(void *), void *data, const char namefmt[], ...)
 	} while (1);
 }
 EXPORT_SYMBOL(spl_kthread_create);
+
+/*
+ * The "why" argument indicates the allowable side-effects of the call:
+ *
+ * FORREAL:  Extract the next pending signal from p_sig into p_cursig;
+ * stop the process if a stop has been requested or if a traced signal
+ * is pending.
+ *
+ * JUSTLOOKING:  Don't stop the process, just indicate whether or not
+ * a signal might be pending (FORREAL is needed to tell for sure).
+ */
+int
+issig(int why)
+{
+	ASSERT(why == FORREAL || why == JUSTLOOKING);
+
+	if (!signal_pending(current))
+		return (0);
+
+	if (why != FORREAL)
+		return (1);
+
+	struct task_struct *task = current;
+	spl_kernel_siginfo_t __info;
+	sigset_t set;
+	siginitsetinv(&set, 1ULL << (SIGSTOP - 1) | 1ULL << (SIGTSTP - 1));
+	sigorsets(&set, &task->blocked, &set);
+
+	spin_lock_irq(&task->sighand->siglock);
+	int ret;
+#ifdef HAVE_DEQUEUE_SIGNAL_4ARG
+	enum pid_type __type;
+	if ((ret = dequeue_signal(task, &set, &__info, &__type)) != 0) {
+#else
+	if ((ret = dequeue_signal(task, &set, &__info)) != 0) {
+#endif
+#ifdef HAVE_SIGNAL_STOP
+		spin_unlock_irq(&task->sighand->siglock);
+		kernel_signal_stop();
+#else
+		if (current->jobctl & JOBCTL_STOP_DEQUEUED)
+			spl_set_special_state(TASK_STOPPED);
+
+		spin_unlock_irq(&current->sighand->siglock);
+
+		schedule();
+#endif
+		return (0);
+	}
+
+	spin_unlock_irq(&task->sighand->siglock);
+
+	return (1);
+}
+
+EXPORT_SYMBOL(issig);

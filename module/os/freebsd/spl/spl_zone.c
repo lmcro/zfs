@@ -27,6 +27,7 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
+#include <sys/types.h>
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/systm.h>
@@ -183,7 +184,7 @@ zone_dataset_visible(const char *dataset, int *write)
 	LIST_FOREACH(zd, head, zd_next) {
 		len = strlen(zd->zd_dataset);
 		if (strlen(dataset) >= len &&
-		    bcmp(dataset, zd->zd_dataset, len) == 0 &&
+		    memcmp(dataset, zd->zd_dataset, len) == 0 &&
 		    (dataset[len] == '\0' || dataset[len] == '/' ||
 		    dataset[len] == '@')) {
 			if (write)
@@ -205,7 +206,7 @@ zone_dataset_visible(const char *dataset, int *write)
 		if (dataset[len - 1] == '/')
 			len--;	/* Ignore trailing slash */
 		if (len < strlen(zd->zd_dataset) &&
-		    bcmp(dataset, zd->zd_dataset, len) == 0 &&
+		    memcmp(dataset, zd->zd_dataset, len) == 0 &&
 		    zd->zd_dataset[len] == '/') {
 			if (write)
 				*write = 0;
@@ -239,12 +240,6 @@ zone_get_hostid(void *ptr)
 	KASSERT(ptr == NULL, ("only NULL pointer supported in %s", __func__));
 
 	return ((uint32_t)curthread->td_ucred->cr_prison->pr_hostid);
-}
-
-boolean_t
-in_globalzone(struct proc *p)
-{
-	return (!jailed(FIRST_THREAD_IN_PROC((p))->td_ucred));
 }
 
 static void

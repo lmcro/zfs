@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -21,6 +21,7 @@
 
 /*
  * Copyright (C) 2016 Gvozden Neskovic <neskovic@gmail.com>.
+ * Copyright (c) 2020 by Delphix. All rights reserved.
  */
 
 #ifndef _MOD_COMPAT_H
@@ -39,13 +40,13 @@ typedef struct kernel_param zfs_kernel_param_t;
 #define	ZMOD_RW 0644
 #define	ZMOD_RD 0444
 
-/* BEGIN CSTYLED */
 #define	INT int
+#define	LONG long
+/* BEGIN CSTYLED */
 #define	UINT uint
 #define	ULONG ulong
-#define	LONG long
-#define	STRING charp
 /* END CSTYLED */
+#define	STRING charp
 
 enum scope_prefix_types {
 	zfs,
@@ -71,7 +72,9 @@ enum scope_prefix_types {
 	zfs_txg,
 	zfs_vdev,
 	zfs_vdev_cache,
+	zfs_vdev_file,
 	zfs_vdev_mirror,
+	zfs_vnops,
 	zfs_zevent,
 	zfs_zio,
 	zfs_zil
@@ -80,7 +83,7 @@ enum scope_prefix_types {
 /*
  * Declare a module parameter / sysctl node
  *
- * "scope_prefix" the part of the the sysctl / sysfs tree the node resides under
+ * "scope_prefix" the part of the sysctl / sysfs tree the node resides under
  *   (currently a no-op on Linux)
  * "name_prefix" the part of the variable name that will be excluded from the
  *   exported names on platforms with a hierarchical namespace
@@ -105,12 +108,12 @@ enum scope_prefix_types {
  * on Linux:
  *   dmu_prefetch_max
  */
-/* BEGIN CSTYLED */
 #define	ZFS_MODULE_PARAM(scope_prefix, name_prefix, name, type, perm, desc) \
-	CTASSERT_GLOBAL((sizeof (scope_prefix) == sizeof (enum scope_prefix_types))); \
+	_Static_assert( \
+	    sizeof (scope_prefix) == sizeof (enum scope_prefix_types), \
+	    "" #scope_prefix " size mismatch with enum scope_prefix_types"); \
 	module_param(name_prefix ## name, type, perm); \
 	MODULE_PARM_DESC(name_prefix ## name, desc)
-/* END CSTYLED */
 
 /*
  * Declare a module parameter / sysctl node
@@ -134,18 +137,27 @@ enum scope_prefix_types {
  * on Linux:
  *   spa_slop_shift
  */
-/* BEGIN CSTYLED */
-#define	ZFS_MODULE_PARAM_CALL(scope_prefix, name_prefix, name, setfunc, getfunc, perm, desc) \
-	CTASSERT_GLOBAL((sizeof (scope_prefix) == sizeof (enum scope_prefix_types))); \
-	module_param_call(name_prefix ## name, setfunc, getfunc, &name_prefix ## name, perm); \
+#define	ZFS_MODULE_PARAM_CALL( \
+    scope_prefix, name_prefix, name, setfunc, getfunc, perm, desc) \
+	_Static_assert( \
+	    sizeof (scope_prefix) == sizeof (enum scope_prefix_types), \
+	    "" #scope_prefix " size mismatch with enum scope_prefix_types"); \
+	module_param_call(name_prefix ## name, setfunc, getfunc, \
+	    &name_prefix ## name, perm); \
 	MODULE_PARM_DESC(name_prefix ## name, desc)
-/* END CSTYLED */
+
+/*
+ * As above, but there is no variable with the name name_prefix ## name,
+ * so NULL is passed to module_param_call instead.
+ */
+#define	ZFS_MODULE_VIRTUAL_PARAM_CALL( \
+    scope_prefix, name_prefix, name, setfunc, getfunc, perm, desc) \
+	_Static_assert( \
+	    sizeof (scope_prefix) == sizeof (enum scope_prefix_types), \
+	    "" #scope_prefix " size mismatch with enum scope_prefix_types"); \
+	module_param_call(name_prefix ## name, setfunc, getfunc, NULL, perm); \
+	MODULE_PARM_DESC(name_prefix ## name, desc)
 
 #define	ZFS_MODULE_PARAM_ARGS	const char *buf, zfs_kernel_param_t *kp
-
-#define	ZFS_MODULE_DESCRIPTION(s) MODULE_DESCRIPTION(s)
-#define	ZFS_MODULE_AUTHOR(s) MODULE_AUTHOR(s)
-#define	ZFS_MODULE_LICENSE(s) MODULE_LICENSE(s)
-#define	ZFS_MODULE_VERSION(s) MODULE_VERSION(s)
 
 #endif	/* _MOD_COMPAT_H */

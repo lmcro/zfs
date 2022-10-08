@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -46,15 +46,6 @@ extern const struct inode_operations zpl_dir_inode_operations;
 extern const struct inode_operations zpl_symlink_inode_operations;
 extern const struct inode_operations zpl_special_inode_operations;
 extern dentry_operations_t zpl_dentry_operations;
-
-/* zpl_file.c */
-extern ssize_t zpl_read_common(struct inode *ip, const char *buf,
-    size_t len, loff_t *ppos, uio_seg_t segment, int flags,
-    cred_t *cr);
-extern ssize_t zpl_write_common(struct inode *ip, const char *buf,
-    size_t len, loff_t *ppos, uio_seg_t segment, int flags,
-    cred_t *cr);
-
 extern const struct address_space_operations zpl_address_space_operations;
 extern const struct file_operations zpl_file_operations;
 extern const struct file_operations zpl_dir_file_operations;
@@ -72,9 +63,18 @@ extern int zpl_xattr_security_init(struct inode *ip, struct inode *dip,
     const struct qstr *qstr);
 #if defined(CONFIG_FS_POSIX_ACL)
 #if defined(HAVE_SET_ACL)
+#if defined(HAVE_SET_ACL_USERNS)
+extern int zpl_set_acl(struct user_namespace *userns, struct inode *ip,
+    struct posix_acl *acl, int type);
+#else
 extern int zpl_set_acl(struct inode *ip, struct posix_acl *acl, int type);
+#endif /* HAVE_SET_ACL_USERNS */
 #endif /* HAVE_SET_ACL */
+#if defined(HAVE_GET_ACL_RCU)
+extern struct posix_acl *zpl_get_acl(struct inode *ip, int type, bool rcu);
+#elif defined(HAVE_GET_ACL)
 extern struct posix_acl *zpl_get_acl(struct inode *ip, int type);
+#endif
 extern int zpl_init_acl(struct inode *ip, struct inode *dir);
 extern int zpl_chmod_acl(struct inode *ip);
 #else
@@ -99,7 +99,6 @@ extern const struct inode_operations zpl_ops_root;
 
 extern const struct file_operations zpl_fops_snapdir;
 extern const struct inode_operations zpl_ops_snapdir;
-extern const struct dentry_operations zpl_dops_snapdirs;
 
 extern const struct file_operations zpl_fops_shares;
 extern const struct inode_operations zpl_ops_shares;
@@ -178,6 +177,24 @@ zpl_dir_emit_dots(struct file *file, zpl_dir_context_t *ctx)
 #else
 #define	zpl_inode_timestamp_truncate(ts, ip)	\
 	timespec_trunc(ts, (ip)->i_sb->s_time_gran)
+#endif
+
+#if defined(HAVE_INODE_OWNER_OR_CAPABLE)
+#define	zpl_inode_owner_or_capable(ns, ip)	inode_owner_or_capable(ip)
+#elif defined(HAVE_INODE_OWNER_OR_CAPABLE_IDMAPPED)
+#define	zpl_inode_owner_or_capable(ns, ip)	inode_owner_or_capable(ns, ip)
+#else
+#error "Unsupported kernel"
+#endif
+
+#ifdef HAVE_SETATTR_PREPARE_USERNS
+#define	zpl_setattr_prepare(ns, dentry, ia)	setattr_prepare(ns, dentry, ia)
+#else
+/*
+ * Use kernel-provided version, or our own from
+ * linux/vfs_compat.h
+ */
+#define	zpl_setattr_prepare(ns, dentry, ia)	setattr_prepare(dentry, ia)
 #endif
 
 #endif	/* _SYS_ZPL_H */

@@ -5,6 +5,8 @@
 #
 # Enable this by passing boot=zfs on the kernel command line.
 #
+# $quiet, $root, $rpool, $bootfs come from the cmdline:
+# shellcheck disable=SC2154
 
 # Source the common functions
 . /etc/zfs/zfs-functions
@@ -15,8 +17,8 @@
 # See "4.5 Disable root prompt on the initramfs" of Securing Debian Manual:
 # https://www.debian.org/doc/manuals/securing-debian-howto/ch4.en.html
 shell() {
-	if type panic > /dev/null 2>&1; then
-		panic $@
+	if command -v panic > /dev/null 2>&1; then
+		panic
 	else
 		/bin/sh
 	fi
@@ -26,22 +28,23 @@ shell() {
 # pools and mounting any filesystems.
 pre_mountroot()
 {
-	if type run_scripts > /dev/null 2>&1 && \
-	    [ -f "/scripts/local-top" -o -d "/scripts/local-top" ]
+	if command -v run_scripts > /dev/null 2>&1
 	then
-		[ "$quiet" != "y" ] && \
-		    zfs_log_begin_msg "Running /scripts/local-top"
-		run_scripts /scripts/local-top
-		[ "$quiet" != "y" ] && zfs_log_end_msg
-	fi
+		if [ -f "/scripts/local-top" ] || [ -d "/scripts/local-top" ]
+		then
+			[ "$quiet" != "y" ] && \
+			    zfs_log_begin_msg "Running /scripts/local-top"
+			run_scripts /scripts/local-top
+			[ "$quiet" != "y" ] && zfs_log_end_msg
+		fi
 
-	if type run_scripts > /dev/null 2>&1 && \
-	    [ -f "/scripts/local-premount" -o -d "/scripts/local-premount" ]
-	then
-		[ "$quiet" != "y" ] && \
-		    zfs_log_begin_msg "Running /scripts/local-premount"
-		run_scripts /scripts/local-premount
-		[ "$quiet" != "y" ] && zfs_log_end_msg
+	  if [ -f "/scripts/local-premount" ] || [ -d "/scripts/local-premount" ]
+	  then
+			[ "$quiet" != "y" ] && \
+			    zfs_log_begin_msg "Running /scripts/local-premount"
+			run_scripts /scripts/local-premount
+			[ "$quiet" != "y" ] && zfs_log_end_msg
+		fi
 	fi
 }
 
@@ -57,10 +60,10 @@ disable_plymouth()
 # Get a ZFS filesystem property value.
 get_fs_value()
 {
-	local fs="$1"
-	local value=$2
+	fs="$1"
+	value=$2
 
-	"${ZFS}" get -H -ovalue $value "$fs" 2> /dev/null
+	"${ZFS}" get -H -ovalue "$value" "$fs" 2> /dev/null
 }
 
 # Find the 'bootfs' property on pool $1.
@@ -68,7 +71,7 @@ get_fs_value()
 # pool by exporting it again.
 find_rootfs()
 {
-	local pool="$1"
+	pool="$1"
 
 	# If 'POOL_IMPORTED' isn't set, no pool imported and therefore
 	# we won't be able to find a root fs.
@@ -76,7 +79,9 @@ find_rootfs()
 
 	# If it's already specified, just keep it mounted and exit
 	# User (kernel command line) must be correct.
-	[ -n "${ZFS_BOOTFS}" ] && return 0
+	if [ -n "${ZFS_BOOTFS}" ] && [ "${ZFS_BOOTFS}" != "zfs:AUTO" ]; then
+		return 0
+	fi
 
 	# Not set, try to find it in the 'bootfs' property of the pool.
 	# NOTE: zpool does not support 'get -H -ovalue bootfs'...
@@ -84,7 +89,7 @@ find_rootfs()
 
 	# Make sure it's not '-' and that it starts with /.
 	if [ "${ZFS_BOOTFS}" != "-" ] && \
-		$(get_fs_value "${ZFS_BOOTFS}" mountpoint | grep -q '^/$')
+		get_fs_value "${ZFS_BOOTFS}" mountpoint | grep -q '^/$'
 	then
 		# Keep it mounted
 		POOL_IMPORTED=1
@@ -93,23 +98,17 @@ find_rootfs()
 
 	# Not boot fs here, export it and later try again..
 	"${ZPOOL}" export "$pool"
-	POOL_IMPORTED=""
-
+	POOL_IMPORTED=
+	ZFS_BOOTFS=
 	return 1
 }
 
 # Support function to get a list of all pools, separated with ';'
 find_pools()
 {
-	local CMD="$*"
-	local pools pool
-
-	pools=$($CMD 2> /dev/null | \
-		grep -E "pool:|^[a-zA-Z0-9]" | \
-		sed 's@.*: @@' | \
-		while read pool; do \
-		    echo -n "$pool;"
-		done)
+	pools=$("$@" 2> /dev/null | \
+		sed -Ee '/pool:|^[a-zA-Z0-9]/!d' -e 's@.*: @@' | \
+		tr '\n' ';')
 
 	echo "${pools%%;}" # Return without the last ';'.
 }
@@ -117,8 +116,6 @@ find_pools()
 # Get a list of all available pools
 get_pools()
 {
-	local available_pools npools
-
 	if [ -n "${ZFS_POOL_IMPORT}" ]; then
 		echo "$ZFS_POOL_IMPORT"
 		return 0
@@ -159,9 +156,8 @@ get_pools()
 	# Filter out any exceptions...
 	if [ -n "$ZFS_POOL_EXCEPTIONS" ]
 	then
-		local found=""
-		local apools=""
-		local pool exception
+		found=""
+		apools=""
 		OLD_IFS="$IFS" ; IFS=";"
 
 		for pool in $available_pools
@@ -194,8 +190,7 @@ get_pools()
 # Import given pool $1
 import_pool()
 {
-	local pool="$1"
-	local dirs dir
+	pool="$1"
 
 	# Verify that the pool isn't already imported
 	# Make as sure as we can to not require '-f' to import.
@@ -205,15 +200,15 @@ import_pool()
 	# to something we can use later with the real import(s). We want to
 	# make sure we find all by* dirs, BUT by-vdev should be first (if it
 	# exists).
-	if [ -n "$USE_DISK_BY_ID" -a -z "$ZPOOL_IMPORT_PATH" ]
+	if [ -n "$USE_DISK_BY_ID" ] && [ -z "$ZPOOL_IMPORT_PATH" ]
 	then
-		dirs="$(for dir in $(echo /dev/disk/by-*)
+		dirs="$(for dir in /dev/disk/by-*
 		do
 			# Ignore by-vdev here - we want it first!
 			echo "$dir" | grep -q /by-vdev && continue
 			[ ! -d "$dir" ] && continue
 
-			echo -n "$dir:"
+			printf "%s" "$dir:"
 		done | sed 's,:$,,g')"
 
 		if [ -d "/dev/disk/by-vdev" ]
@@ -277,7 +272,9 @@ import_pool()
 # with more logging etc.
 load_module_initrd()
 {
-	if [ "$ZFS_INITRD_PRE_MOUNTROOT_SLEEP" > 0 ]
+	[ -n "$ROOTDELAY" ] && ZFS_INITRD_PRE_MOUNTROOT_SLEEP="$ROOTDELAY"
+
+	if [ "$ZFS_INITRD_PRE_MOUNTROOT_SLEEP" -gt 0 ] 2>/dev/null
 	then
 		if [ "$quiet" != "y" ]; then
 			zfs_log_begin_msg "Sleeping for" \
@@ -288,9 +285,9 @@ load_module_initrd()
 	fi
 
 	# Wait for all of the /dev/{hd,sd}[a-z] device nodes to appear.
-	if type wait_for_udev > /dev/null 2>&1 ; then
+	if command -v wait_for_udev > /dev/null 2>&1 ; then
 		wait_for_udev 10
-	elif type wait_for_dev > /dev/null 2>&1 ; then
+	elif command -v wait_for_dev > /dev/null 2>&1 ; then
 		wait_for_dev
 	fi
 
@@ -300,7 +297,7 @@ load_module_initrd()
 	# Load the module
 	load_module "zfs" || return 1
 
-	if [ "$ZFS_INITRD_POST_MODPROBE_SLEEP" > 0 ]
+	if [ "$ZFS_INITRD_POST_MODPROBE_SLEEP" -gt 0 ] 2>/dev/null
 	then
 		if [ "$quiet" != "y" ]; then
 			zfs_log_begin_msg "Sleeping for" \
@@ -316,12 +313,10 @@ load_module_initrd()
 # Mount a given filesystem
 mount_fs()
 {
-	local fs="$1"
-	local mountpoint
+	fs="$1"
 
 	# Check that the filesystem exists
-	"${ZFS}" list -oname -tfilesystem -H "${fs}" > /dev/null 2>&1
-	[ "$?" -ne 0 ] && return 1
+	"${ZFS}" list -oname -tfilesystem -H "${fs}" > /dev/null 2>&1 ||  return 1
 
 	# Skip filesystems with canmount=off.  The root fs should not have
 	# canmount=off, but ignore it for backwards compatibility just in case.
@@ -333,14 +328,15 @@ mount_fs()
 
 	# Need the _original_ datasets mountpoint!
 	mountpoint=$(get_fs_value "$fs" mountpoint)
-	if [ "$mountpoint" = "legacy" -o "$mountpoint" = "none" ]; then
+	ZFS_CMD="mount.zfs -o zfsutil"
+	if [ "$mountpoint" = "legacy" ] || [ "$mountpoint" = "none" ]; then
 		# Can't use the mountpoint property. Might be one of our
 		# clones. Check the 'org.zol:mountpoint' property set in
 		# clone_snap() if that's usable.
 		mountpoint=$(get_fs_value "$fs" org.zol:mountpoint)
-		if [ "$mountpoint" = "legacy" -o \
-		    "$mountpoint" = "none" -o \
-		    "$mountpoint" = "-" ]
+		if [ "$mountpoint" = "legacy" ] ||
+		   [ "$mountpoint" = "none" ] ||
+		   [ "$mountpoint" = "-" ]
 		then
 			if [ "$fs" != "${ZFS_BOOTFS}" ]; then
 				# We don't have a proper mountpoint and this
@@ -352,15 +348,11 @@ mount_fs()
 			fi
 		fi
 
+		# If it's not a legacy filesystem, it can only be a
+		# native one...
 		if [ "$mountpoint" = "legacy" ]; then
-			ZFS_CMD="mount -t zfs"
-		else
-			# If it's not a legacy filesystem, it can only be a
-			# native one...
-			ZFS_CMD="mount -o zfsutil -t zfs"
+			ZFS_CMD="mount.zfs"
 		fi
-	else
-		ZFS_CMD="mount -o zfsutil -t zfs"
 	fi
 
 	# Possibly decrypt a filesystem using native encryption.
@@ -396,10 +388,10 @@ mount_fs()
 # Unlock a ZFS native encrypted filesystem.
 decrypt_fs()
 {
-	local fs="$1"
-	
+	fs="$1"
+
 	# If pool encryption is active and the zfs command understands '-o encryption'
-	if [ "$(zpool list -H -o feature@encryption $(echo "${fs}" | awk -F\/ '{print $1}'))" = 'active' ]; then
+	if [ "$(zpool list -H -o feature@encryption "${fs%%/*}")" = 'active' ]; then
 
 		# Determine dataset that holds key for root dataset
 		ENCRYPTIONROOT="$(get_fs_value "${fs}" encryptionroot)"
@@ -412,35 +404,32 @@ decrypt_fs()
 			KEYSTATUS="$(get_fs_value "${ENCRYPTIONROOT}" keystatus)"
 			# Continue only if the key needs to be loaded
 			[ "$KEYSTATUS" = "unavailable" ] || return 0
-			TRY_COUNT=3
 
-			# If key is stored in a file, do not prompt
+			# Do not prompt if key is stored noninteractively,
 			if ! [ "${KEYLOCATION}" = "prompt" ]; then
 				$ZFS load-key "${ENCRYPTIONROOT}"
 
 			# Prompt with plymouth, if active
-			elif [ -e /bin/plymouth ] && /bin/plymouth --ping 2>/dev/null; then
+			elif /bin/plymouth --ping 2>/dev/null; then
 				echo "plymouth" > /run/zfs_console_askpwd_cmd
-				while [ $TRY_COUNT -gt 0 ]; do
+				for _ in 1 2 3; do
 					plymouth ask-for-password --prompt "Encrypted ZFS password for ${ENCRYPTIONROOT}" | \
 						$ZFS load-key "${ENCRYPTIONROOT}" && break
-					TRY_COUNT=$((TRY_COUNT - 1))
 				done
 
-			# Prompt with systemd, if active 
+			# Prompt with systemd, if active
 			elif [ -e /run/systemd/system ]; then
 				echo "systemd-ask-password" > /run/zfs_console_askpwd_cmd
-				while [ $TRY_COUNT -gt 0 ]; do
-					systemd-ask-password "Encrypted ZFS password for ${ENCRYPTIONROOT}" --no-tty | \
+				for _ in 1 2 3; do
+					systemd-ask-password --no-tty "Encrypted ZFS password for ${ENCRYPTIONROOT}" | \
 						$ZFS load-key "${ENCRYPTIONROOT}" && break
-					TRY_COUNT=$((TRY_COUNT - 1))
 				done
 
 			# Prompt with ZFS tty, otherwise
 			else
 				# Temporarily setting "printk" to "7" allows the prompt to appear even when the "quiet" kernel option has been used
 				echo "load-key" > /run/zfs_console_askpwd_cmd
-				storeprintk="$(awk '{print $1}' /proc/sys/kernel/printk)"
+				read -r storeprintk _ < /proc/sys/kernel/printk
 				echo 7 > /proc/sys/kernel/printk
 				$ZFS load-key "${ENCRYPTIONROOT}"
 				echo "$storeprintk" > /proc/sys/kernel/printk
@@ -454,7 +443,7 @@ decrypt_fs()
 # Destroy a given filesystem.
 destroy_fs()
 {
-	local fs="$1"
+	fs="$1"
 
 	[ "$quiet" != "y" ] && \
 	    zfs_log_begin_msg "Destroying '$fs'"
@@ -489,9 +478,9 @@ destroy_fs()
 # mounted with a 'zfs mount -a' in the init/systemd scripts).
 clone_snap()
 {
-	local snap="$1"
-	local destfs="$2"
-	local mountpoint="$3"
+	snap="$1"
+	destfs="$2"
+	mountpoint="$3"
 
 	[ "$quiet" != "y" ] && zfs_log_begin_msg "Cloning '$snap' to '$destfs'"
 
@@ -529,7 +518,7 @@ clone_snap()
 # Rollback a given snapshot.
 rollback_snap()
 {
-	local snap="$1"
+	snap="$1"
 
 	[ "$quiet" != "y" ] && zfs_log_begin_msg "Rollback $snap"
 
@@ -559,9 +548,7 @@ rollback_snap()
 # to the user to choose from.
 ask_user_snap()
 {
-	local fs="$1"
-	local i=1
-	local SNAP snapnr snap debug
+	fs="$1"
 
 	# We need to temporarily disable debugging. Set 'debug' so we
 	# remember to enabled it again.
@@ -574,16 +561,25 @@ ask_user_snap()
 	# Because we need the resulting snapshot, which is sent on
 	# stdout to the caller, we use stderr for our questions.
 	echo "What snapshot do you want to boot from?" > /dev/stderr
-	while read snap; do
-	    echo "  $i: ${snap}" > /dev/stderr
-	    eval `echo SNAP_$i=$snap`
-	    i=$((i + 1))
-	done <<EOT
-$("${ZFS}" list -H -oname -tsnapshot -r "${fs}")
-EOT
+	# shellcheck disable=SC2046
+	IFS="
+" set -- $("${ZFS}" list -H -oname -tsnapshot -r "${fs}")
 
-	echo -n "  Snap nr [1-$((i-1))]? " > /dev/stderr
-	read snapnr
+	i=1
+	for snap in "$@"; do
+		echo "  $i: $snap"
+		i=$((i + 1))
+	done > /dev/stderr
+
+	# expr instead of test here because [ a -lt 0 ] errors out,
+	# but expr falls back to lexicographical, which works out right
+	snapnr=0
+	while expr "$snapnr" "<" 1 > /dev/null ||
+	    expr "$snapnr" ">" "$#" > /dev/null
+	do
+		printf "%s" "Snap nr [1-$#]? " > /dev/stderr
+		read -r snapnr
+	done
 
 	# Re-enable debugging.
 	if [ -n "${debug}" ]; then
@@ -591,16 +587,16 @@ EOT
 		set -x
 	fi
 
-	echo "$(eval echo "$"SNAP_$snapnr)"
+	eval echo '$'"$snapnr"
 }
 
 setup_snapshot_booting()
 {
-	local snap="$1"
-	local s destfs subfs mountpoint retval=0 filesystems fs
+	snap="$1"
+	retval=0
 
-	# Make sure that the snapshot specified actually exist.
-	if [ ! $(get_fs_value "${snap}" type) ]
+	# Make sure that the snapshot specified actually exists.
+	if [ -z "$(get_fs_value "${snap}" type)" ]
 	then
 		# Snapshot does not exist (...@<null> ?)
 		# ask the user for a snapshot to use.
@@ -617,7 +613,8 @@ setup_snapshot_booting()
 	then
 		# If the destination dataset for the clone
 		# already exists, destroy it. Recursively
-		if [ $(get_fs_value "${rootfs}_${snapname}" type) ]; then
+		if [ -n "$(get_fs_value "${rootfs}_${snapname}" type)" ]
+		then
 			filesystems=$("${ZFS}" list -oname -tfilesystem -H \
 			    -r -Sname "${ZFS_BOOTFS}")
 			for fs in $filesystems; do
@@ -635,6 +632,7 @@ setup_snapshot_booting()
 		then
 			# Rollback snapshot
 			rollback_snap "$s" || retval=$((retval + 1))
+			ZFS_BOOTFS="${rootfs}"
 		else
 			# Setup a destination filesystem name.
 			# Ex: Called with 'rpool/ROOT/debian@snap2'
@@ -652,8 +650,8 @@ setup_snapshot_booting()
 			# with clone_snap(). If legacy or none, then use
 			# the sub fs value.
 			mountpoint=$(get_fs_value "${s%%@*}" mountpoint)
-			if [ "$mountpoint" = "legacy" -o \
-			    "$mountpoint" = "none" ]
+			if [ "$mountpoint" = "legacy" ] || \
+			   [ "$mountpoint" = "none" ]
 			then
 				if [ -n "${subfs}" ]; then
 					mountpoint="${subfs}"
@@ -678,8 +676,6 @@ setup_snapshot_booting()
 # This is the main function.
 mountroot()
 {
-	local snaporig snapsub destfs pool POOLS
-
 	# ----------------------------------------------------------------
 	# I N I T I A L   S E T U P
 
@@ -713,7 +709,8 @@ mountroot()
 
 	# ------------
 	# Look for the cache file (if any).
-	[ ! -f ${ZPOOL_CACHE} ] && unset ZPOOL_CACHE
+	[ -f "${ZPOOL_CACHE}" ] || unset ZPOOL_CACHE
+	[ -s "${ZPOOL_CACHE}" ] || unset ZPOOL_CACHE
 
 	# ------------
 	# Compatibility: 'ROOT' is for Debian GNU/Linux (etc),
@@ -742,7 +739,7 @@ mountroot()
 	# No longer set in the defaults file, but it could have been set in
 	# get_pools() in some circumstances. If it's something, but not 'yes',
 	# it's no good to us.
-	[ -n "$USE_DISK_BY_ID" -a "$USE_DISK_BY_ID" != 'yes' ] && \
+	[ -n "$USE_DISK_BY_ID" ] && [ "$USE_DISK_BY_ID" != 'yes' ] && \
 	    unset USE_DISK_BY_ID
 
 	# ----------------------------------------------------------------
@@ -762,7 +759,7 @@ mountroot()
 	#	rpool=rpool			(default if none of the above is used)
 	#	root=<pool>/<dataset>		(uses this for rpool - first part)
 	#	root=ZFS=<pool>/<dataset>	(uses this for rpool - first part, without 'ZFS=')
-	#	root=zfs:AUTO			(tries to detect both pool and rootfs
+	#	root=zfs:AUTO			(tries to detect both pool and rootfs)
 	#	root=zfs:<pool>/<dataset>	(uses this for rpool - first part, without 'zfs:')
 	#
 	# Option <dataset> could also be <snapshot>
@@ -788,12 +785,12 @@ mountroot()
 	# ------------
 	# If we have 'ROOT' (see above), but not 'ZFS_BOOTFS', then use
 	# 'ROOT'
-	[ -n "$ROOT" -a -z "${ZFS_BOOTFS}" ] && ZFS_BOOTFS="$ROOT"
+	[ -n "$ROOT" ] && [ -z "${ZFS_BOOTFS}" ] && ZFS_BOOTFS="$ROOT"
 
 	# ------------
 	# Check for the `-B zfs-bootfs=%s/%u,...` kind of parameter.
 	# NOTE: Only use the pool name and dataset. The rest is not
-	#       supported by ZoL (whatever it's for).
+	#       supported by OpenZFS (whatever it's for).
 	if [ -z "$ZFS_RPOOL" ]
 	then
 		# The ${zfs-bootfs} variable is set at the kernel command
@@ -803,17 +800,18 @@ mountroot()
 		#
 		# Reassign the variable by dumping the environment and
 		# stripping the zfs-bootfs= prefix.  Let the shell handle
-		# quoting through the eval command.
+		# quoting through the eval command:
+		# shellcheck disable=SC2046
 		eval ZFS_RPOOL=$(set | sed -n -e 's,^zfs-bootfs=,,p')
 	fi
 
 	# ------------
 	# No root fs or pool specified - do auto detect.
-	if [ -z "$ZFS_RPOOL" -a -z "${ZFS_BOOTFS}" ]
+	if [ -z "$ZFS_RPOOL" ] && [ -z "${ZFS_BOOTFS}" ]
 	then
 		# Do auto detect. Do this by 'cheating' - set 'root=zfs:AUTO'
 		# which will be caught later
-		ROOT=zfs:AUTO
+		ROOT='zfs:AUTO'
 	fi
 
 	# ----------------------------------------------------------------
@@ -823,6 +821,11 @@ mountroot()
 	if [ "$ROOT" = "zfs:AUTO" ]
 	then
 		# Try to detect both pool and root fs.
+
+		# If we got here, that means we don't have a hint so as to
+		# the root dataset, but with root=zfs:AUTO on cmdline,
+		# this says "zfs:AUTO" here and interferes with checks later
+		ZFS_BOOTFS=
 
 		[ "$quiet" != "y" ] && \
 		    zfs_log_begin_msg "Attempting to import additional pools."
@@ -841,12 +844,12 @@ mountroot()
 		do
 			[ -z "$pool" ] && continue
 
-			import_pool "$pool"
-			find_rootfs "$pool"
+			IFS="$OLD_IFS" import_pool "$pool"
+			IFS="$OLD_IFS" find_rootfs "$pool" && break
 		done
 		IFS="$OLD_IFS"
 
-		[ "$quiet" != "y" ] && zfs_log_end_msg $ZFS_ERROR
+		[ "$quiet" != "y" ] && zfs_log_end_msg "$ZFS_ERROR"
 	else
 		# No auto - use value from the command line option.
 
@@ -858,7 +861,7 @@ mountroot()
 	fi
 
 	# Import the pool (if not already done so in the AUTO check above).
-	if [ -n "$ZFS_RPOOL" -a -z "${POOL_IMPORTED}" ]
+	if [ -n "$ZFS_RPOOL" ] && [ -z "${POOL_IMPORTED}" ]
 	then
 		[ "$quiet" != "y" ] && \
 		    zfs_log_begin_msg "Importing ZFS root pool '$ZFS_RPOOL'"
@@ -880,7 +883,7 @@ mountroot()
 		echo ""
 		echo "No pool imported. Manually import the root pool"
 		echo "at the command prompt and then exit."
-		echo "Hint: Try:  zpool import -R ${rootmnt} -N ${ZFS_RPOOL}"
+		echo "Hint: Try:  zpool import -N ${ZFS_RPOOL}"
 		shell
 	fi
 
@@ -893,30 +896,6 @@ mountroot()
 			sed -e "s/$("${ZPOOL}" get guid -o value "$pool" -H)/$pool/g")
 		ZFS_RPOOL="${pool}"
 	fi
-
-	# Set the no-op scheduler on the disks containing the vdevs of
-	# the root pool. For single-queue devices, this scheduler is
-	# "noop", for multi-queue devices, it is "none".
-	# ZFS already does this for wholedisk vdevs (for all pools), so this
-	# is only important for partitions.
-	"${ZPOOL}" status -L "${ZFS_RPOOL}" 2> /dev/null |
-	    awk '/^\t / && !/(mirror|raidz)/ {
-	        dev=$1;
-	        sub(/[0-9]+$/, "", dev);
-	        print dev
-	    }' |
-	while read -r i
-	do
-		SCHEDULER=/sys/block/$i/queue/scheduler
-		if [ -e "${SCHEDULER}" ]
-		then
-			# Query to see what schedulers are available
-			case "$(cat "${SCHEDULER}")" in
-				*noop*) echo noop > "${SCHEDULER}" ;;
-				*none*) echo none > "${SCHEDULER}" ;;
-			esac
-		fi
-	done
 
 
 	# ----------------------------------------------------------------
@@ -940,7 +919,7 @@ mountroot()
 		echo "       not specified on the kernel command line."
 		echo ""
 		echo "Manually mount the root filesystem on $rootmnt and then exit."
-		echo "Hint: Try:  mount -o zfsutil -t zfs ${ZFS_RPOOL-rpool}/ROOT/system $rootmnt"
+		echo "Hint: Try:  mount.zfs -o zfsutil ${ZFS_RPOOL-rpool}/ROOT/system $rootmnt"
 		shell
 	fi
 
@@ -963,15 +942,20 @@ mountroot()
 
 	# Go through the complete list (recursively) of all filesystems below
 	# the real root dataset
-	filesystems=$("${ZFS}" list -oname -tfilesystem -H -r "${ZFS_BOOTFS}")
-	for fs in $filesystems $ZFS_INITRD_ADDITIONAL_DATASETS
-	do
+	filesystems="$("${ZFS}" list -oname -tfilesystem -H -r "${ZFS_BOOTFS}")"
+	OLD_IFS="$IFS" ; IFS="
+"
+	for fs in $filesystems; do
+		IFS="$OLD_IFS" mount_fs "$fs"
+	done
+	IFS="$OLD_IFS"
+	for fs in $ZFS_INITRD_ADDITIONAL_DATASETS; do
 		mount_fs "$fs"
 	done
 
 	touch /run/zfs_unlock_complete
 	if [ -e /run/zfs_unlock_complete_notify ]; then
-		read zfs_unlock_complete_notify < /run/zfs_unlock_complete_notify
+		read -r < /run/zfs_unlock_complete_notify
 	fi
 
 	# ------------
@@ -989,8 +973,8 @@ mountroot()
 		echo
 
 		echo "=> waiting for ENTER before continuing because of 'zfsdebug=1'. "
-		echo -n "   'c' for shell, 'r' for reboot, 'ENTER' to continue. "
-		read b
+		printf "%s" "   'c' for shell, 'r' for reboot, 'ENTER' to continue. "
+		read -r b
 
 		[ "$b" = "c" ] && /bin/sh
 		[ "$b" = "r" ] && reboot -f
@@ -1000,12 +984,14 @@ mountroot()
 
 	# ------------
 	# Run local bottom script
-	if type run_scripts > /dev/null 2>&1 && \
-	    [ -f "/scripts/local-bottom" -o -d "/scripts/local-bottom" ]
+	if command -v run_scripts > /dev/null 2>&1
 	then
-		[ "$quiet" != "y" ] && \
-		    zfs_log_begin_msg "Running /scripts/local-bottom"
-		run_scripts /scripts/local-bottom
-		[ "$quiet" != "y" ] && zfs_log_end_msg
+		if [ -f "/scripts/local-bottom" ] || [ -d "/scripts/local-bottom" ]
+		then
+			[ "$quiet" != "y" ] && \
+			    zfs_log_begin_msg "Running /scripts/local-bottom"
+			run_scripts /scripts/local-bottom
+			[ "$quiet" != "y" ] && zfs_log_end_msg
+		fi
 	fi
 }

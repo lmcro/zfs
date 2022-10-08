@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -25,7 +24,11 @@
 #ifndef _SPL_CMN_ERR_H
 #define	_SPL_CMN_ERR_H
 
+#if defined(_KERNEL) && defined(HAVE_STANDALONE_LINUX_STDARG)
+#include <linux/stdarg.h>
+#else
 #include <stdarg.h>
+#endif
 
 #define	CE_CONT		0 /* continuation */
 #define	CE_NOTE		1 /* notice */
@@ -33,9 +36,12 @@
 #define	CE_PANIC	3 /* panic */
 #define	CE_IGNORE	4 /* print nothing */
 
-extern void cmn_err(int, const char *, ...);
-extern void vcmn_err(int, const char *, va_list);
-extern void vpanic(const char *, va_list);
+extern void cmn_err(int, const char *, ...)
+    __attribute__((format(printf, 2, 3)));
+extern void vcmn_err(int, const char *, va_list)
+    __attribute__((format(printf, 2, 0)));
+extern void vpanic(const char *, va_list)
+    __attribute__((format(printf, 1, 0), __noreturn__));
 
 #define	fm_panic	panic
 

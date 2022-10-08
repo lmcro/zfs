@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -21,9 +21,11 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
- * Copyright (c) 2012, 2019 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2020 by Delphix. All rights reserved.
  * Copyright (c) 2013 by Saso Kiselkov. All rights reserved.
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
+ * Copyright (c) 2019, Klara Inc.
+ * Copyright (c) 2019, Allan Jude
  */
 
 #include <sys/zfs_context.h>
@@ -50,8 +52,10 @@
 #include <sys/vdev.h>
 #include <cityhash.h>
 #include <sys/spa_impl.h>
+#include <sys/wmsum.h>
+#include <sys/vdev_impl.h>
 
-kstat_t *dbuf_ksp;
+static kstat_t *dbuf_ksp;
 
 typedef struct dbuf_stats {
 	/*
@@ -96,6 +100,11 @@ typedef struct dbuf_stats {
 	 */
 	kstat_named_t hash_insert_race;
 	/*
+	 * Number of entries in the hash table dbuf and mutex arrays.
+	 */
+	kstat_named_t hash_table_count;
+	kstat_named_t hash_mutex_count;
+	/*
 	 * Statistics about the size of the metadata dbuf cache.
 	 */
 	kstat_named_t metadata_cache_count;
@@ -127,14 +136,30 @@ dbuf_stats_t dbuf_stats = {
 	{ "hash_chains",			KSTAT_DATA_UINT64 },
 	{ "hash_chain_max",			KSTAT_DATA_UINT64 },
 	{ "hash_insert_race",			KSTAT_DATA_UINT64 },
+	{ "hash_table_count",			KSTAT_DATA_UINT64 },
+	{ "hash_mutex_count",			KSTAT_DATA_UINT64 },
 	{ "metadata_cache_count",		KSTAT_DATA_UINT64 },
 	{ "metadata_cache_size_bytes",		KSTAT_DATA_UINT64 },
 	{ "metadata_cache_size_bytes_max",	KSTAT_DATA_UINT64 },
 	{ "metadata_cache_overflow",		KSTAT_DATA_UINT64 }
 };
 
+struct {
+	wmsum_t cache_count;
+	wmsum_t cache_total_evicts;
+	wmsum_t cache_levels[DN_MAX_LEVELS];
+	wmsum_t cache_levels_bytes[DN_MAX_LEVELS];
+	wmsum_t hash_hits;
+	wmsum_t hash_misses;
+	wmsum_t hash_collisions;
+	wmsum_t hash_chains;
+	wmsum_t hash_insert_race;
+	wmsum_t metadata_cache_count;
+	wmsum_t metadata_cache_overflow;
+} dbuf_sums;
+
 #define	DBUF_STAT_INCR(stat, val)	\
-	atomic_add_64(&dbuf_stats.stat.value.ui64, (val));
+	wmsum_add(&dbuf_sums.stat, val);
 #define	DBUF_STAT_DECR(stat, val)	\
 	DBUF_STAT_INCR(stat, -(val));
 #define	DBUF_STAT_BUMP(stat)		\
@@ -152,11 +177,6 @@ static boolean_t dbuf_undirty(dmu_buf_impl_t *db, dmu_tx_t *tx);
 static void dbuf_write(dbuf_dirty_record_t *dr, arc_buf_t *data, dmu_tx_t *tx);
 static void dbuf_sync_leaf_verify_bonus_dnode(dbuf_dirty_record_t *dr);
 static int dbuf_read_verify_dnode_crypt(dmu_buf_impl_t *db, uint32_t flags);
-
-extern inline void dmu_buf_init_user(dmu_buf_user_t *dbu,
-    dmu_buf_evict_func_t *evict_func_sync,
-    dmu_buf_evict_func_t *evict_func_async,
-    dmu_buf_t **clear_on_evict_dbufp);
 
 /*
  * Global data structures and functions for the dbuf cache.
@@ -201,17 +221,24 @@ static boolean_t dbuf_evict_thread_exit;
  * by those caches' matching enum values (from dbuf_cached_state_t).
  */
 typedef struct dbuf_cache {
-	multilist_t *cache;
-	zfs_refcount_t size;
+	multilist_t cache;
+	zfs_refcount_t size ____cacheline_aligned;
 } dbuf_cache_t;
 dbuf_cache_t dbuf_caches[DB_CACHE_MAX];
 
 /* Size limits for the caches */
-unsigned long dbuf_cache_max_bytes = 0;
-unsigned long dbuf_metadata_cache_max_bytes = 0;
+static unsigned long dbuf_cache_max_bytes = ULONG_MAX;
+static unsigned long dbuf_metadata_cache_max_bytes = ULONG_MAX;
+
 /* Set the default sizes of the caches to log2 fraction of arc size */
-int dbuf_cache_shift = 5;
-int dbuf_metadata_cache_shift = 6;
+static uint_t dbuf_cache_shift = 5;
+static uint_t dbuf_metadata_cache_shift = 6;
+
+/* Set the dbuf hash mutex count as log2 shift (dynamic by default) */
+static uint_t dbuf_mutex_cache_shift = 0;
+
+static unsigned long dbuf_cache_target_bytes(void);
+static unsigned long dbuf_metadata_cache_target_bytes(void);
 
 /*
  * The LRU dbuf cache uses a three-stage eviction policy:
@@ -255,15 +282,15 @@ int dbuf_metadata_cache_shift = 6;
 /*
  * The percentage above and below the maximum cache size.
  */
-uint_t dbuf_cache_hiwater_pct = 10;
-uint_t dbuf_cache_lowater_pct = 10;
+static uint_t dbuf_cache_hiwater_pct = 10;
+static uint_t dbuf_cache_lowater_pct = 10;
 
-/* ARGSUSED */
 static int
 dbuf_cons(void *vdb, void *unused, int kmflag)
 {
+	(void) unused, (void) kmflag;
 	dmu_buf_impl_t *db = vdb;
-	bzero(db, sizeof (dmu_buf_impl_t));
+	memset(db, 0, sizeof (dmu_buf_impl_t));
 
 	mutex_init(&db->db_mtx, NULL, MUTEX_DEFAULT, NULL);
 	rw_init(&db->db_rwlock, NULL, RW_DEFAULT, NULL);
@@ -274,10 +301,10 @@ dbuf_cons(void *vdb, void *unused, int kmflag)
 	return (0);
 }
 
-/* ARGSUSED */
 static void
 dbuf_dest(void *vdb, void *unused)
 {
+	(void) unused;
 	dmu_buf_impl_t *db = vdb;
 	mutex_destroy(&db->db_mtx);
 	rw_destroy(&db->db_rwlock);
@@ -290,8 +317,6 @@ dbuf_dest(void *vdb, void *unused)
  * dbuf hash table routines
  */
 static dbuf_hash_table_t dbuf_hash_table;
-
-static uint64_t dbuf_hash_count;
 
 /*
  * We use Cityhash for this. It's fast, and has good hash properties without
@@ -403,8 +428,8 @@ dbuf_hash_insert(dmu_buf_impl_t *db)
 	db->db_hash_next = h->hash_table[idx];
 	h->hash_table[idx] = db;
 	mutex_exit(DBUF_HASH_MUTEX(h, idx));
-	atomic_inc_64(&dbuf_hash_count);
-	DBUF_STAT_MAX(hash_elements_max, dbuf_hash_count);
+	uint64_t he = atomic_inc_64_nv(&dbuf_stats.hash_elements.value.ui64);
+	DBUF_STAT_MAX(hash_elements_max, he);
 
 	return (NULL);
 }
@@ -432,7 +457,7 @@ dbuf_include_in_metadata_cache(dmu_buf_impl_t *db)
 		 */
 		if (zfs_refcount_count(
 		    &dbuf_caches[DB_DBUF_METADATA_CACHE].size) >
-		    dbuf_metadata_cache_max_bytes) {
+		    dbuf_metadata_cache_target_bytes()) {
 			DBUF_STAT_BUMP(metadata_cache_overflow);
 			return (B_FALSE);
 		}
@@ -477,7 +502,7 @@ dbuf_hash_remove(dmu_buf_impl_t *db)
 	    h->hash_table[idx]->db_hash_next == NULL)
 		DBUF_STAT_BUMPDOWN(hash_chains);
 	mutex_exit(DBUF_HASH_MUTEX(h, idx));
-	atomic_dec_64(&dbuf_hash_count);
+	atomic_dec_64(&dbuf_stats.hash_elements.value.ui64);
 }
 
 typedef enum {
@@ -580,6 +605,68 @@ dbuf_is_metadata(dmu_buf_impl_t *db)
 	}
 }
 
+/*
+ * We want to exclude buffers that are on a special allocation class from
+ * L2ARC.
+ */
+boolean_t
+dbuf_is_l2cacheable(dmu_buf_impl_t *db)
+{
+	vdev_t *vd = NULL;
+	zfs_cache_type_t cache = db->db_objset->os_secondary_cache;
+	blkptr_t *bp = db->db_blkptr;
+
+	if (bp != NULL && !BP_IS_HOLE(bp)) {
+		uint64_t vdev = DVA_GET_VDEV(bp->blk_dva);
+		vdev_t *rvd = db->db_objset->os_spa->spa_root_vdev;
+
+		if (vdev < rvd->vdev_children)
+			vd = rvd->vdev_child[vdev];
+
+		if (cache == ZFS_CACHE_ALL ||
+		    (dbuf_is_metadata(db) && cache == ZFS_CACHE_METADATA)) {
+			if (vd == NULL)
+				return (B_TRUE);
+
+			if ((vd->vdev_alloc_bias != VDEV_BIAS_SPECIAL &&
+			    vd->vdev_alloc_bias != VDEV_BIAS_DEDUP) ||
+			    l2arc_exclude_special == 0)
+				return (B_TRUE);
+		}
+	}
+
+	return (B_FALSE);
+}
+
+static inline boolean_t
+dnode_level_is_l2cacheable(blkptr_t *bp, dnode_t *dn, int64_t level)
+{
+	vdev_t *vd = NULL;
+	zfs_cache_type_t cache = dn->dn_objset->os_secondary_cache;
+
+	if (bp != NULL && !BP_IS_HOLE(bp)) {
+		uint64_t vdev = DVA_GET_VDEV(bp->blk_dva);
+		vdev_t *rvd = dn->dn_objset->os_spa->spa_root_vdev;
+
+		if (vdev < rvd->vdev_children)
+			vd = rvd->vdev_child[vdev];
+
+		if (cache == ZFS_CACHE_ALL || ((level > 0 ||
+		    DMU_OT_IS_METADATA(dn->dn_handle->dnh_dnode->dn_type)) &&
+		    cache == ZFS_CACHE_METADATA)) {
+			if (vd == NULL)
+				return (B_TRUE);
+
+			if ((vd->vdev_alloc_bias != VDEV_BIAS_SPECIAL &&
+			    vd->vdev_alloc_bias != VDEV_BIAS_DEDUP) ||
+			    l2arc_exclude_special == 0)
+				return (B_TRUE);
+		}
+	}
+
+	return (B_FALSE);
+}
+
 
 /*
  * This function *must* return indices evenly distributed between all
@@ -603,18 +690,34 @@ dbuf_cache_multilist_index_func(multilist_t *ml, void *obj)
 	 * Also, the low order bits of the hash value are thought to be
 	 * distributed evenly. Otherwise, in the case that the multilist
 	 * has a power of two number of sublists, each sublists' usage
-	 * would not be evenly distributed.
+	 * would not be evenly distributed. In this context full 64bit
+	 * division would be a waste of time, so limit it to 32 bits.
 	 */
-	return (dbuf_hash(db->db_objset, db->db.db_object,
+	return ((unsigned int)dbuf_hash(db->db_objset, db->db.db_object,
 	    db->db_level, db->db_blkid) %
 	    multilist_get_num_sublists(ml));
 }
 
+/*
+ * The target size of the dbuf cache can grow with the ARC target,
+ * unless limited by the tunable dbuf_cache_max_bytes.
+ */
 static inline unsigned long
 dbuf_cache_target_bytes(void)
 {
-	return MIN(dbuf_cache_max_bytes,
-	    arc_target_bytes() >> dbuf_cache_shift);
+	return (MIN(dbuf_cache_max_bytes,
+	    arc_target_bytes() >> dbuf_cache_shift));
+}
+
+/*
+ * The target size of the dbuf metadata cache can grow with the ARC target,
+ * unless limited by the tunable dbuf_metadata_cache_max_bytes.
+ */
+static inline unsigned long
+dbuf_metadata_cache_target_bytes(void)
+{
+	return (MIN(dbuf_metadata_cache_max_bytes,
+	    arc_target_bytes() >> dbuf_metadata_cache_shift));
 }
 
 static inline uint64_t
@@ -646,9 +749,9 @@ dbuf_cache_above_lowater(void)
 static void
 dbuf_evict_one(void)
 {
-	int idx = multilist_get_random_index(dbuf_caches[DB_DBUF_CACHE].cache);
+	int idx = multilist_get_random_index(&dbuf_caches[DB_DBUF_CACHE].cache);
 	multilist_sublist_t *mls = multilist_sublist_lock(
-	    dbuf_caches[DB_DBUF_CACHE].cache, idx);
+	    &dbuf_caches[DB_DBUF_CACHE].cache, idx);
 
 	ASSERT(!MUTEX_HELD(&dbuf_evict_lock));
 
@@ -685,10 +788,10 @@ dbuf_evict_one(void)
  * of the dbuf cache is at or below the maximum size. Once the dbuf is aged
  * out of the cache it is destroyed and becomes eligible for arc eviction.
  */
-/* ARGSUSED */
-static void
+static __attribute__((noreturn)) void
 dbuf_evict_thread(void *unused)
 {
+	(void) unused;
 	callb_cpr_t cpr;
 
 	CALLB_CPR_INIT(&cpr, &dbuf_evict_lock, callb_generic_cpr, FTAG);
@@ -697,7 +800,7 @@ dbuf_evict_thread(void *unused)
 	while (!dbuf_evict_thread_exit) {
 		while (!dbuf_cache_above_lowater() && !dbuf_evict_thread_exit) {
 			CALLB_CPR_SAFE_BEGIN(&cpr);
-			(void) cv_timedwait_sig_hires(&dbuf_evict_cv,
+			(void) cv_timedwait_idle_hires(&dbuf_evict_cv,
 			    &dbuf_evict_lock, SEC2NSEC(1), MSEC2NSEC(1), 0);
 			CALLB_CPR_SAFE_END(&cpr, &dbuf_evict_lock);
 		}
@@ -724,7 +827,7 @@ dbuf_evict_thread(void *unused)
 /*
  * Wake up the dbuf eviction thread if the dbuf cache is at its max size.
  * If the dbuf cache is at its high water mark, then evict a dbuf from the
- * dbuf cache using the callers context.
+ * dbuf cache using the caller's context.
  */
 static void
 dbuf_evict_notify(uint64_t size)
@@ -745,82 +848,101 @@ static int
 dbuf_kstat_update(kstat_t *ksp, int rw)
 {
 	dbuf_stats_t *ds = ksp->ks_data;
+	dbuf_hash_table_t *h = &dbuf_hash_table;
 
-	if (rw == KSTAT_WRITE) {
+	if (rw == KSTAT_WRITE)
 		return (SET_ERROR(EACCES));
-	} else {
-		ds->metadata_cache_size_bytes.value.ui64 = zfs_refcount_count(
-		    &dbuf_caches[DB_DBUF_METADATA_CACHE].size);
-		ds->cache_size_bytes.value.ui64 =
-		    zfs_refcount_count(&dbuf_caches[DB_DBUF_CACHE].size);
-		ds->cache_target_bytes.value.ui64 = dbuf_cache_target_bytes();
-		ds->cache_hiwater_bytes.value.ui64 = dbuf_cache_hiwater_bytes();
-		ds->cache_lowater_bytes.value.ui64 = dbuf_cache_lowater_bytes();
-		ds->hash_elements.value.ui64 = dbuf_hash_count;
-	}
 
+	ds->cache_count.value.ui64 =
+	    wmsum_value(&dbuf_sums.cache_count);
+	ds->cache_size_bytes.value.ui64 =
+	    zfs_refcount_count(&dbuf_caches[DB_DBUF_CACHE].size);
+	ds->cache_target_bytes.value.ui64 = dbuf_cache_target_bytes();
+	ds->cache_hiwater_bytes.value.ui64 = dbuf_cache_hiwater_bytes();
+	ds->cache_lowater_bytes.value.ui64 = dbuf_cache_lowater_bytes();
+	ds->cache_total_evicts.value.ui64 =
+	    wmsum_value(&dbuf_sums.cache_total_evicts);
+	for (int i = 0; i < DN_MAX_LEVELS; i++) {
+		ds->cache_levels[i].value.ui64 =
+		    wmsum_value(&dbuf_sums.cache_levels[i]);
+		ds->cache_levels_bytes[i].value.ui64 =
+		    wmsum_value(&dbuf_sums.cache_levels_bytes[i]);
+	}
+	ds->hash_hits.value.ui64 =
+	    wmsum_value(&dbuf_sums.hash_hits);
+	ds->hash_misses.value.ui64 =
+	    wmsum_value(&dbuf_sums.hash_misses);
+	ds->hash_collisions.value.ui64 =
+	    wmsum_value(&dbuf_sums.hash_collisions);
+	ds->hash_chains.value.ui64 =
+	    wmsum_value(&dbuf_sums.hash_chains);
+	ds->hash_insert_race.value.ui64 =
+	    wmsum_value(&dbuf_sums.hash_insert_race);
+	ds->hash_table_count.value.ui64 = h->hash_table_mask + 1;
+	ds->hash_mutex_count.value.ui64 = h->hash_mutex_mask + 1;
+	ds->metadata_cache_count.value.ui64 =
+	    wmsum_value(&dbuf_sums.metadata_cache_count);
+	ds->metadata_cache_size_bytes.value.ui64 = zfs_refcount_count(
+	    &dbuf_caches[DB_DBUF_METADATA_CACHE].size);
+	ds->metadata_cache_overflow.value.ui64 =
+	    wmsum_value(&dbuf_sums.metadata_cache_overflow);
 	return (0);
 }
 
 void
 dbuf_init(void)
 {
-	uint64_t hsize = 1ULL << 16;
+	uint64_t hmsize, hsize = 1ULL << 16;
 	dbuf_hash_table_t *h = &dbuf_hash_table;
-	int i;
 
 	/*
-	 * The hash table is big enough to fill all of physical memory
+	 * The hash table is big enough to fill one eighth of physical memory
 	 * with an average block size of zfs_arc_average_blocksize (default 8K).
 	 * By default, the table will take up
 	 * totalmem * sizeof(void*) / 8K (1MB per GB with 8-byte pointers).
 	 */
-	while (hsize * zfs_arc_average_blocksize < physmem * PAGESIZE)
+	while (hsize * zfs_arc_average_blocksize < arc_all_memory() / 8)
 		hsize <<= 1;
 
-retry:
-	h->hash_table_mask = hsize - 1;
-#if defined(_KERNEL)
+	h->hash_table = NULL;
+	while (h->hash_table == NULL) {
+		h->hash_table_mask = hsize - 1;
+
+		h->hash_table = vmem_zalloc(hsize * sizeof (void *), KM_SLEEP);
+		if (h->hash_table == NULL)
+			hsize >>= 1;
+
+		ASSERT3U(hsize, >=, 1ULL << 10);
+	}
+
 	/*
-	 * Large allocations which do not require contiguous pages
-	 * should be using vmem_alloc() in the linux kernel
+	 * The hash table buckets are protected by an array of mutexes where
+	 * each mutex is reponsible for protecting 128 buckets.  A minimum
+	 * array size of 8192 is targeted to avoid contention.
 	 */
-	h->hash_table = vmem_zalloc(hsize * sizeof (void *), KM_SLEEP);
-#else
-	h->hash_table = kmem_zalloc(hsize * sizeof (void *), KM_NOSLEEP);
-#endif
-	if (h->hash_table == NULL) {
-		/* XXX - we should really return an error instead of assert */
-		ASSERT(hsize > (1ULL << 10));
-		hsize >>= 1;
-		goto retry;
+	if (dbuf_mutex_cache_shift == 0)
+		hmsize = MAX(hsize >> 7, 1ULL << 13);
+	else
+		hmsize = 1ULL << MIN(dbuf_mutex_cache_shift, 24);
+
+	h->hash_mutexes = NULL;
+	while (h->hash_mutexes == NULL) {
+		h->hash_mutex_mask = hmsize - 1;
+
+		h->hash_mutexes = vmem_zalloc(hmsize * sizeof (kmutex_t),
+		    KM_SLEEP);
+		if (h->hash_mutexes == NULL)
+			hmsize >>= 1;
 	}
 
 	dbuf_kmem_cache = kmem_cache_create("dmu_buf_impl_t",
 	    sizeof (dmu_buf_impl_t),
 	    0, dbuf_cons, dbuf_dest, NULL, NULL, NULL, 0);
 
-	for (i = 0; i < DBUF_MUTEXES; i++)
+	for (int i = 0; i < hmsize; i++)
 		mutex_init(&h->hash_mutexes[i], NULL, MUTEX_DEFAULT, NULL);
 
 	dbuf_stats_init(h);
-
-	/*
-	 * Setup the parameters for the dbuf caches. We set the sizes of the
-	 * dbuf cache and the metadata cache to 1/32nd and 1/16th (default)
-	 * of the target size of the ARC. If the values has been specified as
-	 * a module option and they're not greater than the target size of the
-	 * ARC, then we honor that value.
-	 */
-	if (dbuf_cache_max_bytes == 0 ||
-	    dbuf_cache_max_bytes >= arc_target_bytes()) {
-		dbuf_cache_max_bytes = arc_target_bytes() >> dbuf_cache_shift;
-	}
-	if (dbuf_metadata_cache_max_bytes == 0 ||
-	    dbuf_metadata_cache_max_bytes >= arc_target_bytes()) {
-		dbuf_metadata_cache_max_bytes =
-		    arc_target_bytes() >> dbuf_metadata_cache_shift;
-	}
 
 	/*
 	 * All entries are queued via taskq_dispatch_ent(), so min/maxalloc
@@ -829,8 +951,8 @@ retry:
 	dbu_evict_taskq = taskq_create("dbu_evict", 1, defclsyspri, 0, 0, 0);
 
 	for (dbuf_cached_state_t dcs = 0; dcs < DB_CACHE_MAX; dcs++) {
-		dbuf_caches[dcs].cache =
-		    multilist_create(sizeof (dmu_buf_impl_t),
+		multilist_create(&dbuf_caches[dcs].cache,
+		    sizeof (dmu_buf_impl_t),
 		    offsetof(dmu_buf_impl_t, db_cache_link),
 		    dbuf_cache_multilist_index_func);
 		zfs_refcount_create(&dbuf_caches[dcs].size);
@@ -842,11 +964,25 @@ retry:
 	dbuf_cache_evict_thread = thread_create(NULL, 0, dbuf_evict_thread,
 	    NULL, 0, &p0, TS_RUN, minclsyspri);
 
+	wmsum_init(&dbuf_sums.cache_count, 0);
+	wmsum_init(&dbuf_sums.cache_total_evicts, 0);
+	for (int i = 0; i < DN_MAX_LEVELS; i++) {
+		wmsum_init(&dbuf_sums.cache_levels[i], 0);
+		wmsum_init(&dbuf_sums.cache_levels_bytes[i], 0);
+	}
+	wmsum_init(&dbuf_sums.hash_hits, 0);
+	wmsum_init(&dbuf_sums.hash_misses, 0);
+	wmsum_init(&dbuf_sums.hash_collisions, 0);
+	wmsum_init(&dbuf_sums.hash_chains, 0);
+	wmsum_init(&dbuf_sums.hash_insert_race, 0);
+	wmsum_init(&dbuf_sums.metadata_cache_count, 0);
+	wmsum_init(&dbuf_sums.metadata_cache_overflow, 0);
+
 	dbuf_ksp = kstat_create("zfs", 0, "dbufstats", "misc",
 	    KSTAT_TYPE_NAMED, sizeof (dbuf_stats) / sizeof (kstat_named_t),
 	    KSTAT_FLAG_VIRTUAL);
 	if (dbuf_ksp != NULL) {
-		for (i = 0; i < DN_MAX_LEVELS; i++) {
+		for (int i = 0; i < DN_MAX_LEVELS; i++) {
 			snprintf(dbuf_stats.cache_levels[i].name,
 			    KSTAT_STRLEN, "cache_level_%d", i);
 			dbuf_stats.cache_levels[i].data_type =
@@ -866,21 +1002,16 @@ void
 dbuf_fini(void)
 {
 	dbuf_hash_table_t *h = &dbuf_hash_table;
-	int i;
 
 	dbuf_stats_destroy();
 
-	for (i = 0; i < DBUF_MUTEXES; i++)
+	for (int i = 0; i < (h->hash_mutex_mask + 1); i++)
 		mutex_destroy(&h->hash_mutexes[i]);
-#if defined(_KERNEL)
-	/*
-	 * Large allocations which do not require contiguous pages
-	 * should be using vmem_free() in the linux kernel
-	 */
+
 	vmem_free(h->hash_table, (h->hash_table_mask + 1) * sizeof (void *));
-#else
-	kmem_free(h->hash_table, (h->hash_table_mask + 1) * sizeof (void *));
-#endif
+	vmem_free(h->hash_mutexes, (h->hash_mutex_mask + 1) *
+	    sizeof (kmutex_t));
+
 	kmem_cache_destroy(dbuf_kmem_cache);
 	taskq_destroy(dbu_evict_taskq);
 
@@ -897,13 +1028,27 @@ dbuf_fini(void)
 
 	for (dbuf_cached_state_t dcs = 0; dcs < DB_CACHE_MAX; dcs++) {
 		zfs_refcount_destroy(&dbuf_caches[dcs].size);
-		multilist_destroy(dbuf_caches[dcs].cache);
+		multilist_destroy(&dbuf_caches[dcs].cache);
 	}
 
 	if (dbuf_ksp != NULL) {
 		kstat_delete(dbuf_ksp);
 		dbuf_ksp = NULL;
 	}
+
+	wmsum_fini(&dbuf_sums.cache_count);
+	wmsum_fini(&dbuf_sums.cache_total_evicts);
+	for (int i = 0; i < DN_MAX_LEVELS; i++) {
+		wmsum_fini(&dbuf_sums.cache_levels[i]);
+		wmsum_fini(&dbuf_sums.cache_levels_bytes[i]);
+	}
+	wmsum_fini(&dbuf_sums.hash_hits);
+	wmsum_fini(&dbuf_sums.hash_misses);
+	wmsum_fini(&dbuf_sums.hash_collisions);
+	wmsum_fini(&dbuf_sums.hash_chains);
+	wmsum_fini(&dbuf_sums.hash_insert_race);
+	wmsum_fini(&dbuf_sums.metadata_cache_count);
+	wmsum_fini(&dbuf_sums.metadata_cache_overflow);
 }
 
 /*
@@ -1087,40 +1232,6 @@ dbuf_set_data(dmu_buf_impl_t *db, arc_buf_t *buf)
 }
 
 static arc_buf_t *
-dbuf_alloc_arcbuf_from_arcbuf(dmu_buf_impl_t *db, arc_buf_t *data)
-{
-	objset_t *os = db->db_objset;
-	spa_t *spa = os->os_spa;
-	arc_buf_contents_t type = DBUF_GET_BUFC_TYPE(db);
-	enum zio_compress compress_type;
-	int psize, lsize;
-
-	psize = arc_buf_size(data);
-	lsize = arc_buf_lsize(data);
-	compress_type = arc_get_compression(data);
-
-	if (arc_is_encrypted(data)) {
-		boolean_t byteorder;
-		uint8_t salt[ZIO_DATA_SALT_LEN];
-		uint8_t iv[ZIO_DATA_IV_LEN];
-		uint8_t mac[ZIO_DATA_MAC_LEN];
-		dnode_t *dn = DB_DNODE(db);
-
-		arc_get_raw_params(data, &byteorder, salt, iv, mac);
-		data = arc_alloc_raw_buf(spa, db, dmu_objset_id(os),
-		    byteorder, salt, iv, mac, dn->dn_type, psize, lsize,
-		    compress_type);
-	} else if (compress_type != ZIO_COMPRESS_OFF) {
-		ASSERT3U(type, ==, ARC_BUFC_DATA);
-		data = arc_alloc_compressed_buf(spa, db,
-		    psize, lsize, compress_type);
-	} else {
-		data = arc_alloc_buf(spa, db, type, psize);
-	}
-	return (data);
-}
-
-static arc_buf_t *
 dbuf_alloc_arcbuf(dmu_buf_impl_t *db)
 {
 	spa_t *spa = db->db_objset->os_spa;
@@ -1144,7 +1255,7 @@ dbuf_loan_arcbuf(dmu_buf_impl_t *db)
 
 		mutex_exit(&db->db_mtx);
 		abuf = arc_loan_buf(spa, B_FALSE, blksz);
-		bcopy(db->db.db_data, abuf->b_data, blksz);
+		memcpy(abuf->b_data, db->db.db_data, blksz);
 	} else {
 		abuf = db->db_buf;
 		arc_loan_inuse_buf(abuf, db);
@@ -1206,7 +1317,7 @@ dbuf_whichblock(const dnode_t *dn, const int64_t level, const uint64_t offset)
  * used when modifying or reading db_blkptr.
  */
 db_lock_type_t
-dmu_buf_lock_parent(dmu_buf_impl_t *db, krw_t rw, void *tag)
+dmu_buf_lock_parent(dmu_buf_impl_t *db, krw_t rw, const void *tag)
 {
 	enum db_lock_type ret = DLT_NONE;
 	if (db->db_parent != NULL) {
@@ -1231,7 +1342,7 @@ dmu_buf_lock_parent(dmu_buf_impl_t *db, krw_t rw, void *tag)
  * panic if we didn't pass the lock type in.
  */
 void
-dmu_buf_unlock_parent(dmu_buf_impl_t *db, db_lock_type_t type, void *tag)
+dmu_buf_unlock_parent(dmu_buf_impl_t *db, db_lock_type_t type, const void *tag)
 {
 	if (type == DLT_PARENT)
 		rw_exit(&db->db_parent->db_rwlock);
@@ -1243,6 +1354,7 @@ static void
 dbuf_read_done(zio_t *zio, const zbookmark_phys_t *zb, const blkptr_t *bp,
     arc_buf_t *buf, void *vdb)
 {
+	(void) zb, (void) bp;
 	dmu_buf_impl_t *db = vdb;
 
 	mutex_enter(&db->db_mtx);
@@ -1264,7 +1376,7 @@ dbuf_read_done(zio_t *zio, const zbookmark_phys_t *zb, const blkptr_t *bp,
 		/* freed in flight */
 		ASSERT(zio == NULL || zio->io_error == 0);
 		arc_release(buf, db);
-		bzero(buf->b_data, db->db.db_size);
+		memset(buf->b_data, 0, db->db.db_size);
 		arc_buf_freeze(buf);
 		db->db_freed_in_flight = FALSE;
 		dbuf_set_data(db, buf);
@@ -1303,9 +1415,9 @@ dbuf_read_bonus(dmu_buf_impl_t *db, dnode_t *dn, uint32_t flags)
 	db->db.db_data = kmem_alloc(max_bonuslen, KM_SLEEP);
 	arc_space_consume(max_bonuslen, ARC_SPACE_BONUS);
 	if (bonuslen < max_bonuslen)
-		bzero(db->db.db_data, max_bonuslen);
+		memset(db->db.db_data, 0, max_bonuslen);
 	if (bonuslen)
-		bcopy(DN_BONUS(dn->dn_phys), db->db.db_data, bonuslen);
+		memcpy(db->db.db_data, DN_BONUS(dn->dn_phys), bonuslen);
 	db->db_state = DB_CACHED;
 	DTRACE_SET_STATE(db, "bonus buffer filled");
 	return (0);
@@ -1336,7 +1448,7 @@ dbuf_handle_indirect_hole(dmu_buf_impl_t *db, dnode_t *dn)
  * was taken, ENOENT if no action was taken.
  */
 static int
-dbuf_read_hole(dmu_buf_impl_t *db, dnode_t *dn, uint32_t flags)
+dbuf_read_hole(dmu_buf_impl_t *db, dnode_t *dn)
 {
 	ASSERT(MUTEX_HELD(&db->db_mtx));
 
@@ -1354,7 +1466,7 @@ dbuf_read_hole(dmu_buf_impl_t *db, dnode_t *dn, uint32_t flags)
 
 	if (is_hole) {
 		dbuf_set_data(db, dbuf_alloc_arcbuf(db));
-		bzero(db->db.db_data, db->db.db_size);
+		memset(db->db.db_data, 0, db->db.db_size);
 
 		if (db->db_blkptr != NULL && db->db_level > 0 &&
 		    BP_IS_HOLE(db->db_blkptr) &&
@@ -1430,16 +1542,14 @@ dbuf_read_verify_dnode_crypt(dmu_buf_impl_t *db, uint32_t flags)
  */
 static int
 dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags,
-    db_lock_type_t dblt, void *tag)
+    db_lock_type_t dblt, const void *tag)
 {
 	dnode_t *dn;
 	zbookmark_phys_t zb;
 	uint32_t aflags = ARC_FLAG_NOWAIT;
 	int err, zio_flags;
-	boolean_t bonus_read;
 
 	err = zio_flags = 0;
-	bonus_read = B_FALSE;
 	DB_DNODE_ENTER(db);
 	dn = DB_DNODE(db);
 	ASSERT(!zfs_refcount_is_zero(&db->db_holds));
@@ -1454,7 +1564,7 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags,
 		goto early_unlock;
 	}
 
-	err = dbuf_read_hole(db, dn, flags);
+	err = dbuf_read_hole(db, dn);
 	if (err == 0)
 		goto early_unlock;
 
@@ -1496,7 +1606,7 @@ dbuf_read_impl(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags,
 	DTRACE_SET_STATE(db, "read issued");
 	mutex_exit(&db->db_mtx);
 
-	if (DBUF_IS_L2CACHEABLE(db))
+	if (dbuf_is_l2cacheable(db))
 		aflags |= ARC_FLAG_L2CACHE;
 
 	dbuf_add_ref(db, NULL);
@@ -1567,11 +1677,37 @@ dbuf_fix_old_data(dmu_buf_impl_t *db, uint64_t txg)
 		int bonuslen = DN_SLOTS_TO_BONUSLEN(dn->dn_num_slots);
 		dr->dt.dl.dr_data = kmem_alloc(bonuslen, KM_SLEEP);
 		arc_space_consume(bonuslen, ARC_SPACE_BONUS);
-		bcopy(db->db.db_data, dr->dt.dl.dr_data, bonuslen);
+		memcpy(dr->dt.dl.dr_data, db->db.db_data, bonuslen);
 	} else if (zfs_refcount_count(&db->db_holds) > db->db_dirtycnt) {
-		arc_buf_t *buf = dbuf_alloc_arcbuf_from_arcbuf(db, db->db_buf);
-		dr->dt.dl.dr_data = buf;
-		bcopy(db->db.db_data, buf->b_data, arc_buf_size(buf));
+		dnode_t *dn = DB_DNODE(db);
+		int size = arc_buf_size(db->db_buf);
+		arc_buf_contents_t type = DBUF_GET_BUFC_TYPE(db);
+		spa_t *spa = db->db_objset->os_spa;
+		enum zio_compress compress_type =
+		    arc_get_compression(db->db_buf);
+		uint8_t complevel = arc_get_complevel(db->db_buf);
+
+		if (arc_is_encrypted(db->db_buf)) {
+			boolean_t byteorder;
+			uint8_t salt[ZIO_DATA_SALT_LEN];
+			uint8_t iv[ZIO_DATA_IV_LEN];
+			uint8_t mac[ZIO_DATA_MAC_LEN];
+
+			arc_get_raw_params(db->db_buf, &byteorder, salt,
+			    iv, mac);
+			dr->dt.dl.dr_data = arc_alloc_raw_buf(spa, db,
+			    dmu_objset_id(dn->dn_objset), byteorder, salt, iv,
+			    mac, dn->dn_type, size, arc_buf_lsize(db->db_buf),
+			    compress_type, complevel);
+		} else if (compress_type != ZIO_COMPRESS_OFF) {
+			ASSERT3U(type, ==, ARC_BUFC_DATA);
+			dr->dt.dl.dr_data = arc_alloc_compressed_buf(spa, db,
+			    size, arc_buf_lsize(db->db_buf), compress_type,
+			    complevel);
+		} else {
+			dr->dt.dl.dr_data = arc_alloc_buf(spa, db, type, size);
+		}
+		memcpy(dr->dt.dl.dr_data->b_data, db->db.db_data, size);
 	} else {
 		db->db_buf = NULL;
 		dbuf_clear_data(db);
@@ -1634,7 +1770,7 @@ dbuf_read(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 		mutex_exit(&db->db_mtx);
 		if (err == 0 && prefetch) {
 			dmu_zfetch(&dn->dn_zfetch, db->db_blkid, 1, B_TRUE,
-			    flags & DB_RF_HAVESTRUCT);
+			    B_FALSE, flags & DB_RF_HAVESTRUCT);
 		}
 		DB_DNODE_EXIT(db);
 		DBUF_STAT_BUMP(hash_hits);
@@ -1656,6 +1792,7 @@ dbuf_read(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 		 */
 		if (!err && prefetch) {
 			dmu_zfetch(&dn->dn_zfetch, db->db_blkid, 1, B_TRUE,
+			    db->db_state != DB_CACHED,
 			    flags & DB_RF_HAVESTRUCT);
 		}
 
@@ -1685,7 +1822,7 @@ dbuf_read(dmu_buf_impl_t *db, zio_t *zio, uint32_t flags)
 		mutex_exit(&db->db_mtx);
 		if (prefetch) {
 			dmu_zfetch(&dn->dn_zfetch, db->db_blkid, 1, B_TRUE,
-			    flags & DB_RF_HAVESTRUCT);
+			    B_TRUE, flags & DB_RF_HAVESTRUCT);
 		}
 		DB_DNODE_EXIT(db);
 		DBUF_STAT_BUMP(hash_misses);
@@ -1791,7 +1928,8 @@ dbuf_free_range(dnode_t *dn, uint64_t start_blkid, uint64_t end_blkid,
 	if (end_blkid > dn->dn_maxblkid &&
 	    !(start_blkid == DMU_SPILL_BLKID || end_blkid == DMU_SPILL_BLKID))
 		end_blkid = dn->dn_maxblkid;
-	dprintf_dnode(dn, "start=%llu end=%llu\n", start_blkid, end_blkid);
+	dprintf_dnode(dn, "start=%llu end=%llu\n", (u_longlong_t)start_blkid,
+	    (u_longlong_t)end_blkid);
 
 	db_search = kmem_alloc(sizeof (dmu_buf_impl_t), KM_SLEEP);
 	db_search->db_level = 0;
@@ -1867,7 +2005,7 @@ dbuf_free_range(dnode_t *dn, uint64_t start_blkid, uint64_t end_blkid,
 			ASSERT(db->db.db_data != NULL);
 			arc_release(db->db_buf, db);
 			rw_enter(&db->db_rwlock, RW_WRITER);
-			bzero(db->db.db_data, db->db.db_size);
+			memset(db->db.db_data, 0, db->db.db_size);
 			rw_exit(&db->db_rwlock);
 			arc_buf_freeze(db->db_buf);
 		}
@@ -1875,8 +2013,8 @@ dbuf_free_range(dnode_t *dn, uint64_t start_blkid, uint64_t end_blkid,
 		mutex_exit(&db->db_mtx);
 	}
 
-	kmem_free(db_search, sizeof (dmu_buf_impl_t));
 	mutex_exit(&dn->dn_dbufs_mtx);
+	kmem_free(db_search, sizeof (dmu_buf_impl_t));
 }
 
 void
@@ -1904,10 +2042,10 @@ dbuf_new_size(dmu_buf_impl_t *db, int size, dmu_tx_t *tx)
 
 	/* copy old block data to the new block */
 	old_buf = db->db_buf;
-	bcopy(old_buf->b_data, buf->b_data, MIN(osize, size));
+	memcpy(buf->b_data, old_buf->b_data, MIN(osize, size));
 	/* zero the remainder */
 	if (size > osize)
-		bzero((uint8_t *)buf->b_data + osize, size - osize);
+		memset((uint8_t *)buf->b_data + osize, 0, size - osize);
 
 	mutex_enter(&db->db_mtx);
 	dbuf_set_data(db, buf);
@@ -1968,6 +2106,74 @@ dbuf_redirty(dbuf_dirty_record_t *dr)
 }
 
 dbuf_dirty_record_t *
+dbuf_dirty_lightweight(dnode_t *dn, uint64_t blkid, dmu_tx_t *tx)
+{
+	rw_enter(&dn->dn_struct_rwlock, RW_READER);
+	IMPLY(dn->dn_objset->os_raw_receive, dn->dn_maxblkid >= blkid);
+	dnode_new_blkid(dn, blkid, tx, B_TRUE, B_FALSE);
+	ASSERT(dn->dn_maxblkid >= blkid);
+
+	dbuf_dirty_record_t *dr = kmem_zalloc(sizeof (*dr), KM_SLEEP);
+	list_link_init(&dr->dr_dirty_node);
+	list_link_init(&dr->dr_dbuf_node);
+	dr->dr_dnode = dn;
+	dr->dr_txg = tx->tx_txg;
+	dr->dt.dll.dr_blkid = blkid;
+	dr->dr_accounted = dn->dn_datablksz;
+
+	/*
+	 * There should not be any dbuf for the block that we're dirtying.
+	 * Otherwise the buffer contents could be inconsistent between the
+	 * dbuf and the lightweight dirty record.
+	 */
+	ASSERT3P(NULL, ==, dbuf_find(dn->dn_objset, dn->dn_object, 0, blkid));
+
+	mutex_enter(&dn->dn_mtx);
+	int txgoff = tx->tx_txg & TXG_MASK;
+	if (dn->dn_free_ranges[txgoff] != NULL) {
+		range_tree_clear(dn->dn_free_ranges[txgoff], blkid, 1);
+	}
+
+	if (dn->dn_nlevels == 1) {
+		ASSERT3U(blkid, <, dn->dn_nblkptr);
+		list_insert_tail(&dn->dn_dirty_records[txgoff], dr);
+		mutex_exit(&dn->dn_mtx);
+		rw_exit(&dn->dn_struct_rwlock);
+		dnode_setdirty(dn, tx);
+	} else {
+		mutex_exit(&dn->dn_mtx);
+
+		int epbs = dn->dn_indblkshift - SPA_BLKPTRSHIFT;
+		dmu_buf_impl_t *parent_db = dbuf_hold_level(dn,
+		    1, blkid >> epbs, FTAG);
+		rw_exit(&dn->dn_struct_rwlock);
+		if (parent_db == NULL) {
+			kmem_free(dr, sizeof (*dr));
+			return (NULL);
+		}
+		int err = dbuf_read(parent_db, NULL,
+		    (DB_RF_NOPREFETCH | DB_RF_CANFAIL));
+		if (err != 0) {
+			dbuf_rele(parent_db, FTAG);
+			kmem_free(dr, sizeof (*dr));
+			return (NULL);
+		}
+
+		dbuf_dirty_record_t *parent_dr = dbuf_dirty(parent_db, tx);
+		dbuf_rele(parent_db, FTAG);
+		mutex_enter(&parent_dr->dt.di.dr_mtx);
+		ASSERT3U(parent_dr->dr_txg, ==, tx->tx_txg);
+		list_insert_tail(&parent_dr->dt.di.dr_children, dr);
+		mutex_exit(&parent_dr->dt.di.dr_mtx);
+		dr->dr_parent = parent_dr;
+	}
+
+	dmu_objset_willuse_space(dn->dn_objset, dr->dr_accounted, tx);
+
+	return (dr);
+}
+
+dbuf_dirty_record_t *
 dbuf_dirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 {
 	dnode_t *dn;
@@ -1987,7 +2193,7 @@ dbuf_dirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 	 * objects may be dirtied in syncing context, but only if they
 	 * were already pre-dirtied in open context.
 	 */
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 	if (dn->dn_objset->os_dsl_dataset != NULL) {
 		rrw_enter(&dn->dn_objset->os_dsl_dataset->ds_bp_rwlock,
 		    RW_READER, FTAG);
@@ -2060,7 +2266,7 @@ dbuf_dirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 	 */
 	os = dn->dn_objset;
 	VERIFY3U(tx->tx_txg, <=, spa_final_dirty_txg(os->os_spa));
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 	if (dn->dn_objset->os_dsl_dataset != NULL)
 		rrw_enter(&os->os_dsl_dataset->ds_bp_rwlock, RW_READER, FTAG);
 	ASSERT(!dmu_tx_is_syncing(tx) || DMU_OBJECT_IS_SPECIAL(dn->dn_object) ||
@@ -2084,6 +2290,7 @@ dbuf_dirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 	dr = kmem_zalloc(sizeof (dbuf_dirty_record_t), KM_SLEEP);
 	list_link_init(&dr->dr_dirty_node);
 	list_link_init(&dr->dr_dbuf_node);
+	dr->dr_dnode = dn;
 	if (db->db_level == 0) {
 		void *data_old = db->db_buf;
 
@@ -2249,7 +2456,7 @@ dbuf_undirty_bonus(dbuf_dirty_record_t *dr)
 	dmu_buf_impl_t *db = dr->dr_dbuf;
 
 	if (dr->dt.dl.dr_data != db->db.db_data) {
-		struct dnode *dn = DB_DNODE(db);
+		struct dnode *dn = dr->dr_dnode;
 		int max_bonuslen = DN_SLOTS_TO_BONUSLEN(dn->dn_num_slots);
 
 		kmem_free(dr->dt.dl.dr_data, max_bonuslen);
@@ -2274,9 +2481,7 @@ dbuf_undirty_bonus(dbuf_dirty_record_t *dr)
 static boolean_t
 dbuf_undirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 {
-	dnode_t *dn;
 	uint64_t txg = tx->tx_txg;
-	dbuf_dirty_record_t *dr;
 
 	ASSERT(txg != 0);
 
@@ -2296,13 +2501,12 @@ dbuf_undirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 	/*
 	 * If this buffer is not dirty, we're done.
 	 */
-	dr = dbuf_find_dirty_eq(db, txg);
+	dbuf_dirty_record_t *dr = dbuf_find_dirty_eq(db, txg);
 	if (dr == NULL)
 		return (B_FALSE);
 	ASSERT(dr->dr_dbuf == db);
 
-	DB_DNODE_ENTER(db);
-	dn = DB_DNODE(db);
+	dnode_t *dn = dr->dr_dnode;
 
 	dprintf_dbuf(db, "size=%llx\n", (u_longlong_t)db->db.db_size);
 
@@ -2330,7 +2534,6 @@ dbuf_undirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
 		list_remove(&dn->dn_dirty_records[txg & TXG_MASK], dr);
 		mutex_exit(&dn->dn_mtx);
 	}
-	DB_DNODE_EXIT(db);
 
 	if (db->db_state != DB_NOFILL) {
 		dbuf_unoverride(dr);
@@ -2472,9 +2675,9 @@ dmu_buf_set_crypt_params(dmu_buf_t *db_fake, boolean_t byteorder,
 
 	dr->dt.dl.dr_has_raw_params = B_TRUE;
 	dr->dt.dl.dr_byteorder = byteorder;
-	bcopy(salt, dr->dt.dl.dr_salt, ZIO_DATA_SALT_LEN);
-	bcopy(iv, dr->dt.dl.dr_iv, ZIO_DATA_IV_LEN);
-	bcopy(mac, dr->dt.dl.dr_mac, ZIO_DATA_MAC_LEN);
+	memcpy(dr->dt.dl.dr_salt, salt, ZIO_DATA_SALT_LEN);
+	memcpy(dr->dt.dl.dr_iv, iv, ZIO_DATA_IV_LEN);
+	memcpy(dr->dt.dl.dr_mac, mac, ZIO_DATA_MAC_LEN);
 }
 
 static void
@@ -2491,10 +2694,10 @@ dbuf_override_impl(dmu_buf_impl_t *db, const blkptr_t *bp, dmu_tx_t *tx)
 	dl->dr_overridden_by.blk_birth = dr->dr_txg;
 }
 
-/* ARGSUSED */
 void
 dmu_buf_fill_done(dmu_buf_t *dbuf, dmu_tx_t *tx)
 {
+	(void) tx;
 	dmu_buf_impl_t *db = (dmu_buf_impl_t *)dbuf;
 	dbuf_states_t old_state;
 	mutex_enter(&db->db_mtx);
@@ -2507,7 +2710,7 @@ dmu_buf_fill_done(dmu_buf_t *dbuf, dmu_tx_t *tx)
 			ASSERT(db->db_blkid != DMU_BONUS_BLKID);
 			/* we were freed while filling */
 			/* XXX dbuf_undirty? */
-			bzero(db->db.db_data, db->db.db_size);
+			memset(db->db.db_data, 0, db->db.db_size);
 			db->db_freed_in_flight = FALSE;
 			DTRACE_SET_STATE(db,
 			    "fill done handling freed in flight");
@@ -2619,13 +2822,11 @@ dbuf_assign_arcbuf(dmu_buf_impl_t *db, arc_buf_t *buf, dmu_tx_t *tx)
 		ASSERT(!arc_is_encrypted(buf));
 		mutex_exit(&db->db_mtx);
 		(void) dbuf_dirty(db, tx);
-		bcopy(buf->b_data, db->db.db_data, db->db.db_size);
+		memcpy(db->db.db_data, buf->b_data, db->db.db_size);
 		arc_buf_destroy(buf, db);
-		xuio_stat_wbuf_copied();
 		return;
 	}
 
-	xuio_stat_wbuf_nocopy();
 	if (db->db_state == DB_CACHED) {
 		dbuf_dirty_record_t *dr = list_head(&db->db_dirty_records);
 
@@ -2687,7 +2888,7 @@ dbuf_destroy(dmu_buf_impl_t *db)
 		ASSERT(db->db_caching_status == DB_DBUF_CACHE ||
 		    db->db_caching_status == DB_DBUF_METADATA_CACHE);
 
-		multilist_remove(dbuf_caches[db->db_caching_status].cache, db);
+		multilist_remove(&dbuf_caches[db->db_caching_status].cache, db);
 		(void) zfs_refcount_remove_many(
 		    &dbuf_caches[db->db_caching_status].size,
 		    db->db.db_size, db);
@@ -2760,9 +2961,6 @@ dbuf_destroy(dmu_buf_impl_t *db)
 	ASSERT3U(db->db_caching_status, ==, DB_NO_CACHE);
 	ASSERT(!multilist_link_active(&db->db_cache_link));
 
-	kmem_cache_free(dbuf_kmem_cache, db);
-	arc_space_return(sizeof (dmu_buf_impl_t), ARC_SPACE_DBUF);
-
 	/*
 	 * If this dbuf is referenced from an indirect dbuf,
 	 * decrement the ref count on the indirect dbuf.
@@ -2771,6 +2969,9 @@ dbuf_destroy(dmu_buf_impl_t *db)
 		mutex_enter(&parent->db_mtx);
 		dbuf_rele_and_unlock(parent, db, B_TRUE);
 	}
+
+	kmem_cache_free(dbuf_kmem_cache, db);
+	arc_space_return(sizeof (dmu_buf_impl_t), ARC_SPACE_DBUF);
 }
 
 /*
@@ -2933,8 +3134,8 @@ dbuf_create(dnode_t *dn, uint8_t level, uint64_t blkid,
 	db->db_state = DB_EVICTING; /* not worth logging this state change */
 	if ((odb = dbuf_hash_insert(db)) != NULL) {
 		/* someone else inserted it first */
-		kmem_cache_free(dbuf_kmem_cache, db);
 		mutex_exit(&dn->dn_dbufs_mtx);
+		kmem_cache_free(dbuf_kmem_cache, db);
 		DBUF_STAT_BUMP(hash_insert_race);
 		return (odb);
 	}
@@ -2997,7 +3198,32 @@ typedef struct dbuf_prefetch_arg {
 	zio_priority_t dpa_prio; /* The priority I/Os should be issued at. */
 	zio_t *dpa_zio; /* The parent zio_t for all prefetches. */
 	arc_flags_t dpa_aflags; /* Flags to pass to the final prefetch. */
+	dbuf_prefetch_fn dpa_cb; /* prefetch completion callback */
+	void *dpa_arg; /* prefetch completion arg */
 } dbuf_prefetch_arg_t;
+
+static void
+dbuf_prefetch_fini(dbuf_prefetch_arg_t *dpa, boolean_t io_done)
+{
+	if (dpa->dpa_cb != NULL) {
+		dpa->dpa_cb(dpa->dpa_arg, dpa->dpa_zb.zb_level,
+		    dpa->dpa_zb.zb_blkid, io_done);
+	}
+	kmem_free(dpa, sizeof (*dpa));
+}
+
+static void
+dbuf_issue_final_prefetch_done(zio_t *zio, const zbookmark_phys_t *zb,
+    const blkptr_t *iobp, arc_buf_t *abuf, void *private)
+{
+	(void) zio, (void) zb, (void) iobp;
+	dbuf_prefetch_arg_t *dpa = private;
+
+	if (abuf != NULL)
+		arc_buf_destroy(abuf, private);
+
+	dbuf_prefetch_fini(dpa, B_TRUE);
+}
 
 /*
  * Actually issue the prefetch read for the block given.
@@ -3011,11 +3237,12 @@ dbuf_issue_final_prefetch(dbuf_prefetch_arg_t *dpa, blkptr_t *bp)
 	    SPA_FEATURE_REDACTED_DATASETS));
 
 	if (BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp) || BP_IS_REDACTED(bp))
-		return;
+		return (dbuf_prefetch_fini(dpa, B_FALSE));
 
 	int zio_flags = ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE;
 	arc_flags_t aflags =
-	    dpa->dpa_aflags | ARC_FLAG_NOWAIT | ARC_FLAG_PREFETCH;
+	    dpa->dpa_aflags | ARC_FLAG_NOWAIT | ARC_FLAG_PREFETCH |
+	    ARC_FLAG_NO_BUF;
 
 	/* dnodes are always read as raw and then converted later */
 	if (BP_GET_TYPE(bp) == DMU_OT_DNODE && BP_IS_PROTECTED(bp) &&
@@ -3025,7 +3252,8 @@ dbuf_issue_final_prefetch(dbuf_prefetch_arg_t *dpa, blkptr_t *bp)
 	ASSERT3U(dpa->dpa_curlevel, ==, BP_GET_LEVEL(bp));
 	ASSERT3U(dpa->dpa_curlevel, ==, dpa->dpa_zb.zb_level);
 	ASSERT(dpa->dpa_zio != NULL);
-	(void) arc_read(dpa->dpa_zio, dpa->dpa_spa, bp, NULL, NULL,
+	(void) arc_read(dpa->dpa_zio, dpa->dpa_spa, bp,
+	    dbuf_issue_final_prefetch_done, dpa,
 	    dpa->dpa_prio, zio_flags, &aflags, &dpa->dpa_zb);
 }
 
@@ -3038,6 +3266,7 @@ static void
 dbuf_prefetch_indirect_done(zio_t *zio, const zbookmark_phys_t *zb,
     const blkptr_t *iobp, arc_buf_t *abuf, void *private)
 {
+	(void) zb, (void) iobp;
 	dbuf_prefetch_arg_t *dpa = private;
 
 	ASSERT3S(dpa->dpa_zb.zb_level, <, dpa->dpa_curlevel);
@@ -3045,7 +3274,7 @@ dbuf_prefetch_indirect_done(zio_t *zio, const zbookmark_phys_t *zb,
 
 	if (abuf == NULL) {
 		ASSERT(zio == NULL || zio->io_error != 0);
-		kmem_free(dpa, sizeof (*dpa));
+		dbuf_prefetch_fini(dpa, B_TRUE);
 		return;
 	}
 	ASSERT(zio == NULL || zio->io_error == 0);
@@ -3078,11 +3307,10 @@ dbuf_prefetch_indirect_done(zio_t *zio, const zbookmark_phys_t *zb,
 		dmu_buf_impl_t *db = dbuf_hold_level(dpa->dpa_dnode,
 		    dpa->dpa_curlevel, curblkid, FTAG);
 		if (db == NULL) {
-			kmem_free(dpa, sizeof (*dpa));
 			arc_buf_destroy(abuf, private);
+			dbuf_prefetch_fini(dpa, B_TRUE);
 			return;
 		}
-
 		(void) dbuf_read(db, NULL,
 		    DB_RF_MUST_SUCCEED | DB_RF_NOPREFETCH | DB_RF_HAVESTRUCT);
 		dbuf_rele(db, FTAG);
@@ -3099,11 +3327,12 @@ dbuf_prefetch_indirect_done(zio_t *zio, const zbookmark_phys_t *zb,
 	    dpa->dpa_dnode->dn_objset->os_dsl_dataset,
 	    SPA_FEATURE_REDACTED_DATASETS));
 	if (BP_IS_HOLE(bp) || BP_IS_REDACTED(bp)) {
-		kmem_free(dpa, sizeof (*dpa));
+		arc_buf_destroy(abuf, private);
+		dbuf_prefetch_fini(dpa, B_TRUE);
+		return;
 	} else if (dpa->dpa_curlevel == dpa->dpa_zb.zb_level) {
 		ASSERT3U(nextblkid, ==, dpa->dpa_zb.zb_blkid);
 		dbuf_issue_final_prefetch(dpa, bp);
-		kmem_free(dpa, sizeof (*dpa));
 	} else {
 		arc_flags_t iter_aflags = ARC_FLAG_NOWAIT;
 		zbookmark_phys_t zb;
@@ -3118,7 +3347,8 @@ dbuf_prefetch_indirect_done(zio_t *zio, const zbookmark_phys_t *zb,
 		    dpa->dpa_zb.zb_object, dpa->dpa_curlevel, nextblkid);
 
 		(void) arc_read(dpa->dpa_zio, dpa->dpa_spa,
-		    bp, dbuf_prefetch_indirect_done, dpa, dpa->dpa_prio,
+		    bp, dbuf_prefetch_indirect_done, dpa,
+		    ZIO_PRIORITY_SYNC_READ,
 		    ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE,
 		    &iter_aflags, &zb);
 	}
@@ -3133,9 +3363,10 @@ dbuf_prefetch_indirect_done(zio_t *zio, const zbookmark_phys_t *zb,
  * complete. Note that the prefetch might fail if the dataset is encrypted and
  * the encryption key is unmapped before the IO completes.
  */
-void
-dbuf_prefetch(dnode_t *dn, int64_t level, uint64_t blkid, zio_priority_t prio,
-    arc_flags_t aflags)
+int
+dbuf_prefetch_impl(dnode_t *dn, int64_t level, uint64_t blkid,
+    zio_priority_t prio, arc_flags_t aflags, dbuf_prefetch_fn cb,
+    void *arg)
 {
 	blkptr_t bp;
 	int epbs, nlevels, curlevel;
@@ -3145,10 +3376,10 @@ dbuf_prefetch(dnode_t *dn, int64_t level, uint64_t blkid, zio_priority_t prio,
 	ASSERT(RW_LOCK_HELD(&dn->dn_struct_rwlock));
 
 	if (blkid > dn->dn_maxblkid)
-		return;
+		goto no_issue;
 
 	if (level == 0 && dnode_block_freed(dn, blkid))
-		return;
+		goto no_issue;
 
 	/*
 	 * This dnode hasn't been written to disk yet, so there's nothing to
@@ -3156,11 +3387,11 @@ dbuf_prefetch(dnode_t *dn, int64_t level, uint64_t blkid, zio_priority_t prio,
 	 */
 	nlevels = dn->dn_phys->dn_nlevels;
 	if (level >= nlevels || dn->dn_phys->dn_nblkptr == 0)
-		return;
+		goto no_issue;
 
 	epbs = dn->dn_phys->dn_indblkshift - SPA_BLKPTRSHIFT;
 	if (dn->dn_phys->dn_maxblkid < blkid << (epbs * level))
-		return;
+		goto no_issue;
 
 	dmu_buf_impl_t *db = dbuf_find(dn->dn_objset, dn->dn_object,
 	    level, blkid);
@@ -3170,7 +3401,7 @@ dbuf_prefetch(dnode_t *dn, int64_t level, uint64_t blkid, zio_priority_t prio,
 		 * This dbuf already exists.  It is either CACHED, or
 		 * (we assume) about to be read or filled.
 		 */
-		return;
+		goto no_issue;
 	}
 
 	/*
@@ -3206,7 +3437,7 @@ dbuf_prefetch(dnode_t *dn, int64_t level, uint64_t blkid, zio_priority_t prio,
 	    dsl_dataset_feature_is_active(dn->dn_objset->os_dsl_dataset,
 	    SPA_FEATURE_REDACTED_DATASETS));
 	if (BP_IS_HOLE(&bp) || BP_IS_REDACTED(&bp))
-		return;
+		goto no_issue;
 
 	ASSERT3U(curlevel, ==, BP_GET_LEVEL(&bp));
 
@@ -3224,9 +3455,11 @@ dbuf_prefetch(dnode_t *dn, int64_t level, uint64_t blkid, zio_priority_t prio,
 	dpa->dpa_dnode = dn;
 	dpa->dpa_epbs = epbs;
 	dpa->dpa_zio = pio;
+	dpa->dpa_cb = cb;
+	dpa->dpa_arg = arg;
 
 	/* flag if L2ARC eligible, l2arc_noprefetch then decides */
-	if (DNODE_LEVEL_IS_L2CACHEABLE(dn, level))
+	if (dnode_level_is_l2cacheable(&bp, dn, level))
 		dpa->dpa_aflags |= ARC_FLAG_L2CACHE;
 
 	/*
@@ -3239,19 +3472,19 @@ dbuf_prefetch(dnode_t *dn, int64_t level, uint64_t blkid, zio_priority_t prio,
 	if (curlevel == level) {
 		ASSERT3U(curblkid, ==, blkid);
 		dbuf_issue_final_prefetch(dpa, &bp);
-		kmem_free(dpa, sizeof (*dpa));
 	} else {
 		arc_flags_t iter_aflags = ARC_FLAG_NOWAIT;
 		zbookmark_phys_t zb;
 
 		/* flag if L2ARC eligible, l2arc_noprefetch then decides */
-		if (DNODE_LEVEL_IS_L2CACHEABLE(dn, level))
+		if (dnode_level_is_l2cacheable(&bp, dn, level))
 			iter_aflags |= ARC_FLAG_L2CACHE;
 
 		SET_BOOKMARK(&zb, ds != NULL ? ds->ds_object : DMU_META_OBJSET,
 		    dn->dn_object, curlevel, curblkid);
 		(void) arc_read(dpa->dpa_zio, dpa->dpa_spa,
-		    &bp, dbuf_prefetch_indirect_done, dpa, prio,
+		    &bp, dbuf_prefetch_indirect_done, dpa,
+		    ZIO_PRIORITY_SYNC_READ,
 		    ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE,
 		    &iter_aflags, &zb);
 	}
@@ -3260,6 +3493,19 @@ dbuf_prefetch(dnode_t *dn, int64_t level, uint64_t blkid, zio_priority_t prio,
 	 * dpa may have already been freed.
 	 */
 	zio_nowait(pio);
+	return (1);
+no_issue:
+	if (cb != NULL)
+		cb(arg, level, blkid, B_FALSE);
+	return (0);
+}
+
+int
+dbuf_prefetch(dnode_t *dn, int64_t level, uint64_t blkid, zio_priority_t prio,
+    arc_flags_t aflags)
+{
+
+	return (dbuf_prefetch_impl(dn, level, blkid, prio, aflags, NULL, NULL));
 }
 
 /*
@@ -3274,12 +3520,32 @@ noinline static void
 dbuf_hold_copy(dnode_t *dn, dmu_buf_impl_t *db)
 {
 	dbuf_dirty_record_t *dr = db->db_data_pending;
-	arc_buf_t *newdata, *data = dr->dt.dl.dr_data;
+	arc_buf_t *data = dr->dt.dl.dr_data;
+	enum zio_compress compress_type = arc_get_compression(data);
+	uint8_t complevel = arc_get_complevel(data);
 
-	newdata = dbuf_alloc_arcbuf_from_arcbuf(db, data);
-	dbuf_set_data(db, newdata);
+	if (arc_is_encrypted(data)) {
+		boolean_t byteorder;
+		uint8_t salt[ZIO_DATA_SALT_LEN];
+		uint8_t iv[ZIO_DATA_IV_LEN];
+		uint8_t mac[ZIO_DATA_MAC_LEN];
+
+		arc_get_raw_params(data, &byteorder, salt, iv, mac);
+		dbuf_set_data(db, arc_alloc_raw_buf(dn->dn_objset->os_spa, db,
+		    dmu_objset_id(dn->dn_objset), byteorder, salt, iv, mac,
+		    dn->dn_type, arc_buf_size(data), arc_buf_lsize(data),
+		    compress_type, complevel));
+	} else if (compress_type != ZIO_COMPRESS_OFF) {
+		dbuf_set_data(db, arc_alloc_compressed_buf(
+		    dn->dn_objset->os_spa, db, arc_buf_size(data),
+		    arc_buf_lsize(data), compress_type, complevel));
+	} else {
+		dbuf_set_data(db, arc_alloc_buf(dn->dn_objset->os_spa, db,
+		    DBUF_GET_BUFC_TYPE(db), db->db.db_size));
+	}
+
 	rw_enter(&db->db_rwlock, RW_WRITER);
-	bcopy(data->b_data, db->db.db_data, arc_buf_size(data));
+	memcpy(db->db.db_data, data->b_data, arc_buf_size(data));
 	rw_exit(&db->db_rwlock);
 }
 
@@ -3290,7 +3556,7 @@ dbuf_hold_copy(dnode_t *dn, dmu_buf_impl_t *db)
 int
 dbuf_hold_impl(dnode_t *dn, uint8_t level, uint64_t blkid,
     boolean_t fail_sparse, boolean_t fail_uncached,
-    void *tag, dmu_buf_impl_t **dbp)
+    const void *tag, dmu_buf_impl_t **dbp)
 {
 	dmu_buf_impl_t *db, *parent = NULL;
 
@@ -3363,7 +3629,7 @@ dbuf_hold_impl(dnode_t *dn, uint8_t level, uint64_t blkid,
 		ASSERT(db->db_caching_status == DB_DBUF_CACHE ||
 		    db->db_caching_status == DB_DBUF_METADATA_CACHE);
 
-		multilist_remove(dbuf_caches[db->db_caching_status].cache, db);
+		multilist_remove(&dbuf_caches[db->db_caching_status].cache, db);
 		(void) zfs_refcount_remove_many(
 		    &dbuf_caches[db->db_caching_status].size,
 		    db->db.db_size, db);
@@ -3395,13 +3661,13 @@ dbuf_hold_impl(dnode_t *dn, uint8_t level, uint64_t blkid,
 }
 
 dmu_buf_impl_t *
-dbuf_hold(dnode_t *dn, uint64_t blkid, void *tag)
+dbuf_hold(dnode_t *dn, uint64_t blkid, const void *tag)
 {
 	return (dbuf_hold_level(dn, 0, blkid, tag));
 }
 
 dmu_buf_impl_t *
-dbuf_hold_level(dnode_t *dn, int level, uint64_t blkid, void *tag)
+dbuf_hold_level(dnode_t *dn, int level, uint64_t blkid, const void *tag)
 {
 	dmu_buf_impl_t *db;
 	int err = dbuf_hold_impl(dn, level, blkid, FALSE, FALSE, tag, &db);
@@ -3442,7 +3708,7 @@ dbuf_rm_spill(dnode_t *dn, dmu_tx_t *tx)
 
 #pragma weak dmu_buf_add_ref = dbuf_add_ref
 void
-dbuf_add_ref(dmu_buf_impl_t *db, void *tag)
+dbuf_add_ref(dmu_buf_impl_t *db, const void *tag)
 {
 	int64_t holds = zfs_refcount_add(&db->db_holds, tag);
 	VERIFY3S(holds, >, 1);
@@ -3451,7 +3717,7 @@ dbuf_add_ref(dmu_buf_impl_t *db, void *tag)
 #pragma weak dmu_buf_try_add_ref = dbuf_try_add_ref
 boolean_t
 dbuf_try_add_ref(dmu_buf_t *db_fake, objset_t *os, uint64_t obj, uint64_t blkid,
-    void *tag)
+    const void *tag)
 {
 	dmu_buf_impl_t *db = (dmu_buf_impl_t *)db_fake;
 	dmu_buf_impl_t *found_db;
@@ -3480,14 +3746,14 @@ dbuf_try_add_ref(dmu_buf_t *db_fake, objset_t *os, uint64_t obj, uint64_t blkid,
  * dnode's parent dbuf evicting its dnode handles.
  */
 void
-dbuf_rele(dmu_buf_impl_t *db, void *tag)
+dbuf_rele(dmu_buf_impl_t *db, const void *tag)
 {
 	mutex_enter(&db->db_mtx);
 	dbuf_rele_and_unlock(db, tag, B_FALSE);
 }
 
 void
-dmu_buf_rele(dmu_buf_t *db, void *tag)
+dmu_buf_rele(dmu_buf_t *db, const void *tag)
 {
 	dbuf_rele((dmu_buf_impl_t *)db, tag);
 }
@@ -3506,7 +3772,7 @@ dmu_buf_rele(dmu_buf_t *db, void *tag)
  *
  */
 void
-dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag, boolean_t evicting)
+dbuf_rele_and_unlock(dmu_buf_impl_t *db, const void *tag, boolean_t evicting)
 {
 	int64_t holds;
 	uint64_t size;
@@ -3605,10 +3871,12 @@ dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag, boolean_t evicting)
 				    DB_DBUF_METADATA_CACHE : DB_DBUF_CACHE;
 				db->db_caching_status = dcs;
 
-				multilist_insert(dbuf_caches[dcs].cache, db);
+				multilist_insert(&dbuf_caches[dcs].cache, db);
+				uint64_t db_size = db->db.db_size;
 				size = zfs_refcount_add_many(
-				    &dbuf_caches[dcs].size,
-				    db->db.db_size, db);
+				    &dbuf_caches[dcs].size, db_size, db);
+				uint8_t db_level = db->db_level;
+				mutex_exit(&db->db_mtx);
 
 				if (dcs == DB_DBUF_METADATA_CACHE) {
 					DBUF_STAT_BUMP(metadata_cache_count);
@@ -3616,16 +3884,14 @@ dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag, boolean_t evicting)
 					    metadata_cache_size_bytes_max,
 					    size);
 				} else {
-					DBUF_STAT_BUMP(
-					    cache_levels[db->db_level]);
 					DBUF_STAT_BUMP(cache_count);
-					DBUF_STAT_INCR(
-					    cache_levels_bytes[db->db_level],
-					    db->db.db_size);
 					DBUF_STAT_MAX(cache_size_bytes_max,
 					    size);
+					DBUF_STAT_BUMP(cache_levels[db_level]);
+					DBUF_STAT_INCR(
+					    cache_levels_bytes[db_level],
+					    db_size);
 				}
-				mutex_exit(&db->db_mtx);
 
 				if (dcs == DB_DBUF_CACHE && !evicting)
 					dbuf_evict_notify(size);
@@ -3710,7 +3976,7 @@ dmu_buf_get_user(dmu_buf_t *db_fake)
 }
 
 void
-dmu_buf_user_evict_wait()
+dmu_buf_user_evict_wait(void)
 {
 	taskq_wait(dbu_evict_taskq);
 }
@@ -3797,15 +4063,13 @@ dbuf_sync_bonus(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 
 	ASSERT0(db->db_level);
 	ASSERT(MUTEX_HELD(&db->db_mtx));
-	ASSERT(DB_DNODE_HELD(db));
 	ASSERT(db->db_blkid == DMU_BONUS_BLKID);
 	ASSERT(data != NULL);
 
-	dnode_t *dn = DB_DNODE(db);
+	dnode_t *dn = dr->dr_dnode;
 	ASSERT3U(DN_MAX_BONUS_LEN(dn->dn_phys), <=,
 	    DN_SLOTS_TO_BONUSLEN(dn->dn_phys->dn_extra_slots + 1));
-	bcopy(data, DN_BONUS(dn->dn_phys), DN_MAX_BONUS_LEN(dn->dn_phys));
-	DB_DNODE_EXIT(db);
+	memcpy(DN_BONUS(dn->dn_phys), data, DN_MAX_BONUS_LEN(dn->dn_phys));
 
 	dbuf_sync_leaf_verify_bonus_dnode(dr);
 
@@ -3864,8 +4128,7 @@ noinline static void
 dbuf_sync_indirect(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 {
 	dmu_buf_impl_t *db = dr->dr_dbuf;
-	dnode_t *dn;
-	zio_t *zio;
+	dnode_t *dn = dr->dr_dnode;
 
 	ASSERT(dmu_tx_is_syncing(tx));
 
@@ -3885,12 +4148,9 @@ dbuf_sync_indirect(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 	ASSERT3U(db->db_state, ==, DB_CACHED);
 	ASSERT(db->db_buf != NULL);
 
-	DB_DNODE_ENTER(db);
-	dn = DB_DNODE(db);
 	/* Indirect block size must match what the dnode thinks it is. */
 	ASSERT3U(db->db.db_size, ==, 1<<dn->dn_phys->dn_indblkshift);
 	dbuf_check_blkptr(dn, db);
-	DB_DNODE_EXIT(db);
 
 	/* Provide the pending dirty record to child dbufs */
 	db->db_data_pending = dr;
@@ -3899,7 +4159,7 @@ dbuf_sync_indirect(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 
 	dbuf_write(dr, db->db_buf, tx);
 
-	zio = dr->dr_zio;
+	zio_t *zio = dr->dr_zio;
 	mutex_enter(&dr->dt.di.dr_mtx);
 	dbuf_sync_list(&dr->dt.di.dr_children, db->db_level - 1, tx);
 	ASSERT(list_head(&dr->dt.di.dr_children) == NULL);
@@ -3924,7 +4184,7 @@ static void
 dbuf_sync_leaf_verify_bonus_dnode(dbuf_dirty_record_t *dr)
 {
 #ifdef ZFS_DEBUG
-	dnode_t *dn = DB_DNODE(dr->dr_dbuf);
+	dnode_t *dn = dr->dr_dnode;
 
 	/*
 	 * Encrypted bonus buffers can have data past their bonuslen.
@@ -3947,6 +4207,153 @@ dbuf_sync_leaf_verify_bonus_dnode(dbuf_dirty_record_t *dr)
 #endif
 }
 
+static blkptr_t *
+dbuf_lightweight_bp(dbuf_dirty_record_t *dr)
+{
+	/* This must be a lightweight dirty record. */
+	ASSERT3P(dr->dr_dbuf, ==, NULL);
+	dnode_t *dn = dr->dr_dnode;
+
+	if (dn->dn_phys->dn_nlevels == 1) {
+		VERIFY3U(dr->dt.dll.dr_blkid, <, dn->dn_phys->dn_nblkptr);
+		return (&dn->dn_phys->dn_blkptr[dr->dt.dll.dr_blkid]);
+	} else {
+		dmu_buf_impl_t *parent_db = dr->dr_parent->dr_dbuf;
+		int epbs = dn->dn_indblkshift - SPA_BLKPTRSHIFT;
+		VERIFY3U(parent_db->db_level, ==, 1);
+		VERIFY3P(parent_db->db_dnode_handle->dnh_dnode, ==, dn);
+		VERIFY3U(dr->dt.dll.dr_blkid >> epbs, ==, parent_db->db_blkid);
+		blkptr_t *bp = parent_db->db.db_data;
+		return (&bp[dr->dt.dll.dr_blkid & ((1 << epbs) - 1)]);
+	}
+}
+
+static void
+dbuf_lightweight_ready(zio_t *zio)
+{
+	dbuf_dirty_record_t *dr = zio->io_private;
+	blkptr_t *bp = zio->io_bp;
+
+	if (zio->io_error != 0)
+		return;
+
+	dnode_t *dn = dr->dr_dnode;
+
+	blkptr_t *bp_orig = dbuf_lightweight_bp(dr);
+	spa_t *spa = dmu_objset_spa(dn->dn_objset);
+	int64_t delta = bp_get_dsize_sync(spa, bp) -
+	    bp_get_dsize_sync(spa, bp_orig);
+	dnode_diduse_space(dn, delta);
+
+	uint64_t blkid = dr->dt.dll.dr_blkid;
+	mutex_enter(&dn->dn_mtx);
+	if (blkid > dn->dn_phys->dn_maxblkid) {
+		ASSERT0(dn->dn_objset->os_raw_receive);
+		dn->dn_phys->dn_maxblkid = blkid;
+	}
+	mutex_exit(&dn->dn_mtx);
+
+	if (!BP_IS_EMBEDDED(bp)) {
+		uint64_t fill = BP_IS_HOLE(bp) ? 0 : 1;
+		BP_SET_FILL(bp, fill);
+	}
+
+	dmu_buf_impl_t *parent_db;
+	EQUIV(dr->dr_parent == NULL, dn->dn_phys->dn_nlevels == 1);
+	if (dr->dr_parent == NULL) {
+		parent_db = dn->dn_dbuf;
+	} else {
+		parent_db = dr->dr_parent->dr_dbuf;
+	}
+	rw_enter(&parent_db->db_rwlock, RW_WRITER);
+	*bp_orig = *bp;
+	rw_exit(&parent_db->db_rwlock);
+}
+
+static void
+dbuf_lightweight_physdone(zio_t *zio)
+{
+	dbuf_dirty_record_t *dr = zio->io_private;
+	dsl_pool_t *dp = spa_get_dsl(zio->io_spa);
+	ASSERT3U(dr->dr_txg, ==, zio->io_txg);
+
+	/*
+	 * The callback will be called io_phys_children times.  Retire one
+	 * portion of our dirty space each time we are called.  Any rounding
+	 * error will be cleaned up by dbuf_lightweight_done().
+	 */
+	int delta = dr->dr_accounted / zio->io_phys_children;
+	dsl_pool_undirty_space(dp, delta, zio->io_txg);
+}
+
+static void
+dbuf_lightweight_done(zio_t *zio)
+{
+	dbuf_dirty_record_t *dr = zio->io_private;
+
+	VERIFY0(zio->io_error);
+
+	objset_t *os = dr->dr_dnode->dn_objset;
+	dmu_tx_t *tx = os->os_synctx;
+
+	if (zio->io_flags & (ZIO_FLAG_IO_REWRITE | ZIO_FLAG_NOPWRITE)) {
+		ASSERT(BP_EQUAL(zio->io_bp, &zio->io_bp_orig));
+	} else {
+		dsl_dataset_t *ds = os->os_dsl_dataset;
+		(void) dsl_dataset_block_kill(ds, &zio->io_bp_orig, tx, B_TRUE);
+		dsl_dataset_block_born(ds, zio->io_bp, tx);
+	}
+
+	/*
+	 * See comment in dbuf_write_done().
+	 */
+	if (zio->io_phys_children == 0) {
+		dsl_pool_undirty_space(dmu_objset_pool(os),
+		    dr->dr_accounted, zio->io_txg);
+	} else {
+		dsl_pool_undirty_space(dmu_objset_pool(os),
+		    dr->dr_accounted % zio->io_phys_children, zio->io_txg);
+	}
+
+	abd_free(dr->dt.dll.dr_abd);
+	kmem_free(dr, sizeof (*dr));
+}
+
+noinline static void
+dbuf_sync_lightweight(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
+{
+	dnode_t *dn = dr->dr_dnode;
+	zio_t *pio;
+	if (dn->dn_phys->dn_nlevels == 1) {
+		pio = dn->dn_zio;
+	} else {
+		pio = dr->dr_parent->dr_zio;
+	}
+
+	zbookmark_phys_t zb = {
+		.zb_objset = dmu_objset_id(dn->dn_objset),
+		.zb_object = dn->dn_object,
+		.zb_level = 0,
+		.zb_blkid = dr->dt.dll.dr_blkid,
+	};
+
+	/*
+	 * See comment in dbuf_write().  This is so that zio->io_bp_orig
+	 * will have the old BP in dbuf_lightweight_done().
+	 */
+	dr->dr_bp_copy = *dbuf_lightweight_bp(dr);
+
+	dr->dr_zio = zio_write(pio, dmu_objset_spa(dn->dn_objset),
+	    dmu_tx_get_txg(tx), &dr->dr_bp_copy, dr->dt.dll.dr_abd,
+	    dn->dn_datablksz, abd_get_size(dr->dt.dll.dr_abd),
+	    &dr->dt.dll.dr_props, dbuf_lightweight_ready, NULL,
+	    dbuf_lightweight_physdone, dbuf_lightweight_done, dr,
+	    ZIO_PRIORITY_ASYNC_WRITE,
+	    ZIO_FLAG_MUSTSUCCEED | dr->dt.dll.dr_flags, &zb);
+
+	zio_nowait(dr->dr_zio);
+}
+
 /*
  * dbuf_sync_leaf() is called recursively from dbuf_sync_list() so it is
  * critical the we not allow the compiler to inline this function in to
@@ -3957,7 +4364,7 @@ dbuf_sync_leaf(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 {
 	arc_buf_t **datap = &dr->dt.dl.dr_data;
 	dmu_buf_impl_t *db = dr->dr_dbuf;
-	dnode_t *dn;
+	dnode_t *dn = dr->dr_dnode;
 	objset_t *os;
 	uint64_t txg = tx->tx_txg;
 
@@ -3980,9 +4387,6 @@ dbuf_sync_leaf(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 		ASSERT(db->db_state == DB_CACHED || db->db_state == DB_NOFILL);
 	}
 	DBUF_VERIFY(db);
-
-	DB_DNODE_ENTER(db);
-	dn = DB_DNODE(db);
 
 	if (db->db_blkid == DMU_SPILL_BLKID) {
 		mutex_enter(&dn->dn_mtx);
@@ -4061,8 +4465,31 @@ dbuf_sync_leaf(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 		 * objects only modified in the syncing context (e.g.
 		 * DNONE_DNODE blocks).
 		 */
-		*datap = dbuf_alloc_arcbuf_from_arcbuf(db, db->db_buf);
-		bcopy(db->db.db_data, (*datap)->b_data, arc_buf_size(*datap));
+		int psize = arc_buf_size(*datap);
+		int lsize = arc_buf_lsize(*datap);
+		arc_buf_contents_t type = DBUF_GET_BUFC_TYPE(db);
+		enum zio_compress compress_type = arc_get_compression(*datap);
+		uint8_t complevel = arc_get_complevel(*datap);
+
+		if (arc_is_encrypted(*datap)) {
+			boolean_t byteorder;
+			uint8_t salt[ZIO_DATA_SALT_LEN];
+			uint8_t iv[ZIO_DATA_IV_LEN];
+			uint8_t mac[ZIO_DATA_MAC_LEN];
+
+			arc_get_raw_params(*datap, &byteorder, salt, iv, mac);
+			*datap = arc_alloc_raw_buf(os->os_spa, db,
+			    dmu_objset_id(os), byteorder, salt, iv, mac,
+			    dn->dn_type, psize, lsize, compress_type,
+			    complevel);
+		} else if (compress_type != ZIO_COMPRESS_OFF) {
+			ASSERT3U(type, ==, ARC_BUFC_DATA);
+			*datap = arc_alloc_compressed_buf(os->os_spa, db,
+			    psize, lsize, compress_type, complevel);
+		} else {
+			*datap = arc_alloc_buf(os->os_spa, db, type, psize);
+		}
+		memcpy((*datap)->b_data, db->db.db_data, psize);
 	}
 	db->db_data_pending = dr;
 
@@ -4073,16 +4500,7 @@ dbuf_sync_leaf(dbuf_dirty_record_t *dr, dmu_tx_t *tx)
 	ASSERT(!list_link_active(&dr->dr_dirty_node));
 	if (dn->dn_object == DMU_META_DNODE_OBJECT) {
 		list_insert_tail(&dn->dn_dirty_records[txg & TXG_MASK], dr);
-		DB_DNODE_EXIT(db);
 	} else {
-		/*
-		 * Although zio_nowait() does not "wait for an IO", it does
-		 * initiate the IO. If this is an empty write it seems plausible
-		 * that the IO could actually be completed before the nowait
-		 * returns. We need to DB_DNODE_EXIT() first in case
-		 * zio_nowait() invalidates the dbuf.
-		 */
-		DB_DNODE_EXIT(db);
 		zio_nowait(dr->dr_zio);
 	}
 }
@@ -4105,22 +4523,26 @@ dbuf_sync_list(list_t *list, int level, dmu_tx_t *tx)
 			    DMU_META_DNODE_OBJECT);
 			break;
 		}
-		if (dr->dr_dbuf->db_blkid != DMU_BONUS_BLKID &&
-		    dr->dr_dbuf->db_blkid != DMU_SPILL_BLKID) {
-			VERIFY3U(dr->dr_dbuf->db_level, ==, level);
-		}
 		list_remove(list, dr);
-		if (dr->dr_dbuf->db_level > 0)
-			dbuf_sync_indirect(dr, tx);
-		else
-			dbuf_sync_leaf(dr, tx);
+		if (dr->dr_dbuf == NULL) {
+			dbuf_sync_lightweight(dr, tx);
+		} else {
+			if (dr->dr_dbuf->db_blkid != DMU_BONUS_BLKID &&
+			    dr->dr_dbuf->db_blkid != DMU_SPILL_BLKID) {
+				VERIFY3U(dr->dr_dbuf->db_level, ==, level);
+			}
+			if (dr->dr_dbuf->db_level > 0)
+				dbuf_sync_indirect(dr, tx);
+			else
+				dbuf_sync_leaf(dr, tx);
+		}
 	}
 }
 
-/* ARGSUSED */
 static void
 dbuf_write_ready(zio_t *zio, arc_buf_t *buf, void *vdb)
 {
+	(void) buf;
 	dmu_buf_impl_t *db = vdb;
 	dnode_t *dn;
 	blkptr_t *bp = zio->io_bp;
@@ -4208,7 +4630,6 @@ dbuf_write_ready(zio_t *zio, arc_buf_t *buf, void *vdb)
 	dmu_buf_unlock_parent(db, dblt, FTAG);
 }
 
-/* ARGSUSED */
 /*
  * This function gets called just prior to running through the compression
  * stage of the zio pipeline. If we're an indirect block comprised of only
@@ -4219,6 +4640,7 @@ dbuf_write_ready(zio_t *zio, arc_buf_t *buf, void *vdb)
 static void
 dbuf_write_children_ready(zio_t *zio, arc_buf_t *buf, void *vdb)
 {
+	(void) zio, (void) buf;
 	dmu_buf_impl_t *db = vdb;
 	dnode_t *dn;
 	blkptr_t *bp;
@@ -4247,7 +4669,7 @@ dbuf_write_children_ready(zio_t *zio, arc_buf_t *buf, void *vdb)
 		 * zero out.
 		 */
 		rw_enter(&db->db_rwlock, RW_WRITER);
-		bzero(db->db.db_data, db->db.db_size);
+		memset(db->db.db_data, 0, db->db.db_size);
 		rw_exit(&db->db_rwlock);
 	}
 	DB_DNODE_EXIT(db);
@@ -4262,10 +4684,10 @@ dbuf_write_children_ready(zio_t *zio, arc_buf_t *buf, void *vdb)
  * so this callback allows us to retire dirty space gradually, as the physical
  * i/os complete.
  */
-/* ARGSUSED */
 static void
 dbuf_write_physdone(zio_t *zio, arc_buf_t *buf, void *arg)
 {
+	(void) buf;
 	dmu_buf_impl_t *db = arg;
 	objset_t *os = db->db_objset;
 	dsl_pool_t *dp = dmu_objset_pool(os);
@@ -4284,16 +4706,15 @@ dbuf_write_physdone(zio_t *zio, arc_buf_t *buf, void *arg)
 	dsl_pool_undirty_space(dp, delta, zio->io_txg);
 }
 
-/* ARGSUSED */
 static void
 dbuf_write_done(zio_t *zio, arc_buf_t *buf, void *vdb)
 {
+	(void) buf;
 	dmu_buf_impl_t *db = vdb;
 	blkptr_t *bp_orig = &zio->io_bp_orig;
 	blkptr_t *bp = db->db_blkptr;
 	objset_t *os = db->db_objset;
 	dmu_tx_t *tx = os->os_synctx;
-	dbuf_dirty_record_t *dr;
 
 	ASSERT0(zio->io_error);
 	ASSERT(db->db_blkptr == bp);
@@ -4314,7 +4735,8 @@ dbuf_write_done(zio_t *zio, arc_buf_t *buf, void *vdb)
 
 	DBUF_VERIFY(db);
 
-	dr = db->db_data_pending;
+	dbuf_dirty_record_t *dr = db->db_data_pending;
+	dnode_t *dn = dr->dr_dnode;
 	ASSERT(!list_link_active(&dr->dr_dirty_node));
 	ASSERT(dr->dr_dbuf == db);
 	ASSERT(list_next(&db->db_dirty_records, dr) == NULL);
@@ -4322,14 +4744,9 @@ dbuf_write_done(zio_t *zio, arc_buf_t *buf, void *vdb)
 
 #ifdef ZFS_DEBUG
 	if (db->db_blkid == DMU_SPILL_BLKID) {
-		dnode_t *dn;
-
-		DB_DNODE_ENTER(db);
-		dn = DB_DNODE(db);
 		ASSERT(dn->dn_phys->dn_flags & DNODE_FLAG_SPILL_BLKPTR);
 		ASSERT(!(BP_IS_HOLE(db->db_blkptr)) &&
 		    db->db_blkptr == DN_SPILL_BLKPTR(dn->dn_phys));
-		DB_DNODE_EXIT(db);
 	}
 #endif
 
@@ -4341,10 +4758,6 @@ dbuf_write_done(zio_t *zio, arc_buf_t *buf, void *vdb)
 				arc_buf_destroy(dr->dt.dl.dr_data, db);
 		}
 	} else {
-		dnode_t *dn;
-
-		DB_DNODE_ENTER(db);
-		dn = DB_DNODE(db);
 		ASSERT(list_head(&dr->dt.di.dr_children) == NULL);
 		ASSERT3U(db->db.db_size, ==, 1 << dn->dn_phys->dn_indblkshift);
 		if (!BP_IS_HOLE(db->db_blkptr)) {
@@ -4355,7 +4768,6 @@ dbuf_write_done(zio_t *zio, arc_buf_t *buf, void *vdb)
 			ASSERT3U(BP_GET_LSIZE(db->db_blkptr), ==,
 			    db->db.db_size);
 		}
-		DB_DNODE_EXIT(db);
 		mutex_destroy(&dr->dt.di.dr_mtx);
 		list_destroy(&dr->dt.di.dr_children);
 	}
@@ -4430,7 +4842,7 @@ dbuf_write_override_done(zio_t *zio)
 	dbuf_write_done(zio, NULL, db);
 
 	if (zio->io_abd != NULL)
-		abd_put(zio->io_abd);
+		abd_free(zio->io_abd);
 }
 
 typedef struct dbuf_remap_impl_callback_arg {
@@ -4548,7 +4960,7 @@ static void
 dbuf_write(dbuf_dirty_record_t *dr, arc_buf_t *data, dmu_tx_t *tx)
 {
 	dmu_buf_impl_t *db = dr->dr_dbuf;
-	dnode_t *dn;
+	dnode_t *dn = dr->dr_dnode;
 	objset_t *os;
 	dmu_buf_impl_t *parent = db->db_parent;
 	uint64_t txg = tx->tx_txg;
@@ -4559,8 +4971,6 @@ dbuf_write(dbuf_dirty_record_t *dr, arc_buf_t *data, dmu_tx_t *tx)
 
 	ASSERT(dmu_tx_is_syncing(tx));
 
-	DB_DNODE_ENTER(db);
-	dn = DB_DNODE(db);
 	os = dn->dn_objset;
 
 	if (db->db_state != DB_NOFILL) {
@@ -4616,7 +5026,6 @@ dbuf_write(dbuf_dirty_record_t *dr, arc_buf_t *data, dmu_tx_t *tx)
 	wp_flag |= (db->db_state == DB_NOFILL) ? WP_NOFILL : 0;
 
 	dmu_write_policy(os, dn, db->db_level, wp_flag, &zp);
-	DB_DNODE_EXIT(db);
 
 	/*
 	 * We copy the blkptr now (rather than when we instantiate the dirty
@@ -4667,7 +5076,7 @@ dbuf_write(dbuf_dirty_record_t *dr, arc_buf_t *data, dmu_tx_t *tx)
 			children_ready_cb = dbuf_write_children_ready;
 
 		dr->dr_zio = arc_write(pio, os->os_spa, txg,
-		    &dr->dr_bp_copy, data, DBUF_IS_L2CACHEABLE(db),
+		    &dr->dr_bp_copy, data, dbuf_is_l2cacheable(db),
 		    &zp, dbuf_write_ready,
 		    children_ready_cb, dbuf_write_physdone,
 		    dbuf_write_done, db, ZIO_PRIORITY_ASYNC_WRITE,
@@ -4711,25 +5120,23 @@ EXPORT_SYMBOL(dmu_buf_set_user_ie);
 EXPORT_SYMBOL(dmu_buf_get_user);
 EXPORT_SYMBOL(dmu_buf_get_blkptr);
 
-/* BEGIN CSTYLED */
 ZFS_MODULE_PARAM(zfs_dbuf_cache, dbuf_cache_, max_bytes, ULONG, ZMOD_RW,
 	"Maximum size in bytes of the dbuf cache.");
 
 ZFS_MODULE_PARAM(zfs_dbuf_cache, dbuf_cache_, hiwater_pct, UINT, ZMOD_RW,
-	"Percentage over dbuf_cache_max_bytes when dbufs must be evicted "
-	"directly.");
+	"Percentage over dbuf_cache_max_bytes for direct dbuf eviction.");
 
 ZFS_MODULE_PARAM(zfs_dbuf_cache, dbuf_cache_, lowater_pct, UINT, ZMOD_RW,
-	"Percentage below dbuf_cache_max_bytes when the evict thread stops "
-	"evicting dbufs.");
+	"Percentage below dbuf_cache_max_bytes when dbuf eviction stops.");
 
 ZFS_MODULE_PARAM(zfs_dbuf, dbuf_, metadata_cache_max_bytes, ULONG, ZMOD_RW,
-	"Maximum size in bytes of the dbuf metadata cache.");
+	"Maximum size in bytes of dbuf metadata cache.");
 
-ZFS_MODULE_PARAM(zfs_dbuf, dbuf_, cache_shift, INT, ZMOD_RW,
-	"Set the size of the dbuf cache to a log2 fraction of arc size.");
+ZFS_MODULE_PARAM(zfs_dbuf, dbuf_, cache_shift, UINT, ZMOD_RW,
+	"Set size of dbuf cache to log2 fraction of arc size.");
 
-ZFS_MODULE_PARAM(zfs_dbuf, dbuf_, metadata_cache_shift, INT, ZMOD_RW,
-	"Set the size of the dbuf metadata cache to a log2 fraction of arc "
-	"size.");
-/* END CSTYLED */
+ZFS_MODULE_PARAM(zfs_dbuf, dbuf_, metadata_cache_shift, UINT, ZMOD_RW,
+	"Set size of dbuf metadata cache to log2 fraction of arc size.");
+
+ZFS_MODULE_PARAM(zfs_dbuf, dbuf_, mutex_cache_shift, UINT, ZMOD_RD,
+	"Set size of dbuf cache mutex array as log2 shift.");

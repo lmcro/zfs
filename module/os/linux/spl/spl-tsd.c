@@ -5,7 +5,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -707,7 +706,7 @@ spl_tsd_init(void)
 {
 	tsd_hash_table = tsd_hash_table_init(TSD_HASH_TABLE_BITS_DEFAULT);
 	if (tsd_hash_table == NULL)
-		return (1);
+		return (-ENOMEM);
 
 	return (0);
 }

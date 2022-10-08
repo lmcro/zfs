@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -115,16 +115,45 @@ fn(struct dentry *dentry, const char *name, void *buffer, size_t size,	\
 {									\
 	return (__ ## fn(dentry->d_inode, name, buffer, size));		\
 }
+/*
+ * Android API change,
+ * The xattr_handler->get() callback was changed to take a dentry and inode
+ * and flags, because the dentry might not be attached to an inode yet.
+ */
+#elif defined(HAVE_XATTR_GET_DENTRY_INODE_FLAGS)
+#define	ZPL_XATTR_GET_WRAPPER(fn)					\
+static int								\
+fn(const struct xattr_handler *handler, struct dentry *dentry,		\
+    struct inode *inode, const char *name, void *buffer,		\
+    size_t size, int flags)						\
+{									\
+	return (__ ## fn(inode, name, buffer, size));			\
+}
 #else
 #error "Unsupported kernel"
 #endif
 
 /*
+ * 5.12 API change,
+ * The xattr_handler->set() callback was changed to take the
+ * struct user_namespace* as the first arg, to support idmapped
+ * mounts.
+ */
+#if defined(HAVE_XATTR_SET_USERNS)
+#define	ZPL_XATTR_SET_WRAPPER(fn)					\
+static int								\
+fn(const struct xattr_handler *handler, struct user_namespace *user_ns, \
+    struct dentry *dentry, struct inode *inode, const char *name,	\
+    const void *buffer, size_t size, int flags)	\
+{									\
+	return (__ ## fn(inode, name, buffer, size, flags));		\
+}
+/*
  * 4.7 API change,
  * The xattr_handler->set() callback was changed to take a both dentry and
  * inode, because the dentry might not be attached to an inode yet.
  */
-#if defined(HAVE_XATTR_SET_DENTRY_INODE)
+#elif defined(HAVE_XATTR_SET_DENTRY_INODE)
 #define	ZPL_XATTR_SET_WRAPPER(fn)					\
 static int								\
 fn(const struct xattr_handler *handler, struct dentry *dentry,		\

@@ -33,17 +33,28 @@
 /*
  * This is a bag of dirty hacks to keep things compiling.
  */
+#include_next <sys/types.h>
 
+#ifdef __ILP32__
+typedef __uint64_t u_longlong_t;
+typedef __int64_t longlong_t;
+#else
+typedef unsigned long long	u_longlong_t;
+typedef long long		longlong_t;
+#endif
 #include <sys/stdint.h>
 
-typedef	int64_t		clock_t;
 #define	_CLOCK_T_DECLARED
 
-#include_next <sys/types.h>
 #include <sys/types32.h>
 #include <sys/_stdarg.h>
+#include <linux/types.h>
 
 #define	MAXNAMELEN	256
+
+
+
+typedef	void zfs_kernel_param_t;
 
 typedef	struct timespec	timestruc_t;
 typedef	struct timespec	timespec_t;
@@ -53,8 +64,8 @@ typedef u_int		uint_t;
 typedef u_char		uchar_t;
 typedef u_short		ushort_t;
 typedef u_long		ulong_t;
-typedef	u_int		minor_t;
 /* END CSTYLED */
+typedef	int		minor_t;
 #ifndef	_OFF64_T_DECLARED
 #define	_OFF64_T_DECLARED
 typedef off_t		off64_t;
@@ -62,13 +73,10 @@ typedef off_t		off64_t;
 typedef id_t		taskid_t;
 typedef id_t		projid_t;
 typedef id_t		poolid_t;
-typedef id_t		zoneid_t;
+typedef uint_t		zoneid_t;
 typedef id_t		ctid_t;
 typedef	mode_t		o_mode_t;
 typedef	uint64_t	pgcnt_t;
-
-#define	B_FALSE	0
-#define	B_TRUE	1
 
 typedef	short		index_t;
 typedef	off_t		offset_t;
@@ -79,13 +87,17 @@ typedef	__ptrdiff_t		ptrdiff_t;	/* pointer difference */
 typedef	int64_t		rlim64_t;
 typedef	int		major_t;
 
-#else
 #ifdef NEED_SOLARIS_BOOLEAN
 #if defined(__XOPEN_OR_POSIX)
 typedef enum { _B_FALSE, _B_TRUE }	boolean_t;
 #else
 typedef enum { B_FALSE, B_TRUE }	boolean_t;
 #endif /* defined(__XOPEN_OR_POSIX) */
+#else
+
+#define	B_FALSE	0
+#define	B_TRUE	1
+
 #endif
 
 typedef	u_longlong_t	u_offset_t;
@@ -93,5 +105,5 @@ typedef	u_longlong_t	len_t;
 
 typedef	longlong_t	diskaddr_t;
 
-
+#include <sys/debug.h>
 #endif	/* !_OPENSOLARIS_SYS_TYPES_H_ */

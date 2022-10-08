@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -22,6 +21,7 @@
  *  with the SPL.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <linux/percpu_compat.h>
 #include <sys/debug.h>
 #include <sys/vmem.h>
 #include <sys/kmem_cache.h>

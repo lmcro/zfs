@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -46,6 +46,7 @@ typedef struct zvol_state {
 	uint32_t		zv_flags;	/* ZVOL_* flags */
 	uint32_t		zv_open_count;	/* open counts */
 	uint32_t		zv_changed;	/* disk changed */
+	uint32_t		zv_volmode;	/* volmode */
 	zilog_t			*zv_zilog;	/* ZIL handle */
 	zfs_rangelock_t		zv_rangelock;	/* for range locking */
 	dnode_t			*zv_dn;		/* dnode hold */
@@ -60,12 +61,11 @@ typedef struct zvol_state {
 } zvol_state_t;
 
 
-extern list_t zvol_state_list;
 extern krwlock_t zvol_state_lock;
 #define	ZVOL_HT_SIZE	1024
 extern struct hlist_head *zvol_htable;
 #define	ZVOL_HT_HEAD(hash)	(&zvol_htable[(hash) & (ZVOL_HT_SIZE-1)])
-extern zil_replay_func_t *zvol_replay_vector[TX_MAX_TYPE];
+extern zil_replay_func_t *const zvol_replay_vector[TX_MAX_TYPE];
 
 extern unsigned int zvol_volmode;
 extern unsigned int zvol_inhibit_dev;
@@ -84,25 +84,22 @@ void zvol_log_truncate(zvol_state_t *zv, dmu_tx_t *tx, uint64_t off,
     uint64_t len, boolean_t sync);
 void zvol_log_write(zvol_state_t *zv, dmu_tx_t *tx, uint64_t offset,
     uint64_t size, int sync);
-int zvol_get_data(void *arg, lr_write_t *lr, char *buf, struct lwb *lwb,
-    zio_t *zio);
+int zvol_get_data(void *arg, uint64_t arg2, lr_write_t *lr, char *buf,
+    struct lwb *lwb, zio_t *zio);
 int zvol_init_impl(void);
 void zvol_fini_impl(void);
+void zvol_wait_close(zvol_state_t *zv);
 
 /*
  * platform dependent functions exported to platform independent code
  */
-typedef struct zvol_platform_ops {
-	void (*zv_free)(zvol_state_t *);
-	void (*zv_rename_minor)(zvol_state_t *, const char *);
-	int (*zv_create_minor)(const char *);
-	int (*zv_update_volsize)(zvol_state_t *, uint64_t);
-	boolean_t (*zv_is_zvol)(const char *);
-	void (*zv_clear_private)(zvol_state_t *);
-	void (*zv_set_disk_ro)(zvol_state_t *, int flags);
-	void (*zv_set_capacity)(zvol_state_t *, uint64_t capacity);
-} zvol_platform_ops_t;
-
-void zvol_register_ops(const zvol_platform_ops_t *ops);
+void zvol_os_free(zvol_state_t *zv);
+void zvol_os_rename_minor(zvol_state_t *zv, const char *newname);
+int zvol_os_create_minor(const char *name);
+int zvol_os_update_volsize(zvol_state_t *zv, uint64_t volsize);
+boolean_t zvol_os_is_zvol(const char *path);
+void zvol_os_clear_private(zvol_state_t *zv);
+void zvol_os_set_disk_ro(zvol_state_t *zv, int flags);
+void zvol_os_set_capacity(zvol_state_t *zv, uint64_t capacity);
 
 #endif

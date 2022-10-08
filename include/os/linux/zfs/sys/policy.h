@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -35,6 +35,8 @@
 #include <sys/xvattr.h>
 #include <sys/zpl.h>
 
+struct znode;
+
 int secpolicy_nfs(const cred_t *);
 int secpolicy_sys_config(const cred_t *, boolean_t);
 int secpolicy_vnode_access2(const cred_t *, struct inode *,
@@ -44,7 +46,7 @@ int secpolicy_vnode_chown(const cred_t *, uid_t);
 int secpolicy_vnode_create_gid(const cred_t *);
 int secpolicy_vnode_remove(const cred_t *);
 int secpolicy_vnode_setdac(const cred_t *, uid_t);
-int secpolicy_vnode_setid_retain(const cred_t *, boolean_t);
+int secpolicy_vnode_setid_retain(struct znode *, const cred_t *, boolean_t);
 int secpolicy_vnode_setids_setgids(const cred_t *, gid_t);
 int secpolicy_zinject(const cred_t *);
 int secpolicy_zfs(const cred_t *);

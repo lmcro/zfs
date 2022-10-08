@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -50,12 +49,7 @@ extern void crhold(cred_t *cr);
 extern void crfree(cred_t *cr);
 extern uid_t crgetuid(const cred_t *cr);
 extern uid_t crgetruid(const cred_t *cr);
-extern uid_t crgetsuid(const cred_t *cr);
-extern uid_t crgetfsuid(const cred_t *cr);
 extern gid_t crgetgid(const cred_t *cr);
-extern gid_t crgetrgid(const cred_t *cr);
-extern gid_t crgetsgid(const cred_t *cr);
-extern gid_t crgetfsgid(const cred_t *cr);
 extern int crgetngroups(const cred_t *cr);
 extern gid_t *crgetgroups(const cred_t *cr);
 extern int groupmember(gid_t gid, const cred_t *cr);

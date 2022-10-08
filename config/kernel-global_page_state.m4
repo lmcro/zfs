@@ -55,7 +55,7 @@ dnl #
 AC_DEFUN([ZFS_AC_KERNEL_ENUM_MEMBER], [
 	AC_MSG_CHECKING([whether enum $2 contains $1])
 	AS_IF([AC_TRY_COMMAND(
-	    "${srcdir}/scripts/enum-extract.pl" "$2" "$3" | egrep -qx $1)],[
+	    "${srcdir}/scripts/enum-extract.pl" "$2" "$3" | grep -Eqx $1)],[
 		AC_MSG_RESULT([yes])
 		AC_DEFINE(m4_join([_], [ZFS_ENUM], m4_toupper($2), $1), 1,
 		    [enum $2 contains $1])
@@ -94,7 +94,6 @@ AC_DEFUN([ZFS_AC_KERNEL_GLOBAL_ZONE_PAGE_STATE_SANITY], [
 	ZFS_AC_KERNEL_GLOBAL_PAGE_STATE_ENUM_CHECK([NR_FILE_PAGES])
 	ZFS_AC_KERNEL_GLOBAL_PAGE_STATE_ENUM_CHECK([NR_INACTIVE_ANON])
 	ZFS_AC_KERNEL_GLOBAL_PAGE_STATE_ENUM_CHECK([NR_INACTIVE_FILE])
-	ZFS_AC_KERNEL_GLOBAL_PAGE_STATE_ENUM_CHECK([NR_SLAB_RECLAIMABLE])
 
 	AC_MSG_RESULT(yes)
 ])
@@ -117,16 +116,12 @@ AC_DEFUN([ZFS_AC_KERNEL_GLOBAL_PAGE_STATE], [
 	    [node_stat_item], [$LINUX/include/linux/mmzone.h])
 	ZFS_AC_KERNEL_ENUM_MEMBER([NR_INACTIVE_FILE],
 	    [node_stat_item], [$LINUX/include/linux/mmzone.h])
-	ZFS_AC_KERNEL_ENUM_MEMBER([NR_SLAB_RECLAIMABLE],
-	    [node_stat_item], [$LINUX/include/linux/mmzone.h])
 
 	ZFS_AC_KERNEL_ENUM_MEMBER([NR_FILE_PAGES],
 	    [zone_stat_item], [$LINUX/include/linux/mmzone.h])
 	ZFS_AC_KERNEL_ENUM_MEMBER([NR_INACTIVE_ANON],
 	    [zone_stat_item], [$LINUX/include/linux/mmzone.h])
 	ZFS_AC_KERNEL_ENUM_MEMBER([NR_INACTIVE_FILE],
-	    [zone_stat_item], [$LINUX/include/linux/mmzone.h])
-	ZFS_AC_KERNEL_ENUM_MEMBER([NR_SLAB_RECLAIMABLE],
 	    [zone_stat_item], [$LINUX/include/linux/mmzone.h])
 
 	ZFS_AC_KERNEL_GLOBAL_ZONE_PAGE_STATE_SANITY

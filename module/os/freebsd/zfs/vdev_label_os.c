@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -52,7 +52,7 @@ vdev_label_write_pad2(vdev_t *vd, const char *buf, size_t size)
 	if (vdev_is_dead(vd))
 		return (ENXIO);
 
-	ASSERT(spa_config_held(spa, SCL_ALL, RW_WRITER) == SCL_ALL);
+	ASSERT3U(spa_config_held(spa, SCL_ALL, RW_WRITER), ==, SCL_ALL);
 
 	pad2 = abd_alloc_for_io(VDEV_PAD_SIZE, B_TRUE);
 	abd_zero(pad2, VDEV_PAD_SIZE);

@@ -7,7 +7,7 @@
  * with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -42,15 +42,9 @@ extern "C" {
 void uu_set_error(uint_t);
 
 
-/*PRINTFLIKE1*/
+__attribute__((format(printf, 1, 2), __noreturn__))
 void uu_panic(const char *format, ...);
 
-
-struct uu_dprintf {
-	char	*uud_name;
-	uu_dprintf_severity_t uud_severity;
-	uint_t	uud_flags;
-};
 
 /*
  * For debugging purposes, libuutil keeps around linked lists of all uu_lists

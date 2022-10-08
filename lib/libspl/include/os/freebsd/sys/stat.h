@@ -7,7 +7,7 @@
  * with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -28,6 +28,9 @@
 
 #include_next <sys/stat.h>
 
+/* Note: this file can be used on linux/macOS when bootstrapping tools. */
+
+#if defined(__FreeBSD__)
 #include <sys/mount.h> /* for BLKGETSIZE64 */
 
 #define	stat64	stat
@@ -68,4 +71,15 @@ fstat64_blk(int fd, struct stat64 *st)
 
 	return (0);
 }
+#endif /* defined(__FreeBSD__) */
+
+/*
+ * Only Intel-based Macs have a separate stat64; Arm-based Macs are like
+ * FreeBSD and have a full 64-bit stat from the start.
+ */
+#if defined(__APPLE__) && !(defined(__i386__) || defined(__x86_64__))
+#define	stat64	stat
+#define	fstat64	fstat
+#endif
+
 #endif /* _LIBSPL_SYS_STAT_H */

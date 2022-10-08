@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -117,8 +116,7 @@ RW_READ_HELD(krwlock_t *rwp)
  * will be correctly located in the users code which is important
  * for the built in kernel lock analysis tools
  */
-/* BEGIN CSTYLED */
-#define	rw_init(rwp, name, type, arg)					\
+#define	rw_init(rwp, name, type, arg) /* CSTYLED */			\
 ({									\
 	static struct lock_class_key __key;				\
 	ASSERT(type == RW_DEFAULT || type == RW_NOLOCKDEP);		\
@@ -139,7 +137,7 @@ RW_READ_HELD(krwlock_t *rwp)
  */
 #define	rw_tryupgrade(rwp)	RW_WRITE_HELD(rwp)
 
-#define	rw_tryenter(rwp, rw)						\
+#define	rw_tryenter(rwp, rw) /* CSTYLED */				\
 ({									\
 	int _rc_ = 0;							\
 									\
@@ -159,7 +157,7 @@ RW_READ_HELD(krwlock_t *rwp)
 	_rc_;								\
 })
 
-#define	rw_enter(rwp, rw)						\
+#define	rw_enter(rwp, rw) /* CSTYLED */					\
 ({									\
 	spl_rw_lockdep_off_maybe(rwp);					\
 	switch (rw) {							\
@@ -176,7 +174,7 @@ RW_READ_HELD(krwlock_t *rwp)
 	spl_rw_lockdep_on_maybe(rwp);					\
 })
 
-#define	rw_exit(rwp)							\
+#define	rw_exit(rwp) /* CSTYLED */					\
 ({									\
 	spl_rw_lockdep_off_maybe(rwp);					\
 	if (RW_WRITE_HELD(rwp)) {					\
@@ -189,13 +187,12 @@ RW_READ_HELD(krwlock_t *rwp)
 	spl_rw_lockdep_on_maybe(rwp);					\
 })
 
-#define	rw_downgrade(rwp)						\
+#define	rw_downgrade(rwp) /* CSTYLED */					\
 ({									\
 	spl_rw_lockdep_off_maybe(rwp);					\
 	spl_rw_clear_owner(rwp);					\
 	downgrade_write(SEM(rwp));					\
 	spl_rw_lockdep_on_maybe(rwp);					\
 })
-/* END CSTYLED */
 
 #endif /* _SPL_RWLOCK_H */

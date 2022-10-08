@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -25,7 +25,6 @@
  */
 
 #include <sys/dmu.h>
-#include <sys/refcount.h>
 #include <sys/zap.h>
 #include <sys/zfs_context.h>
 #include <sys/dsl_pool.h>
@@ -135,6 +134,7 @@ dsl_deadlist_load_tree(dsl_deadlist_t *dl)
 {
 	zap_cursor_t zc;
 	zap_attribute_t za;
+	int error;
 
 	ASSERT(MUTEX_HELD(&dl->dl_lock));
 
@@ -163,7 +163,7 @@ dsl_deadlist_load_tree(dsl_deadlist_t *dl)
 	    sizeof (dsl_deadlist_entry_t),
 	    offsetof(dsl_deadlist_entry_t, dle_node));
 	for (zap_cursor_init(&zc, dl->dl_os, dl->dl_object);
-	    zap_cursor_retrieve(&zc, &za) == 0;
+	    (error = zap_cursor_retrieve(&zc, &za)) == 0;
 	    zap_cursor_advance(&zc)) {
 		dsl_deadlist_entry_t *dle = kmem_alloc(sizeof (*dle), KM_SLEEP);
 		dle->dle_mintxg = zfs_strtonum(za.za_name, NULL);
@@ -178,6 +178,7 @@ dsl_deadlist_load_tree(dsl_deadlist_t *dl)
 
 		avl_add(&dl->dl_tree, dle);
 	}
+	VERIFY3U(error, ==, ENOENT);
 	zap_cursor_fini(&zc);
 
 	for (dsl_deadlist_entry_t *dle = avl_first(&dl->dl_tree);
@@ -207,6 +208,7 @@ dsl_deadlist_load_cache(dsl_deadlist_t *dl)
 {
 	zap_cursor_t zc;
 	zap_attribute_t za;
+	int error;
 
 	ASSERT(MUTEX_HELD(&dl->dl_lock));
 
@@ -220,7 +222,7 @@ dsl_deadlist_load_cache(dsl_deadlist_t *dl)
 	    sizeof (dsl_deadlist_cache_entry_t),
 	    offsetof(dsl_deadlist_cache_entry_t, dlce_node));
 	for (zap_cursor_init(&zc, dl->dl_os, dl->dl_object);
-	    zap_cursor_retrieve(&zc, &za) == 0;
+	    (error = zap_cursor_retrieve(&zc, &za)) == 0;
 	    zap_cursor_advance(&zc)) {
 		if (za.za_first_integer == empty_bpobj)
 			continue;
@@ -237,6 +239,7 @@ dsl_deadlist_load_cache(dsl_deadlist_t *dl)
 		    0, 0, 0, ZIO_PRIORITY_SYNC_READ);
 		avl_add(&dl->dl_cache, dlce);
 	}
+	VERIFY3U(error, ==, ENOENT);
 	zap_cursor_fini(&zc);
 
 	for (dsl_deadlist_cache_entry_t *dlce = avl_first(&dl->dl_cache);
@@ -379,6 +382,7 @@ dsl_deadlist_free(objset_t *os, uint64_t dlobj, dmu_tx_t *tx)
 	dmu_object_info_t doi;
 	zap_cursor_t zc;
 	zap_attribute_t za;
+	int error;
 
 	VERIFY0(dmu_object_info(os, dlobj, &doi));
 	if (doi.doi_type == DMU_OT_BPOBJ) {
@@ -387,7 +391,7 @@ dsl_deadlist_free(objset_t *os, uint64_t dlobj, dmu_tx_t *tx)
 	}
 
 	for (zap_cursor_init(&zc, os, dlobj);
-	    zap_cursor_retrieve(&zc, &za) == 0;
+	    (error = zap_cursor_retrieve(&zc, &za)) == 0;
 	    zap_cursor_advance(&zc)) {
 		uint64_t obj = za.za_first_integer;
 		if (obj == dmu_objset_pool(os)->dp_empty_bpobj)
@@ -395,6 +399,7 @@ dsl_deadlist_free(objset_t *os, uint64_t dlobj, dmu_tx_t *tx)
 		else
 			bpobj_free(os, obj, tx);
 	}
+	VERIFY3U(error, ==, ENOENT);
 	zap_cursor_fini(&zc);
 	VERIFY0(dmu_object_free(os, dlobj, tx));
 }
@@ -825,6 +830,7 @@ dsl_deadlist_merge(dsl_deadlist_t *dl, uint64_t obj, dmu_tx_t *tx)
 	dmu_buf_t *bonus;
 	dsl_deadlist_phys_t *dlp;
 	dmu_object_info_t doi;
+	int error;
 
 	VERIFY0(dmu_object_info(dl->dl_os, obj, &doi));
 	if (doi.doi_type == DMU_OT_BPOBJ) {
@@ -837,18 +843,19 @@ dsl_deadlist_merge(dsl_deadlist_t *dl, uint64_t obj, dmu_tx_t *tx)
 
 	mutex_enter(&dl->dl_lock);
 	for (zap_cursor_init(&zc, dl->dl_os, obj);
-	    zap_cursor_retrieve(&zc, &za) == 0;
+	    (error = zap_cursor_retrieve(&zc, &za)) == 0;
 	    zap_cursor_advance(&zc)) {
 		uint64_t mintxg = zfs_strtonum(za.za_name, NULL);
 		dsl_deadlist_insert_bpobj(dl, za.za_first_integer, mintxg, tx);
 		VERIFY0(zap_remove_int(dl->dl_os, obj, mintxg, tx));
 	}
+	VERIFY3U(error, ==, ENOENT);
 	zap_cursor_fini(&zc);
 
 	VERIFY0(dmu_bonus_hold(dl->dl_os, obj, FTAG, &bonus));
 	dlp = bonus->db_data;
 	dmu_buf_will_dirty(bonus, tx);
-	bzero(dlp, sizeof (*dlp));
+	memset(dlp, 0, sizeof (*dlp));
 	dmu_buf_rele(bonus, FTAG);
 	mutex_exit(&dl->dl_lock);
 }
@@ -902,15 +909,16 @@ dsl_deadlist_move_bpobj(dsl_deadlist_t *dl, bpobj_t *bpo, uint64_t mintxg,
 }
 
 typedef struct livelist_entry {
-	const blkptr_t *le_bp;
+	blkptr_t le_bp;
+	uint32_t le_refcnt;
 	avl_node_t le_node;
 } livelist_entry_t;
 
 static int
 livelist_compare(const void *larg, const void *rarg)
 {
-	const blkptr_t *l = ((livelist_entry_t *)larg)->le_bp;
-	const blkptr_t *r = ((livelist_entry_t *)rarg)->le_bp;
+	const blkptr_t *l = &((livelist_entry_t *)larg)->le_bp;
+	const blkptr_t *r = &((livelist_entry_t *)rarg)->le_bp;
 
 	/* Sort them according to dva[0] */
 	uint64_t l_dva0_vdev = DVA_GET_VDEV(&l->blk_dva[0]);
@@ -937,6 +945,11 @@ struct livelist_iter_arg {
  * Expects an AVL tree which is incrementally filled will FREE blkptrs
  * and used to match up ALLOC/FREE pairs. ALLOC'd blkptrs without a
  * corresponding FREE are stored in the supplied bplist.
+ *
+ * Note that multiple FREE and ALLOC entries for the same blkptr may
+ * be encountered when dedup is involved. For this reason we keep a
+ * refcount for all the FREE entries of each blkptr and ensure that
+ * each of those FREE entries has a corresponding ALLOC preceding it.
  */
 static int
 dsl_livelist_iterate(void *arg, const blkptr_t *bp, boolean_t bp_freed,
@@ -950,23 +963,47 @@ dsl_livelist_iterate(void *arg, const blkptr_t *bp, boolean_t bp_freed,
 
 	if ((t != NULL) && (zthr_has_waiters(t) || zthr_iscancelled(t)))
 		return (SET_ERROR(EINTR));
+
+	livelist_entry_t node;
+	node.le_bp = *bp;
+	livelist_entry_t *found = avl_find(avl, &node, NULL);
 	if (bp_freed) {
-		livelist_entry_t *node = kmem_alloc(sizeof (livelist_entry_t),
-		    KM_SLEEP);
-		blkptr_t *temp_bp = kmem_alloc(sizeof (blkptr_t), KM_SLEEP);
-		*temp_bp = *bp;
-		node->le_bp = temp_bp;
-		avl_add(avl, node);
-	} else {
-		livelist_entry_t node;
-		node.le_bp = bp;
-		livelist_entry_t *found = avl_find(avl, &node, NULL);
-		if (found != NULL) {
-			avl_remove(avl, found);
-			kmem_free((blkptr_t *)found->le_bp, sizeof (blkptr_t));
-			kmem_free(found, sizeof (livelist_entry_t));
+		if (found == NULL) {
+			/* first free entry for this blkptr */
+			livelist_entry_t *e =
+			    kmem_alloc(sizeof (livelist_entry_t), KM_SLEEP);
+			e->le_bp = *bp;
+			e->le_refcnt = 1;
+			avl_add(avl, e);
 		} else {
+			/* dedup block free */
+			ASSERT(BP_GET_DEDUP(bp));
+			ASSERT3U(BP_GET_CHECKSUM(bp), ==,
+			    BP_GET_CHECKSUM(&found->le_bp));
+			ASSERT3U(found->le_refcnt + 1, >, found->le_refcnt);
+			found->le_refcnt++;
+		}
+	} else {
+		if (found == NULL) {
+			/* block is currently marked as allocated */
 			bplist_append(to_free, bp);
+		} else {
+			/* alloc matches a free entry */
+			ASSERT3U(found->le_refcnt, !=, 0);
+			found->le_refcnt--;
+			if (found->le_refcnt == 0) {
+				/* all tracked free pairs have been matched */
+				avl_remove(avl, found);
+				kmem_free(found, sizeof (livelist_entry_t));
+			} else {
+				/*
+				 * This is definitely a deduped blkptr so
+				 * let's validate it.
+				 */
+				ASSERT(BP_GET_DEDUP(bp));
+				ASSERT3U(BP_GET_CHECKSUM(bp), ==,
+				    BP_GET_CHECKSUM(&found->le_bp));
+			}
 		}
 	}
 	return (0);
@@ -991,15 +1028,19 @@ dsl_process_sub_livelist(bpobj_t *bpobj, bplist_t *to_free, zthr_t *t,
 	    .t = t
 	};
 	int err = bpobj_iterate_nofree(bpobj, dsl_livelist_iterate, &arg, size);
+	VERIFY(err != 0 || avl_numnodes(&avl) == 0);
 
+	void *cookie = NULL;
+	livelist_entry_t *le = NULL;
+	while ((le = avl_destroy_nodes(&avl, &cookie)) != NULL) {
+		kmem_free(le, sizeof (livelist_entry_t));
+	}
 	avl_destroy(&avl);
 	return (err);
 }
 
-/* BEGIN CSTYLED */
 ZFS_MODULE_PARAM(zfs_livelist, zfs_livelist_, max_entries, ULONG, ZMOD_RW,
 	"Size to start the next sub-livelist in a livelist");
 
 ZFS_MODULE_PARAM(zfs_livelist, zfs_livelist_, min_percent_shared, INT, ZMOD_RW,
 	"Threshold at which livelist is disabled");
-/* END CSTYLED */

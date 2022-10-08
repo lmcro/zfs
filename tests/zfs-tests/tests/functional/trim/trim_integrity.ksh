@@ -60,7 +60,7 @@ log_must set_tunable64 TRIM_EXTENT_BYTES_MIN 4096
 typeset trim_txg_batch=$(get_tunable TRIM_TXG_BATCH)
 log_must set_tunable64 TRIM_TXG_BATCH 8
 
-for type in "" "mirror" "raidz" "raidz2" "raidz3"; do
+for type in "" "mirror" "raidz" "draid"; do
 	log_must truncate -s 1G $TRIM_VDEVS
 
 	log_must zpool create -f $TESTPOOL $type $TRIM_VDEVS
@@ -72,7 +72,7 @@ for type in "" "mirror" "raidz" "raidz2" "raidz3"; do
 		filesize=$((4096 + ((RANDOM * 691) % 131072) ))
 		log_must rm -rf $dir
 		log_must fill_fs $dir 10 10 $filesize 1 R
-		zpool sync
+		sync_all_pools
 	done
 	log_must du -hs /$TESTPOOL
 

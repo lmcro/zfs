@@ -7,7 +7,7 @@
 # You may not use this file except in compliance with the License.
 #
 # You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
-# or http://www.opensolaris.org/os/licensing.
+# or https://opensource.org/licenses/CDDL-1.0.
 # See the License for the specific language governing permissions
 # and limitations under the License.
 #
@@ -63,15 +63,16 @@ log_must zfs create $TESTPOOL/$TESTFS
 log_must zfs set mountpoint=$TESTDIR $TESTPOOL/$TESTFS
 
 typeset -l devsize=$(($SPA_MINDEVSIZE - 1024 * 1024))
-for files in $TESTDIR/file1 $TESTDIR/file2
+for files in $TESTDIR/file1 $TESTDIR/file2 $TESTDIR/file3
 do
-	log_must mkfile $devsize $files
+	log_must truncate -s $devsize $files
 done
 
 set -A args \
 	"$TOOSMALL $TESTDIR/file1" "$TESTPOOL1 $TESTDIR/file1 $TESTDIR/file2" \
         "$TOOSMALL mirror $TESTDIR/file1 $TESTDIR/file2" \
-	"$TOOSMALL raidz $TESTDIR/file1 $TESTDIR/file2"
+	"$TOOSMALL raidz $TESTDIR/file1 $TESTDIR/file2" \
+	"$TOOSMALL draid $TESTDIR/file1 $TESTDIR/file2 $TESTDIR/file3"
 
 typeset -i i=0
 while [[ $i -lt ${#args[*]} ]]; do

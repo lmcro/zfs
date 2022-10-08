@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -67,7 +67,8 @@ extern "C" {
  * Property values for acltype
  */
 #define	ZFS_ACLTYPE_OFF			0
-#define	ZFS_ACLTYPE_POSIXACL		1
+#define	ZFS_ACLTYPE_POSIX		1
+#define	ZFS_ACLTYPE_NFSV4		2
 
 /*
  * Field manipulation macros for the drr_versioninfo field of the
@@ -105,7 +106,7 @@ typedef enum drr_headertype {
 #define	DMU_BACKUP_FEATURE_COMPRESSED		(1 << 22)
 #define	DMU_BACKUP_FEATURE_LARGE_DNODE		(1 << 23)
 #define	DMU_BACKUP_FEATURE_RAW			(1 << 24)
-/* flag #25 is reserved for the ZSTD compression feature */
+#define	DMU_BACKUP_FEATURE_ZSTD			(1 << 25)
 #define	DMU_BACKUP_FEATURE_HOLDS		(1 << 26)
 /*
  * The SWITCH_TO_LARGE_BLOCKS feature indicates that we can receive
@@ -123,6 +124,13 @@ typedef enum drr_headertype {
  * default use of "zfs send" won't encounter the bug mentioned above.
  */
 #define	DMU_BACKUP_FEATURE_SWITCH_TO_LARGE_BLOCKS (1 << 27)
+/* flag #28 is reserved for a Nutanix feature */
+/*
+ * flag #29 is the last unused bit. It is reserved to indicate a to-be-designed
+ * extension to the stream format which will accomodate more feature flags.
+ * If you need to add another feature flag, please reach out to the OpenZFS
+ * community, e.g., on GitHub or Slack.
+ */
 
 /*
  * Mask of all supported backup features
@@ -132,7 +140,8 @@ typedef enum drr_headertype {
     DMU_BACKUP_FEATURE_RESUMING | DMU_BACKUP_FEATURE_LARGE_BLOCKS | \
     DMU_BACKUP_FEATURE_COMPRESSED | DMU_BACKUP_FEATURE_LARGE_DNODE | \
     DMU_BACKUP_FEATURE_RAW | DMU_BACKUP_FEATURE_HOLDS | \
-    DMU_BACKUP_FEATURE_REDACTED | DMU_BACKUP_FEATURE_SWITCH_TO_LARGE_BLOCKS)
+    DMU_BACKUP_FEATURE_REDACTED | DMU_BACKUP_FEATURE_SWITCH_TO_LARGE_BLOCKS | \
+    DMU_BACKUP_FEATURE_ZSTD)
 
 /* Are all features in the given flag word currently supported? */
 #define	DMU_STREAM_SUPPORTED(x)	(!((x) & ~DMU_BACKUP_FEATURE_MASK))
@@ -523,7 +532,6 @@ typedef struct zfs_useracct {
 } zfs_useracct_t;
 
 #define	ZFSDEV_MAX_MINOR	(1 << 16)
-#define	ZFS_MIN_MINOR	(ZFSDEV_MAX_MINOR + 1)
 
 #define	ZPOOL_EXPORT_AFTER_SPLIT 0x1
 
@@ -565,8 +573,7 @@ typedef struct zfsdev_state {
 } zfsdev_state_t;
 
 extern void *zfsdev_get_state(minor_t minor, enum zfsdev_state_type which);
-extern int zfsdev_getminor(int fd, minor_t *minorp);
-extern minor_t zfsdev_minor_alloc(void);
+extern int zfsdev_getminor(zfs_file_t *fp, minor_t *minorp);
 
 extern uint_t zfs_fsyncer_key;
 extern uint_t zfs_allow_log_key;

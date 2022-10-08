@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -27,7 +27,6 @@
 #include <sys/spa_impl.h>
 #include <sys/txg.h>
 #include <sys/vdev_impl.h>
-#include <sys/refcount.h>
 #include <sys/metaslab_impl.h>
 #include <sys/dsl_synctask.h>
 #include <sys/zap.h>
@@ -38,16 +37,16 @@
  * Value that is written to disk during initialization.
  */
 #ifdef _ILP32
-unsigned long zfs_initialize_value = 0xdeadbeefUL;
+static unsigned long zfs_initialize_value = 0xdeadbeefUL;
 #else
-unsigned long zfs_initialize_value = 0xdeadbeefdeadbeeeULL;
+static unsigned long zfs_initialize_value = 0xdeadbeefdeadbeeeULL;
 #endif
 
 /* maximum number of I/Os outstanding per leaf vdev */
-int zfs_initialize_limit = 1;
+static const int zfs_initialize_limit = 1;
 
 /* size of initializing writes; default 1MiB, see zfs_remove_max_segment */
-unsigned long zfs_initialize_chunk_size = 1024 * 1024;
+static unsigned long zfs_initialize_chunk_size = 1024 * 1024;
 
 static boolean_t
 vdev_initialize_should_stop(vdev_t *vd)
@@ -122,12 +121,14 @@ vdev_initialize_change_state(vdev_t *vd, vdev_initializing_state_t new_state)
 	if (vd->vdev_initialize_state != VDEV_INITIALIZE_SUSPENDED) {
 		vd->vdev_initialize_action_time = gethrestime_sec();
 	}
+
+	vdev_initializing_state_t old_state = vd->vdev_initialize_state;
 	vd->vdev_initialize_state = new_state;
 
 	dmu_tx_t *tx = dmu_tx_create_dd(spa_get_dsl(spa)->dp_mos_dir);
 	VERIFY0(dmu_tx_assign(tx, TXG_WAIT));
 	dsl_sync_task_nowait(spa_get_dsl(spa), vdev_initialize_zap_update_sync,
-	    guid, 2, ZFS_SPACE_CHECK_NONE, tx);
+	    guid, tx);
 
 	switch (new_state) {
 	case VDEV_INITIALIZE_ACTIVE:
@@ -139,8 +140,10 @@ vdev_initialize_change_state(vdev_t *vd, vdev_initializing_state_t new_state)
 		    "vdev=%s suspended", vd->vdev_path);
 		break;
 	case VDEV_INITIALIZE_CANCELED:
-		spa_history_log_internal(spa, "initialize", tx,
-		    "vdev=%s canceled", vd->vdev_path);
+		if (old_state == VDEV_INITIALIZE_ACTIVE ||
+		    old_state == VDEV_INITIALIZE_SUSPENDED)
+			spa_history_log_internal(spa, "initialize", tx,
+			    "vdev=%s canceled", vd->vdev_path);
 		break;
 	case VDEV_INITIALIZE_COMPLETE:
 		spa_history_log_internal(spa, "initialize", tx,
@@ -217,8 +220,7 @@ vdev_initialize_write(vdev_t *vd, uint64_t start, uint64_t size, abd_t *data)
 
 		/* This is the first write of this txg. */
 		dsl_sync_task_nowait(spa_get_dsl(spa),
-		    vdev_initialize_zap_update_sync, guid, 2,
-		    ZFS_SPACE_CHECK_RESERVED, tx);
+		    vdev_initialize_zap_update_sync, guid, tx);
 	}
 
 	/*
@@ -253,10 +255,11 @@ vdev_initialize_write(vdev_t *vd, uint64_t start, uint64_t size, abd_t *data)
  * divisible by sizeof (uint64_t), and buf must be 8-byte aligned. The ABD
  * allocation will guarantee these for us.
  */
-/* ARGSUSED */
 static int
 vdev_initialize_block_fill(void *buf, size_t len, void *unused)
 {
+	(void) unused;
+
 	ASSERT0(len % sizeof (uint64_t));
 #ifdef _ILP32
 	for (uint64_t i = 0; i < len; i += sizeof (uint32_t)) {
@@ -320,6 +323,32 @@ vdev_initialize_ranges(vdev_t *vd, abd_t *data)
 }
 
 static void
+vdev_initialize_xlate_last_rs_end(void *arg, range_seg64_t *physical_rs)
+{
+	uint64_t *last_rs_end = (uint64_t *)arg;
+
+	if (physical_rs->rs_end > *last_rs_end)
+		*last_rs_end = physical_rs->rs_end;
+}
+
+static void
+vdev_initialize_xlate_progress(void *arg, range_seg64_t *physical_rs)
+{
+	vdev_t *vd = (vdev_t *)arg;
+
+	uint64_t size = physical_rs->rs_end - physical_rs->rs_start;
+	vd->vdev_initialize_bytes_est += size;
+
+	if (vd->vdev_initialize_last_offset > physical_rs->rs_end) {
+		vd->vdev_initialize_bytes_done += size;
+	} else if (vd->vdev_initialize_last_offset > physical_rs->rs_start &&
+	    vd->vdev_initialize_last_offset < physical_rs->rs_end) {
+		vd->vdev_initialize_bytes_done +=
+		    vd->vdev_initialize_last_offset - physical_rs->rs_start;
+	}
+}
+
+static void
 vdev_initialize_calculate_progress(vdev_t *vd)
 {
 	ASSERT(spa_config_held(vd->vdev_spa, SCL_CONFIG, RW_READER) ||
@@ -333,28 +362,35 @@ vdev_initialize_calculate_progress(vdev_t *vd)
 		metaslab_t *msp = vd->vdev_top->vdev_ms[i];
 		mutex_enter(&msp->ms_lock);
 
-		uint64_t ms_free = msp->ms_size -
-		    metaslab_allocated_space(msp);
-
-		if (vd->vdev_top->vdev_ops == &vdev_raidz_ops)
-			ms_free /= vd->vdev_top->vdev_children;
+		uint64_t ms_free = (msp->ms_size -
+		    metaslab_allocated_space(msp)) /
+		    vdev_get_ndisks(vd->vdev_top);
 
 		/*
 		 * Convert the metaslab range to a physical range
 		 * on our vdev. We use this to determine if we are
 		 * in the middle of this metaslab range.
 		 */
-		range_seg64_t logical_rs, physical_rs;
+		range_seg64_t logical_rs, physical_rs, remain_rs;
 		logical_rs.rs_start = msp->ms_start;
 		logical_rs.rs_end = msp->ms_start + msp->ms_size;
-		vdev_xlate(vd, &logical_rs, &physical_rs);
 
+		/* Metaslab space after this offset has not been initialized */
+		vdev_xlate(vd, &logical_rs, &physical_rs, &remain_rs);
 		if (vd->vdev_initialize_last_offset <= physical_rs.rs_start) {
 			vd->vdev_initialize_bytes_est += ms_free;
 			mutex_exit(&msp->ms_lock);
 			continue;
-		} else if (vd->vdev_initialize_last_offset >
-		    physical_rs.rs_end) {
+		}
+
+		/* Metaslab space before this offset has been initialized */
+		uint64_t last_rs_end = physical_rs.rs_end;
+		if (!vdev_xlate_is_empty(&remain_rs)) {
+			vdev_xlate_walk(vd, &remain_rs,
+			    vdev_initialize_xlate_last_rs_end, &last_rs_end);
+		}
+
+		if (vd->vdev_initialize_last_offset > last_rs_end) {
 			vd->vdev_initialize_bytes_done += ms_free;
 			vd->vdev_initialize_bytes_est += ms_free;
 			mutex_exit(&msp->ms_lock);
@@ -376,22 +412,9 @@ vdev_initialize_calculate_progress(vdev_t *vd)
 		    &where)) {
 			logical_rs.rs_start = rs_get_start(rs, rt);
 			logical_rs.rs_end = rs_get_end(rs, rt);
-			vdev_xlate(vd, &logical_rs, &physical_rs);
 
-			uint64_t size = physical_rs.rs_end -
-			    physical_rs.rs_start;
-			vd->vdev_initialize_bytes_est += size;
-			if (vd->vdev_initialize_last_offset >
-			    physical_rs.rs_end) {
-				vd->vdev_initialize_bytes_done += size;
-			} else if (vd->vdev_initialize_last_offset >
-			    physical_rs.rs_start &&
-			    vd->vdev_initialize_last_offset <
-			    physical_rs.rs_end) {
-				vd->vdev_initialize_bytes_done +=
-				    vd->vdev_initialize_last_offset -
-				    physical_rs.rs_start;
-			}
+			vdev_xlate_walk(vd, &logical_rs,
+			    vdev_initialize_xlate_progress, vd);
 		}
 		mutex_exit(&msp->ms_lock);
 	}
@@ -421,6 +444,34 @@ vdev_initialize_load(vdev_t *vd)
 	return (err);
 }
 
+static void
+vdev_initialize_xlate_range_add(void *arg, range_seg64_t *physical_rs)
+{
+	vdev_t *vd = arg;
+
+	/* Only add segments that we have not visited yet */
+	if (physical_rs->rs_end <= vd->vdev_initialize_last_offset)
+		return;
+
+	/* Pick up where we left off mid-range. */
+	if (vd->vdev_initialize_last_offset > physical_rs->rs_start) {
+		zfs_dbgmsg("range write: vd %s changed (%llu, %llu) to "
+		    "(%llu, %llu)", vd->vdev_path,
+		    (u_longlong_t)physical_rs->rs_start,
+		    (u_longlong_t)physical_rs->rs_end,
+		    (u_longlong_t)vd->vdev_initialize_last_offset,
+		    (u_longlong_t)physical_rs->rs_end);
+		ASSERT3U(physical_rs->rs_end, >,
+		    vd->vdev_initialize_last_offset);
+		physical_rs->rs_start = vd->vdev_initialize_last_offset;
+	}
+
+	ASSERT3U(physical_rs->rs_end, >, physical_rs->rs_start);
+
+	range_tree_add(vd->vdev_initialize_tree, physical_rs->rs_start,
+	    physical_rs->rs_end - physical_rs->rs_start);
+}
+
 /*
  * Convert the logical range into a physical range and add it to our
  * avl tree.
@@ -429,50 +480,15 @@ static void
 vdev_initialize_range_add(void *arg, uint64_t start, uint64_t size)
 {
 	vdev_t *vd = arg;
-	range_seg64_t logical_rs, physical_rs;
+	range_seg64_t logical_rs;
 	logical_rs.rs_start = start;
 	logical_rs.rs_end = start + size;
 
 	ASSERT(vd->vdev_ops->vdev_op_leaf);
-	vdev_xlate(vd, &logical_rs, &physical_rs);
-
-	IMPLY(vd->vdev_top == vd,
-	    logical_rs.rs_start == physical_rs.rs_start);
-	IMPLY(vd->vdev_top == vd,
-	    logical_rs.rs_end == physical_rs.rs_end);
-
-	/* Only add segments that we have not visited yet */
-	if (physical_rs.rs_end <= vd->vdev_initialize_last_offset)
-		return;
-
-	/* Pick up where we left off mid-range. */
-	if (vd->vdev_initialize_last_offset > physical_rs.rs_start) {
-		zfs_dbgmsg("range write: vd %s changed (%llu, %llu) to "
-		    "(%llu, %llu)", vd->vdev_path,
-		    (u_longlong_t)physical_rs.rs_start,
-		    (u_longlong_t)physical_rs.rs_end,
-		    (u_longlong_t)vd->vdev_initialize_last_offset,
-		    (u_longlong_t)physical_rs.rs_end);
-		ASSERT3U(physical_rs.rs_end, >,
-		    vd->vdev_initialize_last_offset);
-		physical_rs.rs_start = vd->vdev_initialize_last_offset;
-	}
-	ASSERT3U(physical_rs.rs_end, >=, physical_rs.rs_start);
-
-	/*
-	 * With raidz, it's possible that the logical range does not live on
-	 * this leaf vdev. We only add the physical range to this vdev's if it
-	 * has a length greater than 0.
-	 */
-	if (physical_rs.rs_end > physical_rs.rs_start) {
-		range_tree_add(vd->vdev_initialize_tree, physical_rs.rs_start,
-		    physical_rs.rs_end - physical_rs.rs_start);
-	} else {
-		ASSERT3U(physical_rs.rs_end, ==, physical_rs.rs_start);
-	}
+	vdev_xlate_walk(vd, &logical_rs, vdev_initialize_xlate_range_add, arg);
 }
 
-static void
+static __attribute__((noreturn)) void
 vdev_initialize_thread(void *arg)
 {
 	vdev_t *vd = arg;
@@ -538,8 +554,14 @@ vdev_initialize_thread(void *arg)
 	vd->vdev_initialize_tree = NULL;
 
 	mutex_enter(&vd->vdev_initialize_lock);
-	if (!vd->vdev_initialize_exit_wanted && vdev_writeable(vd)) {
-		vdev_initialize_change_state(vd, VDEV_INITIALIZE_COMPLETE);
+	if (!vd->vdev_initialize_exit_wanted) {
+		if (vdev_writeable(vd)) {
+			vdev_initialize_change_state(vd,
+			    VDEV_INITIALIZE_COMPLETE);
+		} else if (vd->vdev_faulted) {
+			vdev_initialize_change_state(vd,
+			    VDEV_INITIALIZE_CANCELED);
+		}
 	}
 	ASSERT(vd->vdev_initialize_thread != NULL ||
 	    vd->vdev_initialize_inflight == 0);
@@ -603,6 +625,7 @@ vdev_initialize_stop_wait_impl(vdev_t *vd)
 void
 vdev_initialize_stop_wait(spa_t *spa, list_t *vd_list)
 {
+	(void) spa;
 	vdev_t *vd;
 
 	ASSERT(MUTEX_HELD(&spa_namespace_lock));
@@ -742,10 +765,8 @@ EXPORT_SYMBOL(vdev_initialize_stop_all);
 EXPORT_SYMBOL(vdev_initialize_stop_wait);
 EXPORT_SYMBOL(vdev_initialize_restart);
 
-/* BEGIN CSTYLED */
 ZFS_MODULE_PARAM(zfs, zfs_, initialize_value, ULONG, ZMOD_RW,
 	"Value written during zpool initialize");
 
 ZFS_MODULE_PARAM(zfs, zfs_, initialize_chunk_size, ULONG, ZMOD_RW,
 	"Size in bytes of writes by zpool initialize");
-/* END CSTYLED */

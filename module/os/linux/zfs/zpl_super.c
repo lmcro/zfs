@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -183,6 +183,42 @@ zpl_remount_fs(struct super_block *sb, int *flags, char *data)
 }
 
 static int
+__zpl_show_devname(struct seq_file *seq, zfsvfs_t *zfsvfs)
+{
+	int error;
+	if ((error = zpl_enter(zfsvfs, FTAG)) != 0)
+		return (error);
+
+	char *fsname = kmem_alloc(ZFS_MAX_DATASET_NAME_LEN, KM_SLEEP);
+	dmu_objset_name(zfsvfs->z_os, fsname);
+
+	for (int i = 0; fsname[i] != 0; i++) {
+		/*
+		 * Spaces in the dataset name must be converted to their
+		 * octal escape sequence for getmntent(3) to correctly
+		 * parse then fsname portion of /proc/self/mounts.
+		 */
+		if (fsname[i] == ' ') {
+			seq_puts(seq, "\\040");
+		} else {
+			seq_putc(seq, fsname[i]);
+		}
+	}
+
+	kmem_free(fsname, ZFS_MAX_DATASET_NAME_LEN);
+
+	zpl_exit(zfsvfs, FTAG);
+
+	return (0);
+}
+
+static int
+zpl_show_devname(struct seq_file *seq, struct dentry *root)
+{
+	return (__zpl_show_devname(seq, root->d_sb->s_fs_info));
+}
+
+static int
 __zpl_show_options(struct seq_file *seq, zfsvfs_t *zfsvfs)
 {
 	seq_printf(seq, ",%s",
@@ -190,7 +226,7 @@ __zpl_show_options(struct seq_file *seq, zfsvfs_t *zfsvfs)
 
 #ifdef CONFIG_FS_POSIX_ACL
 	switch (zfsvfs->z_acl_type) {
-	case ZFS_ACLTYPE_POSIXACL:
+	case ZFS_ACLTYPE_POSIX:
 		seq_puts(seq, ",posixacl");
 		break;
 	default:
@@ -198,6 +234,18 @@ __zpl_show_options(struct seq_file *seq, zfsvfs_t *zfsvfs)
 		break;
 	}
 #endif /* CONFIG_FS_POSIX_ACL */
+
+	switch (zfsvfs->z_case) {
+	case ZFS_CASE_SENSITIVE:
+		seq_puts(seq, ",casesensitive");
+		break;
+	case ZFS_CASE_INSENSITIVE:
+		seq_puts(seq, ",caseinsensitive");
+		break;
+	default:
+		seq_puts(seq, ",casemixed");
+		break;
+	}
 
 	return (0);
 }
@@ -253,8 +301,12 @@ zpl_mount_impl(struct file_system_type *fs_type, int flags, zfs_mnt_t *zm)
 	 * a txg sync.  If the dsl_pool lock is held over sget()
 	 * this can prevent the pool sync and cause a deadlock.
 	 */
+	dsl_dataset_long_hold(dmu_objset_ds(os), FTAG);
 	dsl_pool_rele(dmu_objset_pool(os), FTAG);
+
 	s = sget(fs_type, zpl_test_super, set_anon_super, flags, os);
+
+	dsl_dataset_long_rele(dmu_objset_ds(os), FTAG);
 	dsl_dataset_rele(dmu_objset_ds(os), FTAG);
 
 	if (IS_ERR(s))
@@ -314,6 +366,7 @@ const struct super_operations zpl_super_operations = {
 	.sync_fs		= zpl_sync_fs,
 	.statfs			= zpl_statfs,
 	.remount_fs		= zpl_remount_fs,
+	.show_devname		= zpl_show_devname,
 	.show_options		= zpl_show_options,
 	.show_stats		= NULL,
 };
@@ -321,6 +374,7 @@ const struct super_operations zpl_super_operations = {
 struct file_system_type zpl_fs_type = {
 	.owner			= THIS_MODULE,
 	.name			= ZFS_DRIVER,
+	.fs_flags		= FS_USERNS_MOUNT,
 	.mount			= zpl_mount,
 	.kill_sb		= zpl_kill_sb,
 };

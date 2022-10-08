@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -37,7 +37,7 @@ extern "C" {
 
 /*
  * Additional file level attributes, that are stored
- * in the upper half of zp_flags
+ * in the upper half of z_pflags
  */
 #define	ZFS_READONLY		0x0000000100000000ull
 #define	ZFS_HIDDEN		0x0000000200000000ull
@@ -187,7 +187,6 @@ typedef struct znode {
 	boolean_t	z_unlinked;	/* file has been unlinked */
 	boolean_t	z_atime_dirty;	/* atime needs to be synced */
 	boolean_t	z_zn_prefetch;	/* Prefetch znodes? */
-	boolean_t	z_moved;	/* Has this znode been moved? */
 	boolean_t	z_is_sa;	/* are we native sa? */
 	boolean_t	z_is_mapped;	/* are we mmap'ed */
 	boolean_t	z_is_ctldir;	/* are we .zfs entry */
@@ -200,6 +199,8 @@ typedef struct znode {
 	uint64_t	z_size;		/* file size (cached) */
 	uint64_t	z_pflags;	/* pflags (cached) */
 	uint32_t	z_sync_cnt;	/* synchronous open count */
+	uint32_t	z_sync_writes_cnt; /* synchronous write count */
+	uint32_t	z_async_writes_cnt; /* asynchronous write count */
 	mode_t		z_mode;		/* mode (cached) */
 	kmutex_t	z_acl_lock;	/* acl data lock */
 	zfs_acl_t	*z_acl_cached;	/* cached acl */
@@ -216,6 +217,29 @@ typedef struct znode {
 	 */
 	ZNODE_OS_FIELDS;
 } znode_t;
+
+/* Verifies the znode is valid. */
+static inline int
+zfs_verify_zp(znode_t *zp)
+{
+	if (unlikely(zp->z_sa_hdl == NULL))
+		return (SET_ERROR(EIO));
+	return (0);
+}
+
+/* zfs_enter and zfs_verify_zp together */
+static inline int
+zfs_enter_verify_zp(zfsvfs_t *zfsvfs, znode_t *zp, const char *tag)
+{
+	int error;
+	if ((error = zfs_enter(zfsvfs, tag)) != 0)
+		return (error);
+	if ((error = zfs_verify_zp(zp)) != 0) {
+		zfs_exit(zfsvfs, tag);
+		return (error);
+	}
+	return (0);
+}
 
 typedef struct znode_hold {
 	uint64_t	zh_obj;		/* object id */
@@ -262,19 +286,20 @@ extern boolean_t zfs_get_vfs_flag_unmounted(objset_t *os);
 extern void	zfs_znode_dmu_fini(znode_t *);
 
 extern void zfs_log_create(zilog_t *zilog, dmu_tx_t *tx, uint64_t txtype,
-    znode_t *dzp, znode_t *zp, char *name, vsecattr_t *, zfs_fuid_info_t *,
-    vattr_t *vap);
+    znode_t *dzp, znode_t *zp, const char *name, vsecattr_t *,
+    zfs_fuid_info_t *, vattr_t *vap);
 extern int zfs_log_create_txtype(zil_create_t, vsecattr_t *vsecp,
     vattr_t *vap);
 extern void zfs_log_remove(zilog_t *zilog, dmu_tx_t *tx, uint64_t txtype,
-    znode_t *dzp, char *name, uint64_t foid, boolean_t unlinked);
+    znode_t *dzp, const char *name, uint64_t foid, boolean_t unlinked);
 #define	ZFS_NO_OBJECT	0	/* no object id */
 extern void zfs_log_link(zilog_t *zilog, dmu_tx_t *tx, uint64_t txtype,
-    znode_t *dzp, znode_t *zp, char *name);
+    znode_t *dzp, znode_t *zp, const char *name);
 extern void zfs_log_symlink(zilog_t *zilog, dmu_tx_t *tx, uint64_t txtype,
-    znode_t *dzp, znode_t *zp, char *name, char *link);
+    znode_t *dzp, znode_t *zp, const char *name, const char *link);
 extern void zfs_log_rename(zilog_t *zilog, dmu_tx_t *tx, uint64_t txtype,
-    znode_t *sdzp, char *sname, znode_t *tdzp, char *dname, znode_t *szp);
+    znode_t *sdzp, const char *sname, znode_t *tdzp, const char *dname,
+    znode_t *szp);
 extern void zfs_log_write(zilog_t *zilog, dmu_tx_t *tx, int txtype,
     znode_t *zp, offset_t off, ssize_t len, int ioflag,
     zil_callback_t callback, void *callback_data);
@@ -286,6 +311,10 @@ extern void zfs_log_acl(zilog_t *zilog, dmu_tx_t *tx, znode_t *zp,
     vsecattr_t *vsecp, zfs_fuid_info_t *fuidp);
 extern void zfs_xvattr_set(znode_t *zp, xvattr_t *xvap, dmu_tx_t *tx);
 extern void zfs_upgrade(zfsvfs_t *zfsvfs, dmu_tx_t *tx);
+extern void zfs_log_setsaxattr(zilog_t *zilog, dmu_tx_t *tx, int txtype,
+    znode_t *zp, const char *name, const void *value, size_t size);
+
+extern void zfs_znode_update_vfs(struct znode *);
 
 #endif
 #ifdef	__cplusplus

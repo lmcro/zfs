@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -27,7 +26,9 @@
 
 #include <linux/preempt.h>
 
-#define	kpreempt(unused)	schedule()
+#define	KPREEMPT_SYNC		(-1)
+
+#define	kpreempt(unused)	cond_resched()
 #define	kpreempt_disable()	preempt_disable()
 #define	kpreempt_enable()	preempt_enable()
 

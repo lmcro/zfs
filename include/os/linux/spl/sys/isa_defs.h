@@ -6,7 +6,6 @@
  *  UCRL-CODE-235197
  *
  *  This file is part of the SPL, Solaris Porting Layer.
- *  For details, see <http://zfsonlinux.org/>.
  *
  *  The SPL is free software; you can redistribute it and/or modify it
  *  under the terms of the GNU General Public License as published by the
@@ -96,7 +95,7 @@
 #define	_ALIGNMENT_REQUIRED	1
 
 /* arm arch specific defines */
-#elif defined(__arm) || defined(__arm__) || defined(__aarch64__)
+#elif defined(__arm) || defined(__arm__)
 
 #if !defined(__arm)
 #define	__arm
@@ -106,20 +105,14 @@
 #define	__arm__
 #endif
 
-#if defined(__aarch64__)
-#if !defined(_LP64)
-#define	_LP64
-#endif
-#else
 #if !defined(_ILP32)
 #define	_ILP32
 #endif
-#endif
 
-#if defined(__ARMEL__) || defined(__AARCH64EL__)
-#define	_LITTLE_ENDIAN
+#if defined(__ARMEL__)
+#define	_ZFS_LITTLE_ENDIAN
 #else
-#define	_BIG_ENDIAN
+#define	_ZFS_BIG_ENDIAN
 #endif
 
 /*
@@ -127,6 +120,19 @@
  * out of paranoia.
  */
 #define	_ALIGNMENT_REQUIRED	1
+
+/* aarch64 arch specific defines */
+#elif defined(__aarch64__)
+
+#if !defined(_LP64)
+#define	_LP64
+#endif
+
+#if defined(__AARCH64EL__)
+#define	_ZFS_LITTLE_ENDIAN
+#else
+#define	_ZFS_BIG_ENDIAN
+#endif
 
 /* sparc arch specific defines */
 #elif defined(__sparc) || defined(__sparc__)
@@ -149,7 +155,7 @@
 #endif
 #endif
 
-#define	_BIG_ENDIAN
+#define	_ZFS_BIG_ENDIAN
 #define	_SUNOS_VTOC_16
 #define	_ALIGNMENT_REQUIRED	1
 
@@ -165,7 +171,7 @@
 #endif
 #endif
 
-#define	_BIG_ENDIAN
+#define	_ZFS_BIG_ENDIAN
 
 /*
  * Illumos doesn't define _ALIGNMENT_REQUIRED for s390, so default to 1
@@ -177,9 +183,9 @@
 #elif defined(__mips__)
 
 #if defined(__MIPSEB__)
-#define	_BIG_ENDIAN
+#define	_ZFS_BIG_ENDIAN
 #elif defined(__MIPSEL__)
-#define	_LITTLE_ENDIAN
+#define	_ZFS_LITTLE_ENDIAN
 #else
 #error MIPS no endian specified
 #endif
@@ -211,7 +217,7 @@
 #define	__rv64g__
 #endif
 
-#define	_LITTLE_ENDIAN
+#define	_ZFS_LITTLE_ENDIAN
 
 #define	_SUNOS_VTOC_16
 
@@ -243,20 +249,12 @@
 #define	HAVE_EFFICIENT_UNALIGNED_ACCESS
 #endif
 
-#if defined(__LITTLE_ENDIAN) && !defined(_LITTLE_ENDIAN)
-#define	_LITTLE_ENDIAN __LITTLE_ENDIAN
+#if defined(_ZFS_LITTLE_ENDIAN) && defined(_ZFS_BIG_ENDIAN)
+#error "Both _ZFS_LITTLE_ENDIAN and _ZFS_BIG_ENDIAN are defined"
 #endif
 
-#if defined(__BIG_ENDIAN) && !defined(_BIG_ENDIAN)
-#define	_BIG_ENDIAN __BIG_ENDIAN
-#endif
-
-#if defined(_LITTLE_ENDIAN) && defined(_BIG_ENDIAN)
-#error "Both _LITTLE_ENDIAN and _BIG_ENDIAN are defined"
-#endif
-
-#if !defined(_LITTLE_ENDIAN) && !defined(_BIG_ENDIAN)
-#error "Neither _LITTLE_ENDIAN or _BIG_ENDIAN are defined"
+#if !defined(_ZFS_LITTLE_ENDIAN) && !defined(_ZFS_BIG_ENDIAN)
+#error "Neither _ZFS_LITTLE_ENDIAN or _ZFS_BIG_ENDIAN are defined"
 #endif
 
 #endif	/* _SPL_ISA_DEFS_H */

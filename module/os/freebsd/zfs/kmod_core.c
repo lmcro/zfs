@@ -28,78 +28,74 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
-#include <sys/types.h>
 #include <sys/param.h>
-#include <sys/systm.h>
-#include <sys/conf.h>
-#include <sys/eventhandler.h>
-#include <sys/kernel.h>
-#include <sys/lock.h>
-#include <sys/malloc.h>
-#include <sys/mutex.h>
-#include <sys/proc.h>
-#include <sys/errno.h>
-#include <sys/uio.h>
 #include <sys/buf.h>
-#include <sys/file.h>
-#include <sys/kmem.h>
-#include <sys/conf.h>
-#include <sys/eventhandler.h>
 #include <sys/cmn_err.h>
-#include <sys/stat.h>
-#include <sys/zfs_ioctl.h>
-#include <sys/zfs_vfsops.h>
-#include <sys/zfs_znode.h>
-#include <sys/zap.h>
-#include <sys/spa.h>
-#include <sys/spa_impl.h>
-#include <sys/vdev.h>
+#include <sys/conf.h>
 #include <sys/dmu.h>
-#include <sys/dsl_dir.h>
-#include <sys/dsl_dataset.h>
-#include <sys/dsl_prop.h>
-#include <sys/dsl_deleg.h>
-#include <sys/dmu_objset.h>
 #include <sys/dmu_impl.h>
-#include <sys/dmu_tx.h>
-#include <sys/fm/util.h>
-#include <sys/sunddi.h>
-#include <sys/policy.h>
-#include <sys/zone.h>
-#include <sys/nvpair.h>
-#include <sys/mount.h>
-#include <sys/taskqueue.h>
-#include <sys/sdt.h>
-#include <sys/fs/zfs.h>
-#include <sys/zfs_ctldir.h>
-#include <sys/zfs_dir.h>
-#include <sys/zfs_onexit.h>
-#include <sys/zvol.h>
-#include <sys/dsl_scan.h>
 #include <sys/dmu_objset.h>
 #include <sys/dmu_send.h>
-#include <sys/dsl_destroy.h>
+#include <sys/dmu_tx.h>
 #include <sys/dsl_bookmark.h>
-#include <sys/dsl_userhold.h>
-#include <sys/zfeature.h>
-#include <sys/zcp.h>
-#include <sys/zio_checksum.h>
-#include <sys/vdev_removal.h>
 #include <sys/dsl_crypt.h>
-
+#include <sys/dsl_dataset.h>
+#include <sys/dsl_deleg.h>
+#include <sys/dsl_destroy.h>
+#include <sys/dsl_dir.h>
+#include <sys/dsl_prop.h>
+#include <sys/dsl_scan.h>
+#include <sys/dsl_userhold.h>
+#include <sys/errno.h>
+#include <sys/eventhandler.h>
+#include <sys/file.h>
+#include <sys/fm/util.h>
+#include <sys/fs/zfs.h>
+#include <sys/kernel.h>
+#include <sys/kmem.h>
+#include <sys/lock.h>
+#include <sys/malloc.h>
+#include <sys/mount.h>
+#include <sys/mutex.h>
+#include <sys/nvpair.h>
+#include <sys/policy.h>
+#include <sys/proc.h>
+#include <sys/sdt.h>
+#include <sys/spa.h>
+#include <sys/spa_impl.h>
+#include <sys/stat.h>
+#include <sys/sunddi.h>
+#include <sys/systm.h>
+#include <sys/taskqueue.h>
+#include <sys/uio.h>
+#include <sys/vdev.h>
+#include <sys/vdev_removal.h>
+#include <sys/zap.h>
+#include <sys/zcp.h>
+#include <sys/zfeature.h>
+#include <sys/zfs_context.h>
+#include <sys/zfs_ctldir.h>
+#include <sys/zfs_dir.h>
+#include <sys/zfs_ioctl.h>
 #include <sys/zfs_ioctl_compat.h>
 #include <sys/zfs_ioctl_impl.h>
+#include <sys/zfs_onexit.h>
+#include <sys/zfs_vfsops.h>
+#include <sys/zfs_znode.h>
+#include <sys/zio_checksum.h>
+#include <sys/zone.h>
+#include <sys/zvol.h>
 
+#include "zfs_comutil.h"
+#include "zfs_deleg.h"
 #include "zfs_namecheck.h"
 #include "zfs_prop.h"
-#include "zfs_deleg.h"
-#include "zfs_comutil.h"
 
 SYSCTL_DECL(_vfs_zfs);
 SYSCTL_DECL(_vfs_zfs_vdev);
 
-
-static int zfs_version_ioctl = ZFS_IOCVER_ZOF;
+extern uint_t rrw_tsd_key;
+static int zfs_version_ioctl = ZFS_IOCVER_OZFS;
 SYSCTL_DECL(_vfs_zfs_version);
 SYSCTL_INT(_vfs_zfs_version, OID_AUTO, ioctl, CTLFLAG_RD, &zfs_version_ioctl,
     0, "ZFS_IOCTL_VERSION");
@@ -117,41 +113,15 @@ static int zfs__fini(void);
 static void zfs_shutdown(void *, int);
 
 static eventhandler_tag zfs_shutdown_event_tag;
-extern zfsdev_state_t *zfsdev_state_list;
 
 #define	ZFS_MIN_KSTACK_PAGES 4
-
-static void
-zfs_cmd_bsd12_to_zof(zfs_cmd_legacy_t *src, zfs_cmd_t *dst)
-{
-	memcpy(dst, src, offsetof(zfs_cmd_t, zc_objset_stats));
-	*&dst->zc_objset_stats = *&src->zc_objset_stats;
-	memcpy(&dst->zc_begin_record, &src->zc_begin_record,
-	    offsetof(zfs_cmd_t, zc_sendobj) -
-	    offsetof(zfs_cmd_t, zc_begin_record));
-	memcpy(&dst->zc_sendobj, &src->zc_sendobj,
-	    sizeof (zfs_cmd_t) - 8 - offsetof(zfs_cmd_t, zc_sendobj));
-	dst->zc_zoneid = src->zc_jailid;
-}
-
-static void
-zfs_cmd_zof_to_bsd12(zfs_cmd_t *src, zfs_cmd_legacy_t *dst)
-{
-	memcpy(dst, src, offsetof(zfs_cmd_t, zc_objset_stats));
-	*&dst->zc_objset_stats = *&src->zc_objset_stats;
-	memcpy(&dst->zc_begin_record, &src->zc_begin_record,
-	    offsetof(zfs_cmd_t, zc_sendobj) -
-	    offsetof(zfs_cmd_t, zc_begin_record));
-	memcpy(&dst->zc_sendobj, &src->zc_sendobj,
-	    sizeof (zfs_cmd_t) - 8 - offsetof(zfs_cmd_t, zc_sendobj));
-	dst->zc_jailid = src->zc_zoneid;
-}
 
 static int
 zfsdev_ioctl(struct cdev *dev, ulong_t zcmd, caddr_t arg, int flag,
     struct thread *td)
 {
-	uint_t len, vecnum;
+	uint_t len;
+	int vecnum;
 	zfs_iocparm_t *zp;
 	zfs_cmd_t *zc;
 	zfs_cmd_legacy_t *zcl;
@@ -166,8 +136,8 @@ zfsdev_ioctl(struct cdev *dev, ulong_t zcmd, caddr_t arg, int flag,
 	zcl = NULL;
 
 	if (len != sizeof (zfs_iocparm_t)) {
-		printf("len %d vecnum: %d sizeof (zfs_cmd_t) %lu\n",
-		    len, vecnum, sizeof (zfs_cmd_t));
+		printf("len %d vecnum: %d sizeof (zfs_cmd_t) %ju\n",
+		    len, vecnum, (uintmax_t)sizeof (zfs_cmd_t));
 		return (EINVAL);
 	}
 
@@ -175,25 +145,25 @@ zfsdev_ioctl(struct cdev *dev, ulong_t zcmd, caddr_t arg, int flag,
 	/*
 	 * Remap ioctl code for legacy user binaries
 	 */
-	if (zp->zfs_ioctl_version == ZFS_IOCVER_FREEBSD) {
-		if (vecnum >= sizeof (zfs_ioctl_bsd12_to_zof)/sizeof (long)) {
+	if (zp->zfs_ioctl_version == ZFS_IOCVER_LEGACY) {
+		vecnum = zfs_ioctl_legacy_to_ozfs(vecnum);
+		if (vecnum < 0) {
 			kmem_free(zc, sizeof (zfs_cmd_t));
 			return (ENOTSUP);
 		}
 		zcl = kmem_zalloc(sizeof (zfs_cmd_legacy_t), KM_SLEEP);
-		vecnum = zfs_ioctl_bsd12_to_zof[vecnum];
 		if (copyin(uaddr, zcl, sizeof (zfs_cmd_legacy_t))) {
 			error = SET_ERROR(EFAULT);
 			goto out;
 		}
-		zfs_cmd_bsd12_to_zof(zcl, zc);
+		zfs_cmd_legacy_to_ozfs(zcl, zc);
 	} else if (copyin(uaddr, zc, sizeof (zfs_cmd_t))) {
 		error = SET_ERROR(EFAULT);
 		goto out;
 	}
 	error = zfsdev_ioctl_common(vecnum, zc, 0);
 	if (zcl) {
-		zfs_cmd_zof_to_bsd12(zc, zcl);
+		zfs_cmd_ozfs_to_legacy(zc, zcl);
 		rc = copyout(zcl, uaddr, sizeof (*zcl));
 	} else {
 		rc = copyout(zc, uaddr, sizeof (*zc));
@@ -204,76 +174,36 @@ out:
 	if (zcl)
 		kmem_free(zcl, sizeof (zfs_cmd_legacy_t));
 	kmem_free(zc, sizeof (zfs_cmd_t));
+	MPASS(tsd_get(rrw_tsd_key) == NULL);
 	return (error);
 }
 
 static void
 zfsdev_close(void *data)
 {
-	zfsdev_state_t *zs, *zsp = data;
-
-	mutex_enter(&zfsdev_state_lock);
-	for (zs = zfsdev_state_list; zs != NULL; zs = zs->zs_next) {
-		if (zs == zsp)
-			break;
-	}
-	if (zs == NULL || zs->zs_minor <= 0) {
-		mutex_exit(&zfsdev_state_lock);
-		return;
-	}
-	zs->zs_minor = -1;
-	zfs_onexit_destroy(zs->zs_onexit);
-	zfs_zevent_destroy(zs->zs_zevent);
-	mutex_exit(&zfsdev_state_lock);
+	zfsdev_state_destroy(data);
 }
 
-static int
-zfs_ctldev_init(struct cdev *devp)
+void
+zfsdev_private_set_state(void *priv __unused, zfsdev_state_t *zs)
 {
-	boolean_t newzs = B_FALSE;
-	minor_t minor;
-	zfsdev_state_t *zs, *zsprev = NULL;
-
-	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
-
-	minor = zfsdev_minor_alloc();
-	if (minor == 0)
-		return (SET_ERROR(ENXIO));
-
-	for (zs = zfsdev_state_list; zs != NULL; zs = zs->zs_next) {
-		if (zs->zs_minor == -1)
-			break;
-		zsprev = zs;
-	}
-
-	if (!zs) {
-		zs = kmem_zalloc(sizeof (zfsdev_state_t), KM_SLEEP);
-		newzs = B_TRUE;
-	}
-
 	devfs_set_cdevpriv(zs, zfsdev_close);
+}
 
-	zfs_onexit_init((zfs_onexit_t **)&zs->zs_onexit);
-	zfs_zevent_init((zfs_zevent_t **)&zs->zs_zevent);
-
-	if (newzs) {
-		zs->zs_minor = minor;
-		wmb();
-		zsprev->zs_next = zs;
-	} else {
-		wmb();
-		zs->zs_minor = minor;
-	}
-	return (0);
+zfsdev_state_t *
+zfsdev_private_get_state(void *priv)
+{
+	return (priv);
 }
 
 static int
-zfsdev_open(struct cdev *devp, int flag, int mode, struct thread *td)
+zfsdev_open(struct cdev *devp __unused, int flag __unused, int mode __unused,
+    struct thread *td __unused)
 {
 	int error;
 
 	mutex_enter(&zfsdev_state_lock);
-	error = zfs_ctldev_init(devp);
+	error = zfsdev_state_init(NULL);
 	mutex_exit(&zfsdev_state_lock);
 
 	return (error);
@@ -289,9 +219,16 @@ static struct cdevsw zfs_cdevsw = {
 int
 zfsdev_attach(void)
 {
-	zfsdev = make_dev(&zfs_cdevsw, 0x0, UID_ROOT, GID_OPERATOR, 0666,
-	    ZFS_DRIVER);
-	return (0);
+	struct make_dev_args args;
+
+	make_dev_args_init(&args);
+	args.mda_flags = MAKEDEV_CHECKNAME | MAKEDEV_WAITOK;
+	args.mda_devsw = &zfs_cdevsw;
+	args.mda_cr = NULL;
+	args.mda_uid = UID_ROOT;
+	args.mda_gid = GID_OPERATOR;
+	args.mda_mode = 0666;
+	return (make_dev_s(&args, &zfsdev, ZFS_DRIVER));
 }
 
 void
@@ -353,7 +290,6 @@ zfs_shutdown(void *arg __unused, int howto __unused)
 		zfs__fini();
 }
 
-
 static int
 zfs_modevent(module_t mod, int type, void *unused __unused)
 {
@@ -400,4 +336,4 @@ MODULE_DEPEND(zfsctrl, krpc, 1, 1, 1);
 #endif
 MODULE_DEPEND(zfsctrl, acl_nfs4, 1, 1, 1);
 MODULE_DEPEND(zfsctrl, crypto, 1, 1, 1);
-MODULE_DEPEND(zfsctrl, cryptodev, 1, 1, 1);
+MODULE_DEPEND(zfsctrl, zlib, 1, 1, 1);

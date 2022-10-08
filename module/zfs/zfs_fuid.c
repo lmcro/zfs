@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -26,7 +26,6 @@
 #include <sys/dmu.h>
 #include <sys/avl.h>
 #include <sys/zap.h>
-#include <sys/refcount.h>
 #include <sys/nvpair.h>
 #ifdef _KERNEL
 #include <sys/sid.h>
@@ -62,7 +61,7 @@ typedef struct fuid_domain {
 	uint64_t	f_idx;
 } fuid_domain_t;
 
-static char *nulldomain = "";
+static const char *const nulldomain = "";
 
 /*
  * Compare two indexes.
@@ -172,7 +171,7 @@ zfs_fuid_table_destroy(avl_tree_t *idx_tree, avl_tree_t *domain_tree)
 	avl_destroy(idx_tree);
 }
 
-char *
+const char *
 zfs_fuid_idx_domain(avl_tree_t *idx_tree, uint32_t idx)
 {
 	fuid_domain_t searchnode, *findnode;
@@ -259,8 +258,8 @@ zfs_fuid_sync(zfsvfs_t *zfsvfs, dmu_tx_t *tx)
 		VERIFY(nvlist_add_string(fuids[i], FUID_DOMAIN,
 		    domnode->f_ksid->kd_name) == 0);
 	}
-	VERIFY(nvlist_add_nvlist_array(nvp, FUID_NVP_ARRAY,
-	    fuids, numnodes) == 0);
+	fnvlist_add_nvlist_array(nvp, FUID_NVP_ARRAY,
+	    (const nvlist_t * const *)fuids, numnodes);
 	for (i = 0; i != numnodes; i++)
 		nvlist_free(fuids[i]);
 	kmem_free(fuids, numnodes * sizeof (void *));
@@ -291,9 +290,9 @@ zfs_fuid_sync(zfsvfs_t *zfsvfs, dmu_tx_t *tx)
  * necessary for the caller or another thread to detect the dirty table
  * and sync out the changes.
  */
-int
+static int
 zfs_fuid_find_by_domain(zfsvfs_t *zfsvfs, const char *domain,
-    char **retdomain, boolean_t addok)
+    const char **retdomain, boolean_t addok)
 {
 	fuid_domain_t searchnode, *findnode;
 	avl_index_t loc;
@@ -359,7 +358,7 @@ retry:
 const char *
 zfs_fuid_find_by_idx(zfsvfs_t *zfsvfs, uint32_t idx)
 {
-	char *domain;
+	const char *domain;
 
 	if (idx == 0 || !zfsvfs->z_use_fuids)
 		return (NULL);
@@ -388,11 +387,34 @@ zfs_fuid_map_ids(znode_t *zp, cred_t *cr, uid_t *uidp, uid_t *gidp)
 	    cr, ZFS_GROUP);
 }
 
+#ifdef __FreeBSD__
 uid_t
 zfs_fuid_map_id(zfsvfs_t *zfsvfs, uint64_t fuid,
     cred_t *cr, zfs_fuid_type_t type)
 {
-#ifdef HAVE_KSID
+	uint32_t index = FUID_INDEX(fuid);
+
+	if (index == 0)
+		return (fuid);
+
+	return (UID_NOBODY);
+}
+#elif defined(__linux__)
+uid_t
+zfs_fuid_map_id(zfsvfs_t *zfsvfs, uint64_t fuid,
+    cred_t *cr, zfs_fuid_type_t type)
+{
+	/*
+	 * The Linux port only supports POSIX IDs, use the passed id.
+	 */
+	return (fuid);
+}
+
+#else
+uid_t
+zfs_fuid_map_id(zfsvfs_t *zfsvfs, uint64_t fuid,
+    cred_t *cr, zfs_fuid_type_t type)
+{
 	uint32_t index = FUID_INDEX(fuid);
 	const char *domain;
 	uid_t id;
@@ -411,13 +433,8 @@ zfs_fuid_map_id(zfsvfs_t *zfsvfs, uint64_t fuid,
 		    FUID_RID(fuid), &id);
 	}
 	return (id);
-#else
-	/*
-	 * The Linux port only supports POSIX IDs, use the passed id.
-	 */
-	return (fuid);
-#endif /* HAVE_KSID */
 }
+#endif
 
 /*
  * Add a FUID node to the list of fuid's being created for this
@@ -501,8 +518,7 @@ zfs_fuid_create_cred(zfsvfs_t *zfsvfs, zfs_fuid_type_t type,
 	uint64_t	idx;
 	ksid_t		*ksid;
 	uint32_t	rid;
-	char		*kdomain;
-	const char	*domain;
+	const char	*kdomain, *domain;
 	uid_t		id;
 
 	VERIFY(type == ZFS_OWNER || type == ZFS_GROUP);
@@ -557,12 +573,11 @@ zfs_fuid_create(zfsvfs_t *zfsvfs, uint64_t id, cred_t *cr,
     zfs_fuid_type_t type, zfs_fuid_info_t **fuidpp)
 {
 #ifdef HAVE_KSID
-	const char *domain;
-	char *kdomain;
+	const char *domain, *kdomain;
 	uint32_t fuid_idx = FUID_INDEX(id);
-	uint32_t rid;
+	uint32_t rid = 0;
 	idmap_stat status;
-	uint64_t idx = 0;
+	uint64_t idx = UID_NOBODY;
 	zfs_fuid_t *zfuid = NULL;
 	zfs_fuid_info_t *fuidp = NULL;
 
@@ -711,10 +726,11 @@ zfs_fuid_info_free(zfs_fuid_info_t *fuidp)
 boolean_t
 zfs_groupmember(zfsvfs_t *zfsvfs, uint64_t id, cred_t *cr)
 {
-#ifdef HAVE_KSID
+	uid_t		gid;
+
+#ifdef illumos
 	ksid_t		*ksid = crgetsid(cr, KSID_GROUP);
 	ksidlist_t	*ksidlist = crgetsidlist(cr);
-	uid_t		gid;
 
 	if (ksid && ksidlist) {
 		int		i;
@@ -747,15 +763,13 @@ zfs_groupmember(zfsvfs_t *zfsvfs, uint64_t id, cred_t *cr)
 			}
 		}
 	}
+#endif /* illumos */
 
 	/*
 	 * Not found in ksidlist, check posix groups
 	 */
 	gid = zfs_fuid_map_id(zfsvfs, id, cr, ZFS_GROUP);
 	return (groupmember(gid, cr));
-#else
-	return (B_TRUE);
-#endif
 }
 
 void

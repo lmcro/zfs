@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -48,6 +48,8 @@
 #include <sys/dsl_deadlist.h>
 #include <sys/zthr.h>
 #include <sys/spa_impl.h>
+
+extern int zfs_snapshot_history_enabled;
 
 int
 dsl_destroy_snapshot_check_impl(dsl_dataset_t *ds, boolean_t defer)
@@ -200,7 +202,7 @@ rck_alloc(dsl_dataset_t *clone)
 
 static void
 dsl_dir_remove_clones_key_impl(dsl_dir_t *dd, uint64_t mintxg, dmu_tx_t *tx,
-    list_t *stack, void *tag)
+    list_t *stack, const void *tag)
 {
 	objset_t *mos = dd->dd_pool->dp_meta_objset;
 
@@ -321,14 +323,19 @@ dsl_destroy_snapshot_sync_impl(dsl_dataset_t *ds, boolean_t defer, dmu_tx_t *tx)
 		ASSERT(spa_version(dp->dp_spa) >= SPA_VERSION_USERREFS);
 		dmu_buf_will_dirty(ds->ds_dbuf, tx);
 		dsl_dataset_phys(ds)->ds_flags |= DS_FLAG_DEFER_DESTROY;
-		spa_history_log_internal_ds(ds, "defer_destroy", tx, " ");
+		if (zfs_snapshot_history_enabled) {
+			spa_history_log_internal_ds(ds, "defer_destroy", tx,
+			    " ");
+		}
 		return;
 	}
 
 	ASSERT3U(dsl_dataset_phys(ds)->ds_num_children, <=, 1);
 
-	/* We need to log before removing it from the namespace. */
-	spa_history_log_internal_ds(ds, "destroy", tx, " ");
+	if (zfs_snapshot_history_enabled) {
+		/* We need to log before removing it from the namespace. */
+		spa_history_log_internal_ds(ds, "destroy", tx, " ");
+	}
 
 	dsl_scan_ds_destroyed(ds, tx);
 
@@ -600,26 +607,21 @@ dsl_destroy_snapshots_nvl(nvlist_t *snaps, boolean_t defer,
 	/*
 	 * lzc_destroy_snaps() is documented to take an nvlist whose
 	 * values "don't matter".  We need to convert that nvlist to
-	 * one that we know can be converted to LUA. We also don't
-	 * care about any duplicate entries because the nvlist will
-	 * be converted to a LUA table which should take care of this.
+	 * one that we know can be converted to LUA.
 	 */
-	nvlist_t *snaps_normalized;
-	VERIFY0(nvlist_alloc(&snaps_normalized, 0, KM_SLEEP));
+	nvlist_t *snaps_normalized = fnvlist_alloc();
 	for (nvpair_t *pair = nvlist_next_nvpair(snaps, NULL);
 	    pair != NULL; pair = nvlist_next_nvpair(snaps, pair)) {
 		fnvlist_add_boolean_value(snaps_normalized,
 		    nvpair_name(pair), B_TRUE);
 	}
 
-	nvlist_t *arg;
-	VERIFY0(nvlist_alloc(&arg, 0, KM_SLEEP));
+	nvlist_t *arg = fnvlist_alloc();
 	fnvlist_add_nvlist(arg, "snaps", snaps_normalized);
 	fnvlist_free(snaps_normalized);
 	fnvlist_add_boolean_value(arg, "defer", defer);
 
-	nvlist_t *wrapper;
-	VERIFY0(nvlist_alloc(&wrapper, 0, KM_SLEEP));
+	nvlist_t *wrapper = fnvlist_alloc();
 	fnvlist_add_nvlist(wrapper, ZCP_ARG_ARGLIST, arg);
 	fnvlist_free(arg);
 
@@ -654,12 +656,12 @@ dsl_destroy_snapshots_nvl(nvlist_t *snaps, boolean_t defer,
 	    B_TRUE,
 	    0,
 	    zfs_lua_max_memlimit,
-	    nvlist_next_nvpair(wrapper, NULL), result);
+	    fnvlist_lookup_nvpair(wrapper, ZCP_ARG_ARGLIST), result);
 	if (error != 0) {
 		char *errorstr = NULL;
 		(void) nvlist_lookup_string(result, ZCP_RET_ERROR, &errorstr);
 		if (errorstr != NULL) {
-			zfs_dbgmsg(errorstr);
+			zfs_dbgmsg("%s", errorstr);
 		}
 		fnvlist_free(wrapper);
 		fnvlist_free(result);
@@ -704,11 +706,11 @@ struct killarg {
 	dmu_tx_t *tx;
 };
 
-/* ARGSUSED */
 static int
 kill_blkptr(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
     const zbookmark_phys_t *zb, const dnode_phys_t *dnp, void *arg)
 {
+	(void) spa, (void) dnp;
 	struct killarg *ka = arg;
 	dmu_tx_t *tx = ka->tx;
 
@@ -737,6 +739,10 @@ static void
 old_synchronous_dataset_destroy(dsl_dataset_t *ds, dmu_tx_t *tx)
 {
 	struct killarg ka;
+
+	spa_history_log_internal_ds(ds, "destroy", tx,
+	    "(synchronous, mintxg=%llu)",
+	    (long long)dsl_dataset_phys(ds)->ds_prev_snap_txg);
 
 	/*
 	 * Free everything that we point to (that's born after
@@ -902,6 +908,14 @@ dsl_async_clone_destroy(dsl_dataset_t *ds, dmu_tx_t *tx)
 	spa_t *spa = dmu_tx_pool(tx)->dp_spa;
 	VERIFY0(dmu_objset_from_ds(ds, &os));
 
+	uint64_t mintxg = 0;
+	dsl_deadlist_entry_t *dle = dsl_deadlist_first(&dd->dd_livelist);
+	if (dle != NULL)
+		mintxg = dle->dle_mintxg;
+
+	spa_history_log_internal_ds(ds, "destroy", tx,
+	    "(livelist, mintxg=%llu)", (long long)mintxg);
+
 	/* Check that the clone is in a correct state to be deleted */
 	dsl_clone_destroy_assert(dd);
 
@@ -922,7 +936,7 @@ dsl_async_clone_destroy(dsl_dataset_t *ds, dmu_tx_t *tx)
 		spa->spa_livelists_to_delete = zap_obj;
 	} else if (error != 0) {
 		zfs_panic_recover("zfs: error %d was returned while looking "
-		    "up DMU_POOL_DELETED_CLONES in the zap");
+		    "up DMU_POOL_DELETED_CLONES in the zap", error);
 		return;
 	}
 	VERIFY0(zap_add_int(mos, zap_obj, to_delete, tx));
@@ -951,6 +965,10 @@ dsl_async_dataset_destroy(dsl_dataset_t *ds, dmu_tx_t *tx)
 	VERIFY0(dmu_objset_from_ds(ds, &os));
 	dsl_pool_t *dp = dmu_tx_pool(tx);
 	objset_t *mos = dp->dp_meta_objset;
+
+	spa_history_log_internal_ds(ds, "destroy", tx,
+	    "(bptree, mintxg=%llu)",
+	    (long long)dsl_dataset_phys(ds)->ds_prev_snap_txg);
 
 	zil_destroy_sync(dmu_objset_zil(os), tx);
 
@@ -1002,9 +1020,6 @@ dsl_destroy_head_sync_impl(dsl_dataset_t *ds, dmu_tx_t *tx)
 	ASSERT3U(dsl_dataset_phys(ds)->ds_bp.blk_birth, <=, tx->tx_txg);
 	rrw_exit(&ds->ds_bp_rwlock, FTAG);
 	ASSERT(RRW_WRITE_HELD(&dp->dp_config_rwlock));
-
-	/* We need to log before removing it from the namespace. */
-	spa_history_log_internal_ds(ds, "destroy", tx, " ");
 
 	dsl_dir_cancel_waiters(ds->ds_dir);
 
@@ -1145,6 +1160,9 @@ dsl_destroy_head_sync_impl(dsl_dataset_t *ds, dmu_tx_t *tx)
 		dsl_destroy_snapshot_sync_impl(prev, B_FALSE, tx);
 		dsl_dataset_rele(prev, FTAG);
 	}
+	/* Delete errlog. */
+	if (spa_feature_is_enabled(dp->dp_spa, SPA_FEATURE_HEAD_ERRLOG))
+		spa_delete_dataset_errlog(dp->dp_spa, ds->ds_object, tx);
 }
 
 void
@@ -1238,10 +1256,10 @@ dsl_destroy_head(const char *name)
  * inconsistent datasets, even if we encounter an error trying to
  * process one of them.
  */
-/* ARGSUSED */
 int
 dsl_destroy_inconsistent(const char *dsname, void *arg)
 {
+	(void) arg;
 	objset_t *os;
 
 	if (dmu_objset_hold(dsname, FTAG, &os) == 0) {

@@ -7,7 +7,7 @@
 # You may not use this file except in compliance with the License.
 #
 # You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
-# or http://www.opensolaris.org/os/licensing.
+# or https://opensource.org/licenses/CDDL-1.0.
 # See the License for the specific language governing permissions
 # and limitations under the License.
 #
@@ -37,7 +37,7 @@
 # 	Replacing disks during I/O should pass for supported pools.
 #
 # STRATEGY:
-#	1. Create multidisk pools (stripe/mirror/raidz) and
+#	1. Create multidisk pools (stripe/mirror/raidz/draid) and
 #	   start some random I/O
 #	2. Replace a disk in the pool with another disk.
 #	3. Verify the integrity of the file system and the resilvering.
@@ -134,7 +134,7 @@ done
 #
 log_must truncate -s $MINVDEVSIZE $TESTDIR/$REPLACEFILE
 
-for type in "" "raidz" "mirror"; do
+for type in "" "raidz" "mirror" "draid"; do
 	for op in "" "-f"; do
 		create_pool $TESTPOOL1 $type $specials_list
 		log_must zfs create $TESTPOOL1/$TESTFS1
@@ -142,10 +142,7 @@ for type in "" "raidz" "mirror"; do
 
 		replace_test "$opt" $TESTDIR/$TESTFILE1.1 $TESTDIR/$REPLACEFILE
 
-		zpool iostat -v $TESTPOOL1 | grep "$REPLACEFILE"
-		if [[ $? -ne 0 ]]; then
-			log_fail "$REPLACEFILE is not present."
-		fi
+		log_must eval "zpool iostat -v $TESTPOOL1 | grep \"$REPLACEFILE\""
 
 		destroy_pool $TESTPOOL1
 		log_must rm -rf /$TESTPOOL1

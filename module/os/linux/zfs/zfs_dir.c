@@ -6,7 +6,7 @@
  * You may not use this file except in compliance with the License.
  *
  * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
- * or http://www.opensolaris.org/os/licensing.
+ * or https://opensource.org/licenses/CDDL-1.0.
  * See the License for the specific language governing permissions
  * and limitations under the License.
  *
@@ -60,8 +60,9 @@
  * of names after deciding which is the appropriate lookup interface.
  */
 static int
-zfs_match_find(zfsvfs_t *zfsvfs, znode_t *dzp, char *name, matchtype_t mt,
-    boolean_t update, int *deflags, pathname_t *rpnp, uint64_t *zoid)
+zfs_match_find(zfsvfs_t *zfsvfs, znode_t *dzp, const char *name,
+    matchtype_t mt, boolean_t update, int *deflags, pathname_t *rpnp,
+    uint64_t *zoid)
 {
 	boolean_t conflict = B_FALSE;
 	int error;
@@ -139,8 +140,8 @@ zfs_match_find(zfsvfs_t *zfsvfs, znode_t *dzp, char *name, matchtype_t mt,
  *	 but return znode pointers to a single match.
  */
 int
-zfs_dirent_lock(zfs_dirlock_t **dlpp, znode_t *dzp, char *name, znode_t **zpp,
-    int flag, int *direntflags, pathname_t *realpnp)
+zfs_dirent_lock(zfs_dirlock_t **dlpp, znode_t *dzp, char *name,
+    znode_t **zpp, int flag, int *direntflags, pathname_t *realpnp)
 {
 	zfsvfs_t	*zfsvfs = ZTOZSB(dzp);
 	zfs_dirlock_t	*dl;
@@ -296,7 +297,7 @@ zfs_dirent_lock(zfs_dirlock_t **dlpp, znode_t *dzp, char *name, znode_t **zpp,
 		 */
 		dl->dl_namesize = strlen(dl->dl_name) + 1;
 		name = kmem_alloc(dl->dl_namesize, KM_SLEEP);
-		bcopy(dl->dl_name, name, dl->dl_namesize);
+		memcpy(name, dl->dl_name, dl->dl_namesize);
 		dl->dl_name = name;
 	}
 
@@ -624,7 +625,7 @@ zfs_purgedir(znode_t *dzp)
 			skipped += 1;
 			continue;
 		}
-		bzero(&dl, sizeof (dl));
+		memset(&dl, 0, sizeof (dl));
 		dl.dl_dzp = dzp;
 		dl.dl_name = zap.za_name;
 
@@ -1059,7 +1060,7 @@ zfs_make_xattrdir(znode_t *zp, vattr_t *vap, znode_t **xzpp, cred_t *cr)
 	int error;
 	zfs_acl_ids_t acl_ids;
 	boolean_t fuid_dirtied;
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 	uint64_t parent;
 #endif
 
@@ -1095,7 +1096,7 @@ zfs_make_xattrdir(znode_t *zp, vattr_t *vap, znode_t **xzpp, cred_t *cr)
 	if (fuid_dirtied)
 		zfs_fuid_sync(zfsvfs, tx);
 
-#ifdef DEBUG
+#ifdef ZFS_DEBUG
 	error = sa_lookup(xzp->z_sa_hdl, SA_ZPL_PARENT(zfsvfs),
 	    &parent, sizeof (parent));
 	ASSERT(error == 0 && parent == zp->z_id);
@@ -1105,8 +1106,8 @@ zfs_make_xattrdir(znode_t *zp, vattr_t *vap, znode_t **xzpp, cred_t *cr)
 	    sizeof (xzp->z_id), tx));
 
 	if (!zp->z_unlinked)
-		(void) zfs_log_create(zfsvfs->z_log, tx, TX_MKXATTR, zp,
-		    xzp, "", NULL, acl_ids.z_fuidp, vap);
+		zfs_log_create(zfsvfs->z_log, tx, TX_MKXATTR, zp, xzp, "", NULL,
+		    acl_ids.z_fuidp, vap);
 
 	zfs_acl_ids_free(&acl_ids);
 	dmu_tx_commit(tx);
