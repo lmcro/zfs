@@ -26,6 +26,7 @@
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
  * Copyright (c) 2016 Actifio, Inc. All rights reserved.
  * Copyright (c) 2018, loli10K <ezomori.nozomu@gmail.com>. All rights reserved.
+ * Copyright (c) 2023 Hewlett Packard Enterprise Development LP.
  */
 
 #include <sys/dmu.h>
@@ -52,6 +53,15 @@
 #include <sys/zthr.h>
 #include "zfs_namecheck.h"
 #include "zfs_prop.h"
+
+/*
+ * This controls if we verify the ZVOL quota or not.
+ * Currently, quotas are not implemented for ZVOLs.
+ * The quota size is the size of the ZVOL.
+ * The size of the volume already implies the ZVOL size quota.
+ * The quota mechanism can introduce a significant performance drop.
+ */
+static int zvol_enforce_quotas = B_TRUE;
 
 /*
  * Filesystem and Snapshot Limits
@@ -815,6 +825,18 @@ dsl_fs_ss_limit_check(dsl_dir_t *dd, uint64_t delta, zfs_prop_t prop,
 	ASSERT(prop == ZFS_PROP_FILESYSTEM_LIMIT ||
 	    prop == ZFS_PROP_SNAPSHOT_LIMIT);
 
+	if (prop == ZFS_PROP_SNAPSHOT_LIMIT) {
+		/*
+		 * We don't enforce the limit for temporary snapshots. This is
+		 * indicated by a NULL cred_t argument.
+		 */
+		if (cr == NULL)
+			return (0);
+
+		count_prop = DD_FIELD_SNAPSHOT_COUNT;
+	} else {
+		count_prop = DD_FIELD_FILESYSTEM_COUNT;
+	}
 	/*
 	 * If we're allowed to change the limit, don't enforce the limit
 	 * e.g. this can happen if a snapshot is taken by an administrative
@@ -833,19 +855,6 @@ dsl_fs_ss_limit_check(dsl_dir_t *dd, uint64_t delta, zfs_prop_t prop,
 	 */
 	if (delta == 0)
 		return (0);
-
-	if (prop == ZFS_PROP_SNAPSHOT_LIMIT) {
-		/*
-		 * We don't enforce the limit for temporary snapshots. This is
-		 * indicated by a NULL cred_t argument.
-		 */
-		if (cr == NULL)
-			return (0);
-
-		count_prop = DD_FIELD_SNAPSHOT_COUNT;
-	} else {
-		count_prop = DD_FIELD_FILESYSTEM_COUNT;
-	}
 
 	/*
 	 * If an ancestor has been provided, stop checking the limit once we
@@ -1178,10 +1187,9 @@ dsl_dir_space_towrite(dsl_dir_t *dd)
 
 	ASSERT(MUTEX_HELD(&dd->dd_lock));
 
-	for (int i = 0; i < TXG_SIZE; i++) {
+	for (int i = 0; i < TXG_SIZE; i++)
 		space += dd->dd_space_towrite[i & TXG_MASK];
-		ASSERT3U(dd->dd_space_towrite[i & TXG_MASK], >=, 0);
-	}
+
 	return (space);
 }
 
@@ -1268,6 +1276,7 @@ dsl_dir_tempreserve_impl(dsl_dir_t *dd, uint64_t asize, boolean_t netfree,
 	uint64_t quota;
 	struct tempreserve *tr;
 	int retval;
+	uint64_t ext_quota;
 	uint64_t ref_rsrv;
 
 top_of_function:
@@ -1311,7 +1320,9 @@ top_of_function:
 	 * If this transaction will result in a net free of space,
 	 * we want to let it through.
 	 */
-	if (ignorequota || netfree || dsl_dir_phys(dd)->dd_quota == 0)
+	if (ignorequota || netfree || dsl_dir_phys(dd)->dd_quota == 0 ||
+	    (tx->tx_objset && dmu_objset_type(tx->tx_objset) == DMU_OST_ZVOL &&
+	    zvol_enforce_quotas == B_FALSE))
 		quota = UINT64_MAX;
 	else
 		quota = dsl_dir_phys(dd)->dd_quota;
@@ -1343,26 +1354,28 @@ top_of_function:
 	 * on-disk is over quota and there are no pending changes
 	 * or deferred frees (which may free up space for us).
 	 */
-	if (used_on_disk + est_inflight >= quota) {
-		if (est_inflight > 0 || used_on_disk < quota) {
+	ext_quota = quota >> 5;
+	if (quota == UINT64_MAX)
+		ext_quota = 0;
+
+	if (used_on_disk >= quota) {
+		if (retval == ENOSPC && (used_on_disk - quota) <
+		    dsl_pool_deferred_space(dd->dd_pool)) {
 			retval = SET_ERROR(ERESTART);
-		} else {
-			ASSERT3U(used_on_disk, >=, quota);
-
-			if (retval == ENOSPC && (used_on_disk - quota) <
-			    dsl_pool_deferred_space(dd->dd_pool)) {
-				retval = SET_ERROR(ERESTART);
-			}
 		}
-
-		dprintf_dd(dd, "failing: used=%lluK inflight = %lluK "
-		    "quota=%lluK tr=%lluK err=%d\n",
-		    (u_longlong_t)used_on_disk>>10,
-		    (u_longlong_t)est_inflight>>10,
-		    (u_longlong_t)quota>>10, (u_longlong_t)asize>>10, retval);
+		/* Quota exceeded */
 		mutex_exit(&dd->dd_lock);
 		DMU_TX_STAT_BUMP(dmu_tx_quota);
 		return (retval);
+	} else if (used_on_disk + est_inflight >= quota + ext_quota) {
+		dprintf_dd(dd, "failing: used=%lluK inflight = %lluK "
+		    "quota=%lluK tr=%lluK\n",
+		    (u_longlong_t)used_on_disk>>10,
+		    (u_longlong_t)est_inflight>>10,
+		    (u_longlong_t)quota>>10, (u_longlong_t)asize>>10);
+		mutex_exit(&dd->dd_lock);
+		DMU_TX_STAT_BUMP(dmu_tx_quota);
+		return (SET_ERROR(ERESTART));
 	}
 
 	/* We need to up our estimated delta before dropping dd_lock */
@@ -1390,10 +1403,9 @@ top_of_function:
 		ignorequota = (dsl_dir_phys(dd)->dd_head_dataset_obj == 0);
 		first = B_FALSE;
 		goto top_of_function;
-
-	} else {
-		return (0);
 	}
+
+	return (0);
 }
 
 /*
@@ -1472,7 +1484,7 @@ dsl_dir_tempreserve_clear(void *tr_cookie, dmu_tx_t *tx)
 	if (tr_cookie == NULL)
 		return;
 
-	while ((tr = list_head(tr_list)) != NULL) {
+	while ((tr = list_remove_head(tr_list)) != NULL) {
 		if (tr->tr_ds) {
 			mutex_enter(&tr->tr_ds->dd_lock);
 			ASSERT3U(tr->tr_ds->dd_tempreserved[txgidx], >=,
@@ -1482,7 +1494,6 @@ dsl_dir_tempreserve_clear(void *tr_cookie, dmu_tx_t *tx)
 		} else {
 			arc_tempreserve_clear(tr->tr_size);
 		}
-		list_remove(tr_list, tr);
 		kmem_free(tr, sizeof (struct tempreserve));
 	}
 
@@ -2107,6 +2118,8 @@ dsl_dir_rename_sync(void *arg, dmu_tx_t *tx)
 	VERIFY0(dsl_dir_hold(dp, ddra->ddra_newname, FTAG, &newparent,
 	    &mynewname));
 
+	ASSERT3P(mynewname, !=, NULL);
+
 	/* Log this before we change the name. */
 	spa_history_log_internal_dd(dd, "rename", tx,
 	    "-> %s", ddra->ddra_newname);
@@ -2474,3 +2487,7 @@ dsl_dir_cancel_waiters(dsl_dir_t *dd)
 EXPORT_SYMBOL(dsl_dir_set_quota);
 EXPORT_SYMBOL(dsl_dir_set_reservation);
 #endif
+
+/* CSTYLED */
+ZFS_MODULE_PARAM(zfs, , zvol_enforce_quotas, INT, ZMOD_RW,
+	"Enable strict ZVOL quota enforcment");

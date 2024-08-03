@@ -25,17 +25,19 @@
  */
 
 #include <sys/types.h>
-#include <sys/mutex.h>
 #include <sys/sysmacros.h>
 #include <sys/kmem.h>
 #include <linux/file.h>
 #include <linux/magic.h>
 #include <sys/zone.h>
+#include <sys/string.h>
 
 #if defined(CONFIG_USER_NS)
 #include <linux/statfs.h>
 #include <linux/proc_ns.h>
 #endif
+
+#include <sys/mutex.h>
 
 static kmutex_t zone_datasets_lock;
 static struct list_head zone_datasets;
@@ -49,7 +51,7 @@ typedef struct zone_datasets {
 typedef struct zone_dataset {
 	struct list_head zd_list;	/* zone_dataset linkage */
 	size_t zd_dsnamelen;		/* length of name */
-	char zd_dsname[0];		/* name of the member dataset */
+	char zd_dsname[];		/* name of the member dataset */
 } zone_dataset_t;
 
 #if defined(CONFIG_USER_NS) && defined(HAVE_USER_NS_COMMON_INUM)

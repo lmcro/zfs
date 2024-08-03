@@ -81,7 +81,7 @@ typedef struct arc_prune arc_prune_t;
 typedef void arc_read_done_func_t(zio_t *zio, const zbookmark_phys_t *zb,
     const blkptr_t *bp, arc_buf_t *buf, void *priv);
 typedef void arc_write_done_func_t(zio_t *zio, arc_buf_t *buf, void *priv);
-typedef void arc_prune_func_t(int64_t bytes, void *priv);
+typedef void arc_prune_func_t(uint64_t bytes, void *priv);
 
 /* Shared module parameters */
 extern uint_t zfs_arc_average_blocksize;
@@ -115,7 +115,7 @@ typedef enum arc_flags
 	ARC_FLAG_PREFETCH		= 1 << 2,	/* I/O is a prefetch */
 	ARC_FLAG_CACHED			= 1 << 3,	/* I/O was in cache */
 	ARC_FLAG_L2CACHE		= 1 << 4,	/* cache in L2ARC */
-	ARC_FLAG_PREDICTIVE_PREFETCH	= 1 << 5,	/* I/O from zfetch */
+	ARC_FLAG_UNCACHED		= 1 << 5,	/* evict after use */
 	ARC_FLAG_PRESCIENT_PREFETCH	= 1 << 6,	/* long min lifespan */
 
 	/*
@@ -195,13 +195,11 @@ typedef enum arc_buf_flags {
 struct arc_buf {
 	arc_buf_hdr_t		*b_hdr;
 	arc_buf_t		*b_next;
-	kmutex_t		b_evict_lock;
 	void			*b_data;
 	arc_buf_flags_t		b_flags;
 };
 
 typedef enum arc_buf_contents {
-	ARC_BUFC_INVALID,			/* invalid type */
 	ARC_BUFC_DATA,				/* buffer contains data */
 	ARC_BUFC_METADATA,			/* buffer contains metadata */
 	ARC_BUFC_NUMTYPES
@@ -229,6 +227,7 @@ typedef enum arc_state_type {
 	ARC_STATE_MFU,
 	ARC_STATE_MFU_GHOST,
 	ARC_STATE_L2C_ONLY,
+	ARC_STATE_UNCACHED,
 	ARC_STATE_NUMTYPES
 } arc_state_type_t;
 
@@ -250,6 +249,16 @@ typedef struct arc_buf_info {
 	uint64_t		abi_l2arc_asize;
 	enum zio_compress	abi_l2arc_compress;
 } arc_buf_info_t;
+
+/*
+ * Flags returned by arc_cached; describes which part of the arc
+ * the block is cached in.
+ */
+#define	ARC_CACHED_EMBEDDED	(1U << 0)
+#define	ARC_CACHED_IN_L1	(1U << 1)
+#define	ARC_CACHED_IN_MRU	(1U << 2)
+#define	ARC_CACHED_IN_MFU	(1U << 3)
+#define	ARC_CACHED_IN_L2	(1U << 4)
 
 void arc_space_consume(uint64_t space, arc_space_type_t type);
 void arc_space_return(uint64_t space, arc_space_type_t type);
@@ -302,16 +311,16 @@ int arc_referenced(arc_buf_t *buf);
 int arc_read(zio_t *pio, spa_t *spa, const blkptr_t *bp,
     arc_read_done_func_t *done, void *priv, zio_priority_t priority,
     int flags, arc_flags_t *arc_flags, const zbookmark_phys_t *zb);
-zio_t *arc_write(zio_t *pio, spa_t *spa, uint64_t txg,
-    blkptr_t *bp, arc_buf_t *buf, boolean_t l2arc, const zio_prop_t *zp,
+zio_t *arc_write(zio_t *pio, spa_t *spa, uint64_t txg, blkptr_t *bp,
+    arc_buf_t *buf, boolean_t uncached, boolean_t l2arc, const zio_prop_t *zp,
     arc_write_done_func_t *ready, arc_write_done_func_t *child_ready,
-    arc_write_done_func_t *physdone, arc_write_done_func_t *done,
-    void *priv, zio_priority_t priority, int zio_flags,
-    const zbookmark_phys_t *zb);
+    arc_write_done_func_t *done, void *priv, zio_priority_t priority,
+    int zio_flags, const zbookmark_phys_t *zb);
 
 arc_prune_t *arc_add_prune_callback(arc_prune_func_t *func, void *priv);
 void arc_remove_prune_callback(arc_prune_t *p);
 void arc_freed(spa_t *spa, const blkptr_t *bp);
+int arc_cached(spa_t *spa, const blkptr_t *bp);
 
 void arc_flush(spa_t *spa, boolean_t retry);
 void arc_tempreserve_clear(uint64_t reserve);

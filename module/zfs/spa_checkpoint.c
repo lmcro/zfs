@@ -158,7 +158,7 @@
  * amount of checkpointed data that has been freed within them while
  * the pool had a checkpoint.
  */
-static unsigned long zfs_spa_discard_memory_limit = 16 * 1024 * 1024;
+static uint64_t zfs_spa_discard_memory_limit = 16 * 1024 * 1024;
 
 int
 spa_checkpoint_get_stats(spa_t *spa, pool_checkpoint_stat_t *pcs)
@@ -465,6 +465,9 @@ spa_checkpoint_check(void *arg, dmu_tx_t *tx)
 	if (spa->spa_removing_phys.sr_state == DSS_SCANNING)
 		return (SET_ERROR(ZFS_ERR_DEVRM_IN_PROGRESS));
 
+	if (spa->spa_raidz_expand != NULL)
+		return (SET_ERROR(ZFS_ERR_RAIDZ_EXPAND_IN_PROGRESS));
+
 	if (spa->spa_checkpoint_txg != 0)
 		return (SET_ERROR(ZFS_ERR_CHECKPOINT_EXISTS));
 
@@ -631,7 +634,7 @@ EXPORT_SYMBOL(spa_checkpoint_discard_thread);
 EXPORT_SYMBOL(spa_checkpoint_discard_thread_check);
 
 /* BEGIN CSTYLED */
-ZFS_MODULE_PARAM(zfs_spa, zfs_spa_, discard_memory_limit, ULONG, ZMOD_RW,
+ZFS_MODULE_PARAM(zfs_spa, zfs_spa_, discard_memory_limit, U64, ZMOD_RW,
 	"Limit for memory used in prefetching the checkpoint space map done "
 	"on each vdev while discarding the checkpoint");
 /* END CSTYLED */

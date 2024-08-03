@@ -429,7 +429,7 @@ txg_quiesce(dsl_pool_t *dp, uint64_t txg)
 }
 
 static void
-txg_do_callbacks(list_t *cb_list)
+txg_do_callbacks(void *cb_list)
 {
 	dmu_tx_do_callbacks(cb_list, 0);
 
@@ -479,7 +479,7 @@ txg_dispatch_callbacks(dsl_pool_t *dp, uint64_t txg)
 
 		list_move_tail(cb_list, &tc->tc_callbacks[g]);
 
-		(void) taskq_dispatch(tx->tx_commit_cb_taskq, (task_func_t *)
+		(void) taskq_dispatch(tx->tx_commit_cb_taskq,
 		    txg_do_callbacks, cb_list, TQ_SLEEP);
 	}
 }
@@ -549,6 +549,15 @@ txg_sync_thread(void *arg)
 			delta = ddi_get_lbolt() - start;
 			timer = (delta > timeout ? 0 : timeout - delta);
 		}
+
+		/*
+		 * When we're suspended, nothing should be changing and for
+		 * MMP we don't want to bump anything that would make it
+		 * harder to detect if another host is changing it when
+		 * resuming after a MMP suspend.
+		 */
+		if (spa_suspended(spa))
+			continue;
 
 		/*
 		 * Wait until the quiesce thread hands off a txg to us,
@@ -895,15 +904,10 @@ txg_list_destroy(txg_list_t *tl)
 boolean_t
 txg_all_lists_empty(txg_list_t *tl)
 {
-	mutex_enter(&tl->tl_lock);
-	for (int i = 0; i < TXG_SIZE; i++) {
-		if (!txg_list_empty_impl(tl, i)) {
-			mutex_exit(&tl->tl_lock);
-			return (B_FALSE);
-		}
-	}
-	mutex_exit(&tl->tl_lock);
-	return (B_TRUE);
+	boolean_t res = B_TRUE;
+	for (int i = 0; i < TXG_SIZE; i++)
+		res &= (tl->tl_head[i] == NULL);
+	return (res);
 }
 
 /*

@@ -83,6 +83,9 @@ typedef struct progress_arg {
 	boolean_t pa_parsable;
 	boolean_t pa_estimate;
 	int pa_verbosity;
+	boolean_t pa_astitle;
+	boolean_t pa_progress;
+	uint64_t pa_size;
 } progress_arg_t;
 
 static int
@@ -116,7 +119,7 @@ dump_record(dmu_replay_record_t *drr, void *payload, size_t payload_len,
 typedef struct fsavl_node {
 	avl_node_t fn_node;
 	nvlist_t *fn_nvfs;
-	char *fn_snapname;
+	const char *fn_snapname;
 	uint64_t fn_guid;
 } fsavl_node_t;
 
@@ -134,7 +137,7 @@ fsavl_compare(const void *arg1, const void *arg2)
  * (optionally) name.
  */
 static nvlist_t *
-fsavl_find(avl_tree_t *avl, uint64_t snapguid, char **snapname)
+fsavl_find(avl_tree_t *avl, uint64_t snapguid, const char **snapname)
 {
 	fsavl_node_t fn_find;
 	fsavl_node_t *fn;
@@ -285,7 +288,7 @@ send_iterate_prop(zfs_handle_t *zhp, boolean_t received_only, nvlist_t *nv);
 
 /*
  * Collect guid, valid props, optionally holds, etc. of a snapshot.
- * This interface is intended for use as a zfs_iter_snapshots_sorted visitor.
+ * This interface is intended for use as a zfs_iter_snapshots_v2_sorted visitor.
  */
 static int
 send_iterate_snap(zfs_handle_t *zhp, void *arg)
@@ -381,7 +384,7 @@ send_iterate_prop(zfs_handle_t *zhp, boolean_t received_only, nvlist_t *nv)
 
 	nvpair_t *elem = NULL;
 	while ((elem = nvlist_next_nvpair(props, elem)) != NULL) {
-		char *propname = nvpair_name(elem);
+		const char *propname = nvpair_name(elem);
 		zfs_prop_t prop = zfs_name_to_prop(propname);
 
 		if (!zfs_prop_user(propname)) {
@@ -409,7 +412,7 @@ send_iterate_prop(zfs_handle_t *zhp, boolean_t received_only, nvlist_t *nv)
 		if (isspacelimit && zhp->zfs_type == ZFS_TYPE_SNAPSHOT)
 			continue;
 
-		char *source;
+		const char *source;
 		if (nvlist_lookup_string(propnv, ZPROP_SOURCE, &source) == 0) {
 			if (strcmp(source, zhp->zfs_name) != 0 &&
 			    strcmp(source, ZPROP_SOURCE_VAL_RECVD) != 0)
@@ -425,7 +428,7 @@ send_iterate_prop(zfs_handle_t *zhp, boolean_t received_only, nvlist_t *nv)
 
 		if (zfs_prop_user(propname) ||
 		    zfs_prop_get_type(prop) == PROP_TYPE_STRING) {
-			char *value;
+			const char *value;
 			value = fnvlist_lookup_string(propnv, ZPROP_VALUE);
 			fnvlist_add_string(nv, propname, value);
 		} else {
@@ -616,10 +619,10 @@ send_iterate_fs(zfs_handle_t *zhp, void *arg)
 			min_txg = fromsnap_txg;
 		if (!sd->replicate && tosnap_txg != 0)
 			max_txg = tosnap_txg;
-		(void) zfs_iter_snapshots_sorted(zhp, send_iterate_snap, sd,
-		    min_txg, max_txg);
+		(void) zfs_iter_snapshots_sorted_v2(zhp, 0, send_iterate_snap,
+		    sd, min_txg, max_txg);
 	} else {
-		char snapname[MAXPATHLEN];
+		char snapname[MAXPATHLEN] = { 0 };
 		zfs_handle_t *snap;
 
 		(void) snprintf(snapname, sizeof (snapname), "%s@%s",
@@ -659,7 +662,7 @@ send_iterate_fs(zfs_handle_t *zhp, void *arg)
 
 	/* Iterate over children. */
 	if (sd->recursive)
-		rv = zfs_iter_filesystems(zhp, send_iterate_fs, sd);
+		rv = zfs_iter_filesystems_v2(zhp, 0, send_iterate_fs, sd);
 
 out:
 	/* Restore saved fields. */
@@ -733,6 +736,7 @@ typedef struct send_dump_data {
 	boolean_t seenfrom, seento, replicate, doall, fromorigin;
 	boolean_t dryrun, parsable, progress, embed_data, std_out;
 	boolean_t large_block, compress, raw, holds;
+	boolean_t progressastitle;
 	int outfd;
 	boolean_t err;
 	nvlist_t *fss;
@@ -789,7 +793,7 @@ zfs_send_space(zfs_handle_t *zhp, const char *snapname, const char *from,
 	case EFAULT:
 	case EROFS:
 	case EINVAL:
-		zfs_error_aux(hdl, "%s", strerror(error));
+		zfs_error_aux(hdl, "%s", zfs_strerror(error));
 		return (zfs_error(hdl, EZFS_BADBACKUP, errbuf));
 
 	default:
@@ -872,7 +876,7 @@ dump_ioctl(zfs_handle_t *zhp, const char *fromsnap, uint64_t fromsnap_obj,
 		case EFAULT:
 		case EROFS:
 		case EINVAL:
-			zfs_error_aux(hdl, "%s", strerror(errno));
+			zfs_error_aux(hdl, "%s", zfs_strerror(errno));
 			return (zfs_error(hdl, EZFS_BADBACKUP, errbuf));
 
 		default:
@@ -924,6 +928,39 @@ zfs_send_progress(zfs_handle_t *zhp, int fd, uint64_t *bytes_written,
 	return (0);
 }
 
+static volatile boolean_t send_progress_thread_signal_duetotimer;
+static void
+send_progress_thread_act(int sig, siginfo_t *info, void *ucontext)
+{
+	(void) sig, (void) ucontext;
+	send_progress_thread_signal_duetotimer = info->si_code == SI_TIMER;
+}
+
+struct timer_desirability {
+	timer_t timer;
+	boolean_t desired;
+};
+static void
+timer_delete_cleanup(void *timer)
+{
+	struct timer_desirability *td = timer;
+	if (td->desired)
+		timer_delete(td->timer);
+}
+
+#ifdef SIGINFO
+#define	SEND_PROGRESS_THREAD_PARENT_BLOCK_SIGINFO sigaddset(&new, SIGINFO)
+#else
+#define	SEND_PROGRESS_THREAD_PARENT_BLOCK_SIGINFO
+#endif
+#define	SEND_PROGRESS_THREAD_PARENT_BLOCK(old) { \
+	sigset_t new; \
+	sigemptyset(&new); \
+	sigaddset(&new, SIGUSR1); \
+	SEND_PROGRESS_THREAD_PARENT_BLOCK_SIGINFO; \
+	pthread_sigmask(SIG_BLOCK, &new, old); \
+}
+
 static void *
 send_progress_thread(void *arg)
 {
@@ -931,12 +968,33 @@ send_progress_thread(void *arg)
 	zfs_handle_t *zhp = pa->pa_zhp;
 	uint64_t bytes;
 	uint64_t blocks;
+	uint64_t total = pa->pa_size / 100;
 	char buf[16];
 	time_t t;
 	struct tm tm;
 	int err;
 
-	if (!pa->pa_parsable) {
+	const struct sigaction signal_action =
+	    {.sa_sigaction = send_progress_thread_act, .sa_flags = SA_SIGINFO};
+	struct sigevent timer_cfg =
+	    {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGUSR1};
+	const struct itimerspec timer_time =
+	    {.it_value = {.tv_sec = 1}, .it_interval = {.tv_sec = 1}};
+	struct timer_desirability timer = {};
+
+	sigaction(SIGUSR1, &signal_action, NULL);
+#ifdef SIGINFO
+	sigaction(SIGINFO, &signal_action, NULL);
+#endif
+
+	if ((timer.desired = pa->pa_progress || pa->pa_astitle)) {
+		if (timer_create(CLOCK_MONOTONIC, &timer_cfg, &timer.timer))
+			return ((void *)(uintptr_t)errno);
+		(void) timer_settime(timer.timer, 0, &timer_time, NULL);
+	}
+	pthread_cleanup_push(timer_delete_cleanup, &timer);
+
+	if (!pa->pa_parsable && pa->pa_progress) {
 		(void) fprintf(stderr,
 		    "TIME       %s   %sSNAPSHOT %s\n",
 		    pa->pa_estimate ? "BYTES" : " SENT",
@@ -948,16 +1006,27 @@ send_progress_thread(void *arg)
 	 * Print the progress from ZFS_IOC_SEND_PROGRESS every second.
 	 */
 	for (;;) {
-		(void) sleep(1);
+		pause();
 		if ((err = zfs_send_progress(zhp, pa->pa_fd, &bytes,
 		    &blocks)) != 0) {
 			if (err == EINTR || err == ENOENT)
-				return ((void *)0);
-			return ((void *)(uintptr_t)err);
+				err = 0;
+			pthread_exit(((void *)(uintptr_t)err));
 		}
 
 		(void) time(&t);
 		localtime_r(&t, &tm);
+
+		if (pa->pa_astitle) {
+			char buf_bytes[16];
+			char buf_size[16];
+			int pct;
+			zfs_nicenum(bytes, buf_bytes, sizeof (buf_bytes));
+			zfs_nicenum(pa->pa_size, buf_size, sizeof (buf_size));
+			pct = (total > 0) ? bytes / total : 100;
+			zfs_setproctitle("sending %s (%d%%: %s/%s)",
+			    zhp->zfs_name, MIN(pct, 100), buf_bytes, buf_size);
+		}
 
 		if (pa->pa_verbosity >= 2 && pa->pa_parsable) {
 			(void) fprintf(stderr,
@@ -975,21 +1044,26 @@ send_progress_thread(void *arg)
 			(void) fprintf(stderr, "%02d:%02d:%02d\t%llu\t%s\n",
 			    tm.tm_hour, tm.tm_min, tm.tm_sec,
 			    (u_longlong_t)bytes, zhp->zfs_name);
-		} else {
+		} else if (pa->pa_progress ||
+		    !send_progress_thread_signal_duetotimer) {
 			zfs_nicebytes(bytes, buf, sizeof (buf));
 			(void) fprintf(stderr, "%02d:%02d:%02d   %5s   %s\n",
 			    tm.tm_hour, tm.tm_min, tm.tm_sec,
 			    buf, zhp->zfs_name);
 		}
 	}
+	pthread_cleanup_pop(B_TRUE);
+	return (NULL);
 }
 
 static boolean_t
-send_progress_thread_exit(libzfs_handle_t *hdl, pthread_t ptid)
+send_progress_thread_exit(
+    libzfs_handle_t *hdl, pthread_t ptid, sigset_t *oldmask)
 {
 	void *status = NULL;
 	(void) pthread_cancel(ptid);
 	(void) pthread_join(ptid, &status);
+	pthread_sigmask(SIG_SETMASK, oldmask, NULL);
 	int error = (int)(uintptr_t)status;
 	if (error != 0 && status != PTHREAD_CANCELED)
 		return (zfs_standard_error(hdl, error,
@@ -1007,8 +1081,23 @@ send_print_verbose(FILE *fout, const char *tosnap, const char *fromsnap,
 			(void) fprintf(fout, dgettext(TEXT_DOMAIN,
 			    "incremental\t%s\t%s"), fromsnap, tosnap);
 		} else {
+/*
+ * Workaround for GCC 12+ with UBSan enabled deficencies.
+ *
+ * GCC 12+ invoked with -fsanitize=undefined incorrectly reports the code
+ * below as violating -Wformat-overflow.
+ */
+#if defined(__GNUC__) && !defined(__clang__) && \
+	defined(ZFS_UBSAN_ENABLED) && defined(HAVE_FORMAT_OVERFLOW)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-overflow"
+#endif
 			(void) fprintf(fout, dgettext(TEXT_DOMAIN,
 			    "full\t%s"), tosnap);
+#if defined(__GNUC__) && !defined(__clang__) && \
+	defined(ZFS_UBSAN_ENABLED) && defined(HAVE_FORMAT_OVERFLOW)
+#pragma GCC diagnostic pop
+#endif
 		}
 		(void) fprintf(fout, "\t%llu", (longlong_t)size);
 	} else {
@@ -1028,8 +1117,23 @@ send_print_verbose(FILE *fout, const char *tosnap, const char *fromsnap,
 		if (size != 0) {
 			char buf[16];
 			zfs_nicebytes(size, buf, sizeof (buf));
+/*
+ * Workaround for GCC 12+ with UBSan enabled deficencies.
+ *
+ * GCC 12+ invoked with -fsanitize=undefined incorrectly reports the code
+ * below as violating -Wformat-overflow.
+ */
+#if defined(__GNUC__) && !defined(__clang__) && \
+	defined(ZFS_UBSAN_ENABLED) && defined(HAVE_FORMAT_OVERFLOW)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-overflow"
+#endif
 			(void) fprintf(fout, dgettext(TEXT_DOMAIN,
 			    " estimated size is %s"), buf);
+#if defined(__GNUC__) && !defined(__clang__) && \
+	defined(ZFS_UBSAN_ENABLED) && defined(HAVE_FORMAT_OVERFLOW)
+#pragma GCC diagnostic pop
+#endif
 		}
 	}
 	(void) fprintf(fout, "\n");
@@ -1037,7 +1141,7 @@ send_print_verbose(FILE *fout, const char *tosnap, const char *fromsnap,
 
 /*
  * Send a single filesystem snapshot, updating the send dump data.
- * This interface is intended for use as a zfs_iter_snapshots_sorted visitor.
+ * This interface is intended for use as a zfs_iter_snapshots_v2_sorted visitor.
  */
 static int
 dump_snapshot(zfs_handle_t *zhp, void *arg)
@@ -1086,7 +1190,7 @@ dump_snapshot(zfs_handle_t *zhp, void *arg)
 
 	if (!sdd->doall && !isfromsnap && !istosnap) {
 		if (sdd->replicate) {
-			char *snapname;
+			const char *snapname;
 			nvlist_t *snapprops;
 			/*
 			 * Filter out all intermediate snapshots except origin
@@ -1153,25 +1257,29 @@ dump_snapshot(zfs_handle_t *zhp, void *arg)
 		 * If progress reporting is requested, spawn a new thread to
 		 * poll ZFS_IOC_SEND_PROGRESS at a regular interval.
 		 */
-		if (sdd->progress) {
+		sigset_t oldmask;
+		{
 			pa.pa_zhp = zhp;
 			pa.pa_fd = sdd->outfd;
 			pa.pa_parsable = sdd->parsable;
 			pa.pa_estimate = B_FALSE;
 			pa.pa_verbosity = sdd->verbosity;
+			pa.pa_size = sdd->size;
+			pa.pa_astitle = sdd->progressastitle;
+			pa.pa_progress = sdd->progress;
 
 			if ((err = pthread_create(&tid, NULL,
 			    send_progress_thread, &pa)) != 0) {
 				zfs_close(zhp);
 				return (err);
 			}
+			SEND_PROGRESS_THREAD_PARENT_BLOCK(&oldmask);
 		}
 
 		err = dump_ioctl(zhp, sdd->prevsnap, sdd->prevsnap_obj,
 		    fromorigin, sdd->outfd, flags, sdd->debugnv);
 
-		if (sdd->progress &&
-		    send_progress_thread_exit(zhp->zfs_hdl, tid))
+		if (send_progress_thread_exit(zhp->zfs_hdl, tid, &oldmask))
 			return (-1);
 	}
 
@@ -1244,7 +1352,7 @@ dump_filesystem(zfs_handle_t *zhp, send_dump_data_t *sdd)
 				    zhp->zfs_name, sdd->tosnap);
 			}
 		}
-		rv = zfs_iter_snapshots_sorted(zhp, dump_snapshot, sdd,
+		rv = zfs_iter_snapshots_sorted_v2(zhp, 0, dump_snapshot, sdd,
 		    min_txg, max_txg);
 	} else {
 		char snapname[MAXPATHLEN] = { 0 };
@@ -1259,7 +1367,7 @@ dump_filesystem(zfs_handle_t *zhp, send_dump_data_t *sdd)
 			if (snap != NULL)
 				rv = dump_snapshot(snap, sdd);
 			else
-				rv = -1;
+				rv = errno;
 		}
 
 		/* Dump tosnap. */
@@ -1271,7 +1379,7 @@ dump_filesystem(zfs_handle_t *zhp, send_dump_data_t *sdd)
 			if (snap != NULL)
 				rv = dump_snapshot(snap, sdd);
 			else
-				rv = -1;
+				rv = errno;
 		}
 	}
 
@@ -1323,7 +1431,7 @@ dump_filesystems(zfs_handle_t *rzhp, send_dump_data_t *sdd)
 		nvfs = fnvpair_value_nvlist(fspair);
 		(void) nvlist_lookup_uint64(nvfs, "origin", &origin_guid);
 		if (origin_guid != 0) {
-			char *snapname;
+			const char *snapname;
 			nvlist_t *origin_nv = fsavl_find(sdd->fsavl,
 			    origin_guid, &snapname);
 			if (origin_nv != NULL) {
@@ -1342,7 +1450,7 @@ again:
 	for (fspair = nvlist_next_nvpair(sdd->fss, NULL); fspair;
 	    fspair = nvlist_next_nvpair(sdd->fss, fspair)) {
 		nvlist_t *fslist, *parent_nv;
-		char *fsname;
+		const char *fsname;
 		zfs_handle_t *zhp;
 		int err;
 		uint64_t origin_guid = 0;
@@ -1506,15 +1614,16 @@ lzc_flags_from_sendflags(const sendflags_t *flags)
 static int
 estimate_size(zfs_handle_t *zhp, const char *from, int fd, sendflags_t *flags,
     uint64_t resumeobj, uint64_t resumeoff, uint64_t bytes,
-    const char *redactbook, char *errbuf)
+    const char *redactbook, char *errbuf, uint64_t *sizep)
 {
 	uint64_t size;
 	FILE *fout = flags->dryrun ? stdout : stderr;
 	progress_arg_t pa = { 0 };
 	int err = 0;
 	pthread_t ptid;
+	sigset_t oldmask;
 
-	if (flags->progress) {
+	{
 		pa.pa_zhp = zhp;
 		pa.pa_fd = fd;
 		pa.pa_parsable = flags->parsable;
@@ -1524,21 +1633,26 @@ estimate_size(zfs_handle_t *zhp, const char *from, int fd, sendflags_t *flags,
 		err = pthread_create(&ptid, NULL,
 		    send_progress_thread, &pa);
 		if (err != 0) {
-			zfs_error_aux(zhp->zfs_hdl, "%s", strerror(errno));
+			zfs_error_aux(zhp->zfs_hdl, "%s", zfs_strerror(errno));
 			return (zfs_error(zhp->zfs_hdl,
 			    EZFS_THREADCREATEFAILED, errbuf));
 		}
+		SEND_PROGRESS_THREAD_PARENT_BLOCK(&oldmask);
 	}
 
 	err = lzc_send_space_resume_redacted(zhp->zfs_name, from,
 	    lzc_flags_from_sendflags(flags), resumeobj, resumeoff, bytes,
 	    redactbook, fd, &size);
+	*sizep = size;
 
-	if (flags->progress && send_progress_thread_exit(zhp->zfs_hdl, ptid))
+	if (send_progress_thread_exit(zhp->zfs_hdl, ptid, &oldmask))
 		return (-1);
 
+	if (!flags->progress && !flags->parsable)
+		return (err);
+
 	if (err != 0) {
-		zfs_error_aux(zhp->zfs_hdl, "%s", strerror(err));
+		zfs_error_aux(zhp->zfs_hdl, "%s", zfs_strerror(err));
 		return (zfs_error(zhp->zfs_hdl, EZFS_BADBACKUP,
 		    errbuf));
 	}
@@ -1654,7 +1768,7 @@ find_redact_book(libzfs_handle_t *hdl, const char *path,
 			    "dataset to be sent no longer exists"));
 		} else {
 			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-			    "unknown error: %s"), strerror(error));
+			    "unknown error: %s"), zfs_strerror(error));
 		}
 		return (zfs_error(hdl, EZFS_BADPROP, errbuf));
 	}
@@ -1703,8 +1817,8 @@ zfs_send_resume_impl_cb_impl(libzfs_handle_t *hdl, sendflags_t *flags,
     int outfd, nvlist_t *resume_nvl)
 {
 	char errbuf[ERRBUFLEN];
-	char *toname;
-	char *fromname = NULL;
+	const char *toname;
+	const char *fromname = NULL;
 	uint64_t resumeobj, resumeoff, toguid, fromguid, bytes;
 	zfs_handle_t *zhp;
 	int error = 0;
@@ -1713,6 +1827,7 @@ zfs_send_resume_impl_cb_impl(libzfs_handle_t *hdl, sendflags_t *flags,
 	uint64_t *redact_snap_guids = NULL;
 	int num_redact_snaps = 0;
 	char *redact_book = NULL;
+	uint64_t size = 0;
 
 	(void) snprintf(errbuf, sizeof (errbuf), dgettext(TEXT_DOMAIN,
 	    "cannot resume send"));
@@ -1798,7 +1913,7 @@ zfs_send_resume_impl_cb_impl(libzfs_handle_t *hdl, sendflags_t *flags,
 	enum lzc_send_flags lzc_flags = lzc_flags_from_sendflags(flags) |
 	    lzc_flags_from_resume_nvl(resume_nvl);
 
-	if (flags->verbosity != 0) {
+	if (flags->verbosity != 0 || flags->progressastitle) {
 		/*
 		 * Some of these may have come from the resume token, set them
 		 * here for size estimate purposes.
@@ -1815,22 +1930,26 @@ zfs_send_resume_impl_cb_impl(libzfs_handle_t *hdl, sendflags_t *flags,
 		if (lzc_flags & LZC_SEND_FLAG_SAVED)
 			tmpflags.saved = B_TRUE;
 		error = estimate_size(zhp, fromname, outfd, &tmpflags,
-		    resumeobj, resumeoff, bytes, redact_book, errbuf);
+		    resumeobj, resumeoff, bytes, redact_book, errbuf, &size);
 	}
 
 	if (!flags->dryrun) {
 		progress_arg_t pa = { 0 };
 		pthread_t tid;
+		sigset_t oldmask;
 		/*
 		 * If progress reporting is requested, spawn a new thread to
 		 * poll ZFS_IOC_SEND_PROGRESS at a regular interval.
 		 */
-		if (flags->progress) {
+		{
 			pa.pa_zhp = zhp;
 			pa.pa_fd = outfd;
 			pa.pa_parsable = flags->parsable;
 			pa.pa_estimate = B_FALSE;
 			pa.pa_verbosity = flags->verbosity;
+			pa.pa_size = size;
+			pa.pa_astitle = flags->progressastitle;
+			pa.pa_progress = flags->progress;
 
 			error = pthread_create(&tid, NULL,
 			    send_progress_thread, &pa);
@@ -1840,6 +1959,7 @@ zfs_send_resume_impl_cb_impl(libzfs_handle_t *hdl, sendflags_t *flags,
 				zfs_close(zhp);
 				return (error);
 			}
+			SEND_PROGRESS_THREAD_PARENT_BLOCK(&oldmask);
 		}
 
 		error = lzc_send_resume_redacted(zhp->zfs_name, fromname, outfd,
@@ -1847,8 +1967,10 @@ zfs_send_resume_impl_cb_impl(libzfs_handle_t *hdl, sendflags_t *flags,
 		if (redact_book != NULL)
 			free(redact_book);
 
-		if (flags->progress && send_progress_thread_exit(hdl, tid))
+		if (send_progress_thread_exit(hdl, tid, &oldmask)) {
+			zfs_close(zhp);
 			return (-1);
+		}
 
 		char errbuf[ERRBUFLEN];
 		(void) snprintf(errbuf, sizeof (errbuf), dgettext(TEXT_DOMAIN,
@@ -1883,7 +2005,7 @@ zfs_send_resume_impl_cb_impl(libzfs_handle_t *hdl, sendflags_t *flags,
 		case ERANGE:
 		case EFAULT:
 		case EROFS:
-			zfs_error_aux(hdl, "%s", strerror(errno));
+			zfs_error_aux(hdl, "%s", zfs_strerror(errno));
 			return (zfs_error(hdl, EZFS_BADBACKUP, errbuf));
 
 		default:
@@ -2048,7 +2170,8 @@ out:
 static int
 send_conclusion_record(int fd, zio_cksum_t *zc)
 {
-	dmu_replay_record_t drr = { 0 };
+	dmu_replay_record_t drr;
+	memset(&drr, 0, sizeof (dmu_replay_record_t));
 	drr.drr_type = DRR_END;
 	if (zc != NULL)
 		drr.drr_u.drr_end.drr_checksum = *zc;
@@ -2117,9 +2240,9 @@ send_prelim_records(zfs_handle_t *zhp, const char *from, int fd,
 			fnvlist_add_boolean(hdrnv, "raw");
 		}
 
-		if ((err = gather_nvlist(zhp->zfs_hdl, tofs,
+		if (gather_nvlist(zhp->zfs_hdl, tofs,
 		    from, tosnap, recursive, raw, doall, replicate, skipmissing,
-		    verbose, backup, holds, props, &fss, fsavlp)) != 0) {
+		    verbose, backup, holds, props, &fss, fsavlp) != 0) {
 			return (zfs_error(zhp->zfs_hdl, EZFS_BADBACKUP,
 			    errbuf));
 		}
@@ -2150,7 +2273,8 @@ send_prelim_records(zfs_handle_t *zhp, const char *from, int fd,
 	}
 
 	if (!dryrun) {
-		dmu_replay_record_t drr = { 0 };
+		dmu_replay_record_t drr;
+		memset(&drr, 0, sizeof (dmu_replay_record_t));
 		/* write first begin record */
 		drr.drr_type = DRR_BEGIN;
 		drr.drr_u.drr_begin.drr_magic = DMU_BACKUP_MAGIC;
@@ -2169,13 +2293,13 @@ send_prelim_records(zfs_handle_t *zhp, const char *from, int fd,
 		err = dump_record(&drr, packbuf, buflen, &zc, fd);
 		free(packbuf);
 		if (err != 0) {
-			zfs_error_aux(zhp->zfs_hdl, "%s", strerror(err));
+			zfs_error_aux(zhp->zfs_hdl, "%s", zfs_strerror(err));
 			return (zfs_error(zhp->zfs_hdl, EZFS_BADBACKUP,
 			    errbuf));
 		}
 		err = send_conclusion_record(fd, &zc);
 		if (err != 0) {
-			zfs_error_aux(zhp->zfs_hdl, "%s", strerror(err));
+			zfs_error_aux(zhp->zfs_hdl, "%s", zfs_strerror(err));
 			return (zfs_error(zhp->zfs_hdl, EZFS_BADBACKUP,
 			    errbuf));
 		}
@@ -2283,6 +2407,7 @@ zfs_send_cb_impl(zfs_handle_t *zhp, const char *fromsnap, const char *tosnap,
 	sdd.verbosity = flags->verbosity;
 	sdd.parsable = flags->parsable;
 	sdd.progress = flags->progress;
+	sdd.progressastitle = flags->progressastitle;
 	sdd.dryrun = flags->dryrun;
 	sdd.large_block = flags->largeblock;
 	sdd.embed_data = flags->embed_data;
@@ -2532,6 +2657,7 @@ zfs_send_one_cb_impl(zfs_handle_t *zhp, const char *from, int fd,
 	char *name = zhp->zfs_name;
 	pthread_t ptid;
 	progress_arg_t pa = { 0 };
+	uint64_t size = 0;
 
 	char errbuf[ERRBUFLEN];
 	(void) snprintf(errbuf, sizeof (errbuf), dgettext(TEXT_DOMAIN,
@@ -2614,9 +2740,9 @@ zfs_send_one_cb_impl(zfs_handle_t *zhp, const char *from, int fd,
 	/*
 	 * Perform size estimate if verbose was specified.
 	 */
-	if (flags->verbosity != 0) {
+	if (flags->verbosity != 0 || flags->progressastitle) {
 		err = estimate_size(zhp, from, fd, flags, 0, 0, 0, redactbook,
-		    errbuf);
+		    errbuf, &size);
 		if (err != 0)
 			return (err);
 	}
@@ -2628,26 +2754,31 @@ zfs_send_one_cb_impl(zfs_handle_t *zhp, const char *from, int fd,
 	 * If progress reporting is requested, spawn a new thread to poll
 	 * ZFS_IOC_SEND_PROGRESS at a regular interval.
 	 */
-	if (flags->progress) {
+	sigset_t oldmask;
+	{
 		pa.pa_zhp = zhp;
 		pa.pa_fd = fd;
 		pa.pa_parsable = flags->parsable;
 		pa.pa_estimate = B_FALSE;
 		pa.pa_verbosity = flags->verbosity;
+		pa.pa_size = size;
+		pa.pa_astitle = flags->progressastitle;
+		pa.pa_progress = flags->progress;
 
 		err = pthread_create(&ptid, NULL,
 		    send_progress_thread, &pa);
 		if (err != 0) {
-			zfs_error_aux(zhp->zfs_hdl, "%s", strerror(errno));
+			zfs_error_aux(zhp->zfs_hdl, "%s", zfs_strerror(errno));
 			return (zfs_error(zhp->zfs_hdl,
 			    EZFS_THREADCREATEFAILED, errbuf));
 		}
+		SEND_PROGRESS_THREAD_PARENT_BLOCK(&oldmask);
 	}
 
 	err = lzc_send_redacted(name, from, fd,
 	    lzc_flags_from_sendflags(flags), redactbook);
 
-	if (flags->progress && send_progress_thread_exit(hdl, ptid))
+	if (send_progress_thread_exit(hdl, ptid, &oldmask))
 			return (-1);
 
 	if (err == 0 && (flags->props || flags->holds || flags->backup)) {
@@ -2695,7 +2826,7 @@ zfs_send_one_cb_impl(zfs_handle_t *zhp, const char *from, int fd,
 		case EPIPE:
 		case ERANGE:
 		case EROFS:
-			zfs_error_aux(hdl, "%s", strerror(errno));
+			zfs_error_aux(hdl, "%s", zfs_strerror(errno));
 			return (zfs_error(hdl, EZFS_BADBACKUP, errbuf));
 
 		default:
@@ -3095,9 +3226,9 @@ guid_to_name_cb(zfs_handle_t *zhp, void *arg)
 		return (EEXIST);
 	}
 
-	err = zfs_iter_children(zhp, guid_to_name_cb, gtnd);
+	err = zfs_iter_children_v2(zhp, 0, guid_to_name_cb, gtnd);
 	if (err != EEXIST && gtnd->bookmark_ok)
-		err = zfs_iter_bookmarks(zhp, guid_to_name_cb, gtnd);
+		err = zfs_iter_bookmarks_v2(zhp, 0, guid_to_name_cb, gtnd);
 	zfs_close(zhp);
 	return (err);
 }
@@ -3151,9 +3282,11 @@ guid_to_name_redact_snaps(libzfs_handle_t *hdl, const char *parent,
 			continue;
 		int err = guid_to_name_cb(zfs_handle_dup(zhp), &gtnd);
 		if (err != EEXIST)
-			err = zfs_iter_children(zhp, guid_to_name_cb, &gtnd);
+			err = zfs_iter_children_v2(zhp, 0, guid_to_name_cb,
+			    &gtnd);
 		if (err != EEXIST && bookmark_ok)
-			err = zfs_iter_bookmarks(zhp, guid_to_name_cb, &gtnd);
+			err = zfs_iter_bookmarks_v2(zhp, 0, guid_to_name_cb,
+			    &gtnd);
 		zfs_close(zhp);
 		if (err == EEXIST)
 			return (0);
@@ -3186,7 +3319,7 @@ created_before(libzfs_handle_t *hdl, avl_tree_t *avl,
     uint64_t guid1, uint64_t guid2)
 {
 	nvlist_t *nvfs;
-	char *fsname = NULL, *snapname = NULL;
+	const char *fsname = NULL, *snapname = NULL;
 	char buf[ZFS_MAX_DATASET_NAME_LEN];
 	int rv;
 	zfs_handle_t *guid1hdl, *guid2hdl;
@@ -3252,7 +3385,7 @@ recv_fix_encryption_hierarchy(libzfs_handle_t *hdl, const char *top_zfs,
 		nvpair_t *snapel = NULL;
 		boolean_t is_encroot, is_clone, stream_encroot;
 		char *cp;
-		char *stream_keylocation = NULL;
+		const char *stream_keylocation = NULL;
 		char keylocation[MAXNAMELEN];
 		char fsname[ZFS_MAX_DATASET_NAME_LEN];
 
@@ -3372,12 +3505,12 @@ recv_incremental_replication(libzfs_handle_t *hdl, const char *tofs,
 	nvlist_t *local_nv, *deleted = NULL;
 	avl_tree_t *local_avl;
 	nvpair_t *fselem, *nextfselem;
-	char *fromsnap;
+	const char *fromsnap;
 	char newname[ZFS_MAX_DATASET_NAME_LEN];
 	char guidname[32];
 	int error;
 	boolean_t needagain, progress, recursive;
-	char *s1, *s2;
+	const char *s1, *s2;
 
 	fromsnap = fnvlist_lookup_string(stream_nv, "fromsnap");
 
@@ -3409,7 +3542,7 @@ again:
 		uint64_t originguid = 0;
 		uint64_t stream_originguid = 0;
 		uint64_t parent_fromsnap_guid, stream_parent_fromsnap_guid;
-		char *fsname, *stream_fsname;
+		const char *fsname, *stream_fsname;
 
 		nextfselem = nvlist_next_nvpair(local_nv, fselem);
 
@@ -3444,7 +3577,7 @@ again:
 			case 1: {
 				/* promote it! */
 				nvlist_t *origin_nvfs;
-				char *origin_fsname;
+				const char *origin_fsname;
 
 				origin_nvfs = fsavl_find(local_avl, originguid,
 				    NULL);
@@ -3475,7 +3608,7 @@ again:
 		for (snapelem = nvlist_next_nvpair(snaps, NULL);
 		    snapelem; snapelem = nextsnapelem) {
 			uint64_t thisguid;
-			char *stream_snapname;
+			const char *stream_snapname;
 			nvlist_t *found, *props;
 
 			nextsnapelem = nvlist_next_nvpair(snaps, snapelem);
@@ -3621,7 +3754,7 @@ again:
 			 * new fs.
 			 */
 			if (parent != NULL) {
-				char *pname;
+				const char *pname;
 
 				pname = fnvlist_lookup_string(parent, "name");
 				(void) snprintf(tryname, sizeof (tryname),
@@ -3672,8 +3805,8 @@ zfs_receive_package(libzfs_handle_t *hdl, int fd, const char *destname,
 {
 	nvlist_t *stream_nv = NULL;
 	avl_tree_t *stream_avl = NULL;
-	char *fromsnap = NULL;
-	char *sendsnap = NULL;
+	const char *fromsnap = NULL;
+	const char *sendsnap = NULL;
 	char *cp;
 	char tofs[ZFS_MAX_DATASET_NAME_LEN];
 	char sendfs[ZFS_MAX_DATASET_NAME_LEN];
@@ -4119,6 +4252,15 @@ zfs_setup_cmdline_props(libzfs_handle_t *hdl, zfs_type_t type,
 			goto error;
 		}
 
+		/*
+		 * For plain replicated send, we can ignore encryption
+		 * properties other than first stream
+		 */
+		if ((zfs_prop_encryption_key_param(prop) || prop ==
+		    ZFS_PROP_ENCRYPTION) && !newfs && recursive && !raw) {
+			continue;
+		}
+
 		/* incremental streams can only exclude encryption properties */
 		if ((zfs_prop_encryption_key_param(prop) ||
 		    prop == ZFS_PROP_ENCRYPTION) && !newfs &&
@@ -4153,7 +4295,7 @@ zfs_setup_cmdline_props(libzfs_handle_t *hdl, zfs_type_t type,
 			 */
 			if (nvlist_exists(origprops, newname)) {
 				nvlist_t *attrs;
-				char *source = NULL;
+				const char *source = NULL;
 
 				attrs = fnvlist_lookup_nvlist(origprops,
 				    newname);
@@ -4220,7 +4362,8 @@ zfs_setup_cmdline_props(libzfs_handle_t *hdl, zfs_type_t type,
 		if (cp != NULL)
 			*cp = '\0';
 
-		if (!raw && zfs_crypto_create(hdl, namebuf, voprops, NULL,
+		if (!raw && !(!newfs && recursive) &&
+		    zfs_crypto_create(hdl, namebuf, voprops, NULL,
 		    B_FALSE, wkeydata_out, wkeylen_out) != 0) {
 			fnvlist_free(voprops);
 			ret = zfs_error(hdl, EZFS_CRYPTOFAILED, errbuf);
@@ -4276,7 +4419,7 @@ zfs_receive_one(libzfs_handle_t *hdl, int infd, const char *tosnap,
 	zprop_errflags_t prop_errflags;
 	nvlist_t *prop_errors = NULL;
 	boolean_t recursive;
-	char *snapname = NULL;
+	const char *snapname = NULL;
 	char destsnap[MAXPATHLEN * 2];
 	char origin[MAXNAMELEN] = {0};
 	char name[MAXPATHLEN];
@@ -4307,7 +4450,7 @@ zfs_receive_one(libzfs_handle_t *hdl, int infd, const char *tosnap,
 	boolean_t holds = flags->holds && !flags->skipholds;
 
 	if (stream_avl != NULL) {
-		char *keylocation = NULL;
+		const char *keylocation = NULL;
 		nvlist_t *lookup = NULL;
 		nvlist_t *fs = fsavl_find(stream_avl, drrb->drr_toguid,
 		    &snapname);
@@ -4512,7 +4655,7 @@ zfs_receive_one(libzfs_handle_t *hdl, int infd, const char *tosnap,
 			    B_FALSE, destsnap) == 0) {
 				*strchr(destsnap, '@') = '\0';
 				(void) strlcat(destsnap, suffix,
-				    sizeof (destsnap) - strlen(destsnap));
+				    sizeof (destsnap));
 			}
 		}
 	} else {
@@ -4548,7 +4691,7 @@ zfs_receive_one(libzfs_handle_t *hdl, int infd, const char *tosnap,
 			    B_FALSE, destsnap) == 0) {
 				*strchr(destsnap, '@') = '\0';
 				(void) strlcat(destsnap, snap,
-				    sizeof (destsnap) - strlen(destsnap));
+				    sizeof (destsnap));
 			}
 		}
 	}
@@ -4809,7 +4952,7 @@ zfs_receive_one(libzfs_handle_t *hdl, int infd, const char *tosnap,
 	if (flags->verbose) {
 		(void) printf("%s %s%s stream of %s into %s\n",
 		    flags->dryrun ? "would receive" : "receiving",
-		    flags->heal ? " corrective" : "",
+		    flags->heal ? "corrective " : "",
 		    drrb->drr_fromguid ? "incremental" : "full",
 		    drrb->drr_toname, destsnap);
 		(void) fflush(stdout);
@@ -5043,14 +5186,14 @@ zfs_receive_one(libzfs_handle_t *hdl, int infd, const char *tosnap,
 			*cp = '@';
 			break;
 		case EINVAL:
-			if (flags->resumable) {
-				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-				    "kernel modules must be upgraded to "
-				    "receive this stream."));
-			} else if (embedded && !raw) {
+			if (embedded && !raw) {
 				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 				    "incompatible embedded data stream "
 				    "feature with encrypted receive."));
+			} else if (flags->resumable) {
+				zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+				    "kernel modules must be upgraded to "
+				    "receive this stream."));
 			}
 			(void) zfs_error(hdl, EZFS_BADSTREAM, errbuf);
 			break;
@@ -5082,6 +5225,12 @@ zfs_receive_one(libzfs_handle_t *hdl, int infd, const char *tosnap,
 				    "pool must be upgraded to receive this "
 				    "stream."));
 			(void) zfs_error(hdl, EZFS_BADVERSION, errbuf);
+			break;
+		case ZFS_ERR_CRYPTO_NOTSUP:
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			    "stream uses crypto parameters not compatible with "
+			    "this pool"));
+			(void) zfs_error(hdl, EZFS_BADSTREAM, errbuf);
 			break;
 		case EDQUOT:
 			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
@@ -5122,6 +5271,14 @@ zfs_receive_one(libzfs_handle_t *hdl, int infd, const char *tosnap,
 			    dgettext(TEXT_DOMAIN, "cannot resume recv %s"),
 			    destsnap);
 			*cp = '@';
+			break;
+		case E2BIG:
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			    "zfs receive required kernel memory allocation "
+			    "larger than the system can support. Please file "
+			    "an issue at the OpenZFS issue tracker:\n"
+			    "https://github.com/openzfs/zfs/issues/new"));
+			(void) zfs_error(hdl, EZFS_BADSTREAM, errbuf);
 			break;
 		case EBUSY:
 			if (hastoken) {
@@ -5411,7 +5568,7 @@ zfs_receive(libzfs_handle_t *hdl, const char *tosnap, nvlist_t *props,
 	char *top_zfs = NULL;
 	int err;
 	struct stat sb;
-	char *originsnap = NULL;
+	const char *originsnap = NULL;
 
 	/*
 	 * The only way fstat can fail is if we do not have a valid file
